@@ -1,0 +1,124 @@
+import { describe, expect, it } from 'vitest';
+import {
+  ALLOCATION_KEY,
+  LEGACY_ALLOCATION_KEY,
+  SESSION_KEY,
+  eraseAllocation,
+  storeAllocation,
+  storeSession,
+  type ErasableStorage,
+} from './store.js';
+import { loadAllocation, loadSession } from './load.js';
+import { initialAllocationRecord } from '../model/allocation.js';
+import type { SessionAggregate } from '../model/session.js';
+
+function memoryStorage(): ErasableStorage & { data: Map<string, unknown> } {
+  const data = new Map<string, unknown>();
+  return {
+    data,
+    get: async <T>(key: string): Promise<T | undefined> => data.get(key) as T | undefined,
+    put: async <T>(key: string, value: T) => {
+      data.set(key, value);
+    },
+    delete: async (keys: readonly string[]) => {
+      let deleted = 0;
+      for (const key of keys) if (data.delete(key)) deleted += 1;
+      return deleted;
+    },
+  };
+}
+
+const SESSION: SessionAggregate = {
+  binding: { kind: 'bound', handle: { incarnation: 'inc-1', wrapper: 'w-1', epoch: 3 } },
+  messages: [
+    {
+      messageId: 'm1',
+      state: {
+        kind: 'queued',
+        intent: {
+          turn: { type: 'prompt', messageId: 'm1', prompt: 'hello' },
+          agent: { mode: 'code', model: 'm' },
+        },
+        queuedAt: 90,
+        deliveryStep: 'preparing',
+        deadlineAt: 123,
+        attachFailures: 1,
+        promptFailures: 0,
+      },
+      cancellation: { operationId: 'cancel-1', deadlineAt: 130 },
+      proofs: {
+        attach: {
+          authorization: {
+            operation: 'session.attach',
+            operationId: 'op-1',
+            messageId: 'm1',
+            session: { sessionId: 's', kiloSessionId: 'k', directory: '/d' },
+            wrapperInstanceId: 'w-1',
+            dispatchDeadlineAt: 100,
+          },
+          dispatched: true,
+          attachmentEpoch: 1,
+        },
+      },
+    },
+  ],
+};
+
+describe('canonical store', () => {
+  it('stores the allocation record as-is under the canonical key', async () => {
+    const storage = memoryStorage();
+    const record = initialAllocationRecord(true);
+    await storeAllocation(storage, record);
+    expect(storage.data.get(ALLOCATION_KEY)).toEqual(record);
+  });
+
+  it('stores the session aggregate as a {v:2} envelope', async () => {
+    const storage = memoryStorage();
+    await storeSession(storage, SESSION);
+    expect(storage.data.get(SESSION_KEY)).toEqual({ v: 2, ...SESSION });
+  });
+
+  it('allocation store→load round-trip is identity', async () => {
+    const storage = memoryStorage();
+    const record = initialAllocationRecord(false);
+    await storeAllocation(storage, record);
+    const loaded = await loadAllocation(storage);
+    expect(loaded).toEqual({ ok: true, source: 'canonical', value: record });
+  });
+
+  it('session store→load round-trip is identity', async () => {
+    const storage = memoryStorage();
+    await storeSession(storage, SESSION);
+    const loaded = await loadSession(storage);
+    expect(loaded).toEqual({ ok: true, source: 'canonical', value: SESSION });
+  });
+
+  it('eraseAllocation deletes both allocation keys and leaves the session alone', async () => {
+    const storage = memoryStorage();
+    await storage.put(ALLOCATION_KEY, initialAllocationRecord(true));
+    await storage.put(LEGACY_ALLOCATION_KEY, { state: 'running', providerRef: 'ref' });
+    await storage.put(SESSION_KEY, { v: 2, binding: { kind: 'unbound' }, messages: [] });
+    await eraseAllocation(storage);
+    expect(storage.data.has(ALLOCATION_KEY)).toBe(false);
+    expect(storage.data.has(LEGACY_ALLOCATION_KEY)).toBe(false);
+    expect(storage.data.has(SESSION_KEY)).toBe(true);
+  });
+
+  it('erasing both allocation keys blocks legacy fallback: a later load is first boot', async () => {
+    const storage: ErasableStorage & { data: Map<string, unknown> } = memoryStorage();
+    await storage.put(LEGACY_ALLOCATION_KEY, {
+      state: 'running',
+      providerRef: 'ref',
+      createIntent: { intentId: 'i', createdAt: 1 },
+      stopTombstone: null,
+      resumable: true,
+    });
+    await eraseAllocation(storage);
+    const loaded = await loadAllocation(storage, true);
+    expect(loaded).toEqual({
+      ok: true,
+      source: 'initial',
+      value: { v: 2, resumable: true, state: { kind: 'stopped', summary: null } },
+    });
+  });
+});
