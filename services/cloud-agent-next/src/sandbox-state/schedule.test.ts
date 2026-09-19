@@ -14,6 +14,7 @@ import type { SessionAggregate } from './model/session.js';
 
 const NOW = 7_000_000;
 const INC = 'inc-1';
+const EPISODE_ID = '11111111-1111-4111-8111-111111111111';
 const TARGET = {
   provider: 'cloudflare' as const,
   providerRef: 'ref',
@@ -80,6 +81,8 @@ describe('scheduler — one deadline per aggregate', () => {
       step: 'check_sandbox',
       attempts: 1,
       deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+      episodeId: EPISODE_ID,
+      cause: 'activation_pending',
     };
     const record = allocated(recovering, NOW - 1);
     expect(allocationAlarmAt(record)).toBe(NOW + POLICY.recoveryDeadlineMs);
@@ -133,7 +136,7 @@ describe('scheduler regression — recovery just before idle expiry', () => {
 
     const recovering = decideAllocation(
       before,
-      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false },
+      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false, episodeId: EPISODE_ID },
       NOW
     );
     expect(recovering).toBeDefined();
@@ -164,9 +167,9 @@ describe('scheduler regression — recovery just before idle expiry', () => {
         type: 'RECOVERY_SUCCEEDED',
         fence: {
           incarnation: INC,
-          episode: NOW + POLICY.recoveryDeadlineMs,
+          episodeId: EPISODE_ID,
           attempt: 1,
-          operationId: operationId('reconcile', INC, NOW + POLICY.recoveryDeadlineMs, 1),
+          operationId: operationId('reconcile', INC, EPISODE_ID, 1),
         },
         at: NOW + 30_000,
         ready: true,

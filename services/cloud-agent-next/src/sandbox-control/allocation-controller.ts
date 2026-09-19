@@ -61,6 +61,11 @@ export type AllocationControllerDeps = {
   /** Legacy-migration flag for a first-boot record. */
   resumable?: boolean;
   receiptsKey?: string;
+  /**
+   * The single impure owner of the recovery episode id: mints one uuid for a
+   * recovery-opening event that lacks one. Defaults to `crypto.randomUUID`.
+   */
+  mintEpisodeId?: () => string;
 };
 
 export type AllocationDecision = {
@@ -93,9 +98,28 @@ export function isLiveAllocation(record: AllocationRecord): boolean {
   return record.state.kind === 'creating' || record.state.kind === 'allocated';
 }
 
+/**
+ * Attach the minted episode id at the single impure dispatch boundary. Only the
+ * four recovery-opening event variants are touched, and only when they lack an
+ * id, so a retried dispatch of the same event keeps the first id and every
+ * attempt in the episode reuses it.
+ */
+function withEpisodeId(event: AllocationInputEvent, mint: () => string): AllocationInputEvent {
+  switch (event.type) {
+    case 'CONNECTED':
+    case 'HEARTBEAT':
+    case 'HEALTH_OBSERVED':
+    case 'DEADLINE':
+      return event.episodeId !== undefined ? event : { ...event, episodeId: mint() };
+    default:
+      return event;
+  }
+}
+
 export function createAllocationController(deps: AllocationControllerDeps): AllocationController {
   const clock = deps.now ?? (() => Date.now());
   const receiptsKey = deps.receiptsKey ?? ACQUISITION_RECEIPTS_KEY;
+  const mintEpisodeId = deps.mintEpisodeId ?? (() => crypto.randomUUID());
 
   async function load(): Promise<AllocationRecord> {
     const result = await loadAllocation(deps.storage, deps.resumable ?? false);
@@ -109,7 +133,7 @@ export function createAllocationController(deps: AllocationControllerDeps): Allo
     async dispatch(event, now) {
       const at = now ?? clock();
       const record = await load();
-      const decision = decideAllocation(record, event, at);
+      const decision = decideAllocation(record, withEpisodeId(event, mintEpisodeId), at);
       if (decision === undefined) return undefined;
       await storeAllocation(deps.storage, decision.state);
       return {

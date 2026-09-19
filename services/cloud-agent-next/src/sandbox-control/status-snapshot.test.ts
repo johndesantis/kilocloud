@@ -158,6 +158,8 @@ describe('status snapshot — valid public projection', () => {
         step: 'check_sandbox',
         attempts: 1,
         deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+        episodeId: '11111111-1111-4111-8111-111111111111',
+        cause: 'activation_pending',
       }),
       allocated({
         kind: 'recovering',
@@ -165,6 +167,8 @@ describe('status snapshot — valid public projection', () => {
         step: 'reconnect_wrapper',
         attempts: 2,
         deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+        episodeId: '11111111-1111-4111-8111-111111111111',
+        cause: 'activation_pending',
       }),
       allocated(healthy()),
       allocated({ kind: 'unhealthy', incarnation: INC, verdict: 'absent' }),
@@ -227,6 +231,8 @@ describe('status snapshot — valid public projection', () => {
           step: 'check_sandbox',
           attempts: 1,
           deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+          episodeId: '11111111-1111-4111-8111-111111111111',
+          cause: 'activation_pending',
         })
       )
     ).resolves.toMatchObject({ status: 'unreachable', detailCode: 'connection_unavailable' });

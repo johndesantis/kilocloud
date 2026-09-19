@@ -20,6 +20,7 @@ import {
   sessionEnvelopeSchema,
   type RuntimeHandle,
   type SessionAggregate,
+  type SessionMessage,
 } from '../model/session.js';
 import { decodeLegacyAllocation } from './legacy/allocation.js';
 import { decodeLegacySession } from './legacy/session.js';
@@ -101,4 +102,13 @@ export async function loadSession(
     };
   }
   return { ok: false, reason: 'invalid_session_shape', key: raw.key };
+}
+
+/**
+ * Permitted boundary for the stopped-seam adapter: decode the frozen legacy bare
+ * array to canonical messages only. The binding is deliberately ignored — the
+ * seam derives it from the authoritative attachment record, not from row states.
+ */
+export function decodeLegacySessionMessages(value: unknown): SessionMessage[] | undefined {
+  return decodeLegacySession(value)?.messages;
 }

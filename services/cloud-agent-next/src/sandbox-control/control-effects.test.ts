@@ -1,15 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import type { AllocationRecord, AllocationTarget } from '../sandbox-state/model/allocation.js';
-import type {
-  Command,
-  CreateCommand,
-  DestroyCommand,
-  NotifySessionCommand,
-  ObserveCommand,
-  ReconcileCommand,
-  StopCommand,
+import {
+  operationId,
+  type Command,
+  type CreateCommand,
+  type DestroyCommand,
+  type NotifySessionCommand,
+  type ObserveCommand,
+  type ReconcileCommand,
+  type StopCommand,
 } from '../sandbox-state/commands.js';
 import { decideAllocation } from '../sandbox-state/allocation/reduce.js';
+import { POLICY } from '../sandbox-state/schedule.js';
 import { ALLOCATION_KEY, type CanonicalStorage } from '../sandbox-state/persist/store.js';
 import { createAllocationController } from './allocation-controller.js';
 import {
@@ -22,7 +24,8 @@ import {
 
 const NOW = 1_000_000;
 const INC = 'inc-1';
-const EPISODE = NOW + 90_000;
+const EPISODE_ID = '11111111-1111-4111-8111-111111111111';
+const EPISODE = NOW + POLICY.recoveryDeadlineMs;
 
 const CF_CAPS: AllocationTarget['capabilities'] = {
   persistentWorkspace: false,
@@ -71,10 +74,18 @@ const OBSERVE: ObserveCommand = {
 };
 const RECONCILE: ReconcileCommand = {
   kind: 'Reconcile',
-  operationId: 'reconcile:inc-1:90000:1',
+  operationId: operationId('reconcile', INC, EPISODE_ID, 1),
   incarnation: INC,
   attempt: 1,
   deadlineAt: EPISODE,
+  recovery: {
+    episodeId: EPISODE_ID,
+    cause: 'activation_pending',
+    startedAt: NOW,
+    deadlineAt: EPISODE,
+    attempt: 1,
+  },
+  phase: 'ready',
 };
 const NOTIFY: NotifySessionCommand = {
   kind: 'NotifySession',
@@ -300,7 +311,12 @@ describe('control effects — command to event runner', () => {
     const succeeded = await executeCommand(fakePort(), RECONCILE, NOW);
     expect(succeeded).toEqual({
       type: 'RECOVERY_SUCCEEDED',
-      fence: { incarnation: INC, episode: EPISODE, attempt: 1, operationId: RECONCILE.operationId },
+      fence: {
+        incarnation: INC,
+        episodeId: EPISODE_ID,
+        attempt: 1,
+        operationId: RECONCILE.operationId,
+      },
       at: NOW,
       ready: true,
     });
@@ -311,7 +327,12 @@ describe('control effects — command to event runner', () => {
     );
     expect(stepped).toEqual({
       type: 'RECOVERY_STEP',
-      fence: { incarnation: INC, episode: EPISODE, attempt: 1, operationId: RECONCILE.operationId },
+      fence: {
+        incarnation: INC,
+        episodeId: EPISODE_ID,
+        attempt: 1,
+        operationId: RECONCILE.operationId,
+      },
       step: 'reconnect_wrapper',
     });
     const result: ReconcileEffectResult = { outcome: 'attempt-failed' };

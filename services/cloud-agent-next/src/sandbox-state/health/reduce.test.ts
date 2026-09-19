@@ -7,15 +7,16 @@ import { POLICY } from '../schedule.js';
 
 const NOW = 2_000_000;
 const INC = 'inc-1';
-const EPISODE = NOW + POLICY.recoveryDeadlineMs;
+const EPISODE_ID = '11111111-1111-4111-8111-111111111111';
+const OTHER_EPISODE_ID = '22222222-2222-4222-8222-222222222222';
 
 /** Fence for the in-flight attempt of the standard episode. */
 function fence(attempt: number, overrides: Partial<RecoveryFence> = {}): RecoveryFence {
   return {
     incarnation: INC,
-    episode: EPISODE,
+    episodeId: EPISODE_ID,
     attempt,
-    operationId: operationId('reconcile', INC, EPISODE, attempt),
+    operationId: operationId('reconcile', INC, EPISODE_ID, attempt),
     ...overrides,
   };
 }
@@ -35,7 +36,8 @@ function healthy(lastAt = NOW - 1_000): HealthState {
 
 function recovering(
   step: 'check_sandbox' | 'reconnect_wrapper' = 'check_sandbox',
-  attempts = 1
+  attempts = 1,
+  overrides: Partial<Extract<HealthState, { kind: 'recovering' }>> = {}
 ): HealthState {
   return {
     kind: 'recovering',
@@ -43,6 +45,9 @@ function recovering(
     step,
     attempts,
     deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+    episodeId: EPISODE_ID,
+    cause: 'activation_pending',
+    ...overrides,
   };
 }
 
@@ -65,7 +70,7 @@ describe('health reducer — design §6 transitions', () => {
   it('connecting + HEARTBEAT not ready → recovering and emits Reconcile', () => {
     const decision = decideHealth(
       connecting(),
-      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false },
+      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false, episodeId: EPISODE_ID },
       NOW
     );
     expect(decision?.state.kind).toBe('recovering');
@@ -76,12 +81,20 @@ describe('health reducer — design §6 transitions', () => {
     expect(command?.kind === 'Reconcile' && command.deadlineAt).toBe(
       NOW + POLICY.recoveryDeadlineMs
     );
+    expect(command?.kind === 'Reconcile' && command.phase).toBe('drain');
+    expect(command?.kind === 'Reconcile' && command.recovery).toEqual({
+      episodeId: EPISODE_ID,
+      cause: 'activation_pending',
+      startedAt: NOW,
+      deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+      attempt: 1,
+    });
   });
 
   it('connecting + DEADLINE → recovering with Reconcile', () => {
     const decision = decideHealth(
       connecting(),
-      { type: 'DEADLINE' },
+      { type: 'DEADLINE', episodeId: EPISODE_ID },
       NOW + POLICY.connectingDeadlineMs
     );
     expect(decision?.state.kind).toBe('recovering');
@@ -111,7 +124,7 @@ describe('health reducer — design §6 transitions', () => {
   it('healthy + HEARTBEAT not ready → recovering with Reconcile', () => {
     const decision = decideHealth(
       healthy(),
-      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false },
+      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false, episodeId: EPISODE_ID },
       NOW
     );
     expect(decision?.state.kind).toBe('recovering');
@@ -119,7 +132,11 @@ describe('health reducer — design §6 transitions', () => {
   });
 
   it('healthy + DEADLINE → recovering with Reconcile', () => {
-    const decision = decideHealth(healthy(), { type: 'DEADLINE' }, NOW + POLICY.heartbeatExpiryMs);
+    const decision = decideHealth(
+      healthy(),
+      { type: 'DEADLINE', episodeId: EPISODE_ID },
+      NOW + POLICY.heartbeatExpiryMs
+    );
     expect(decision?.state.kind).toBe('recovering');
     expect(commandKinds(decision)).toEqual(['Reconcile']);
   });
@@ -136,11 +153,43 @@ describe('health reducer — design §6 transitions', () => {
   it('healthy + HEALTH_OBSERVED unknown → recovering with Reconcile', () => {
     const decision = decideHealth(
       healthy(),
-      { type: 'HEALTH_OBSERVED', incarnation: INC, at: NOW, providerState: 'unknown' },
+      {
+        type: 'HEALTH_OBSERVED',
+        incarnation: INC,
+        at: NOW,
+        providerState: 'unknown',
+        episodeId: EPISODE_ID,
+      },
       NOW
     );
     expect(decision?.state.kind).toBe('recovering');
     expect(commandKinds(decision)).toEqual(['Reconcile']);
+  });
+
+  it('rejects a recovery-opening event that carries no episode id', () => {
+    expect(
+      decideHealth(healthy(), { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false }, NOW)
+    ).toBeUndefined();
+    expect(
+      decideHealth(healthy(), { type: 'DEADLINE' }, NOW + POLICY.heartbeatExpiryMs)
+    ).toBeUndefined();
+    expect(
+      decideHealth(
+        healthy(),
+        { type: 'HEALTH_OBSERVED', incarnation: INC, at: NOW, providerState: 'unknown' },
+        NOW
+      )
+    ).toBeUndefined();
+    expect(
+      decideHealth(
+        connecting(),
+        { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false },
+        NOW
+      )
+    ).toBeUndefined();
+    expect(
+      decideHealth(connecting(), { type: 'DEADLINE' }, NOW + POLICY.connectingDeadlineMs)
+    ).toBeUndefined();
   });
 
   it('recovering + RECOVERY_STEP advances and cannot extend the absolute deadline', () => {
@@ -182,7 +231,7 @@ describe('health reducer — design §6 transitions', () => {
         recovering('check_sandbox', 1),
         {
           type: 'RECOVERY_STEP',
-          fence: fence(2, { episode: EPISODE + 1 }),
+          fence: fence(2, { episodeId: OTHER_EPISODE_ID }),
           step: 'reconnect_wrapper',
         },
         NOW
@@ -294,30 +343,208 @@ describe('health reducer — design §6 transitions', () => {
     expect(decision?.deadlineAt).toBeNull();
   });
 
-  it('a later recovery episode gets fresh command ids and its own deadline', () => {
+  it('a later recovery episode gets fresh command ids and its own episode', () => {
     const first = decideHealth(
       connecting(),
-      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false },
+      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false, episodeId: EPISODE_ID },
       NOW
     )!;
     const firstHealth = first.state as Extract<HealthState, { kind: 'recovering' }>;
     const firstCommand = first.commands[0];
+    expect(firstHealth.episodeId).toBe(EPISODE_ID);
     expect(firstCommand?.kind === 'Reconcile' && firstCommand.operationId).toBe(
-      operationId('reconcile', INC, firstHealth.deadlineAt, 1)
+      operationId('reconcile', INC, firstHealth.episodeId, 1)
     );
 
     const laterAt = NOW + 10_000_000;
     const later = decideHealth(
       connecting(),
-      { type: 'HEARTBEAT', incarnation: INC, at: laterAt, ready: false },
+      {
+        type: 'HEARTBEAT',
+        incarnation: INC,
+        at: laterAt,
+        ready: false,
+        episodeId: OTHER_EPISODE_ID,
+      },
       laterAt
     )!;
     const laterHealth = later.state as Extract<HealthState, { kind: 'recovering' }>;
     const laterCommand = later.commands[0];
     expect(laterHealth.deadlineAt).not.toBe(firstHealth.deadlineAt);
+    expect(laterHealth.episodeId).not.toBe(firstHealth.episodeId);
     expect(laterCommand?.kind === 'Reconcile' && laterCommand.operationId).not.toBe(
       firstCommand?.kind === 'Reconcile' ? firstCommand.operationId : undefined
     );
+  });
+
+  it('maps the entering event and pre-state to the recovery cause', () => {
+    const cases: Array<{
+      state: HealthState;
+      event:
+        | { type: 'DEADLINE'; episodeId: string }
+        | {
+            type: 'HEALTH_OBSERVED';
+            incarnation: string;
+            at: number;
+            providerState: 'active' | 'unknown';
+            episodeId: string;
+          }
+        | {
+            type: 'CONNECTED' | 'HEARTBEAT';
+            incarnation: string;
+            at: number;
+            ready: false;
+            episodeId: string;
+          };
+      now: number;
+      cause: string;
+    }> = [
+      {
+        state: healthy(),
+        event: { type: 'DEADLINE', episodeId: EPISODE_ID },
+        now: NOW + POLICY.heartbeatExpiryMs,
+        cause: 'heartbeat_expired',
+      },
+      {
+        state: connecting(),
+        event: { type: 'DEADLINE', episodeId: EPISODE_ID },
+        now: NOW + POLICY.connectingDeadlineMs,
+        cause: 'activation_pending',
+      },
+      {
+        state: connecting(),
+        event: {
+          type: 'HEALTH_OBSERVED',
+          incarnation: INC,
+          at: NOW,
+          providerState: 'active',
+          episodeId: EPISODE_ID,
+        },
+        now: NOW,
+        cause: 'activation_pending',
+      },
+      {
+        state: connecting(),
+        event: {
+          type: 'CONNECTED',
+          incarnation: INC,
+          at: NOW,
+          ready: false,
+          episodeId: EPISODE_ID,
+        },
+        now: NOW,
+        cause: 'activation_pending',
+      },
+      {
+        state: healthy(),
+        event: {
+          type: 'HEARTBEAT',
+          incarnation: INC,
+          at: NOW,
+          ready: false,
+          episodeId: EPISODE_ID,
+        },
+        now: NOW,
+        cause: 'activation_pending',
+      },
+      {
+        state: healthy(),
+        event: {
+          type: 'HEALTH_OBSERVED',
+          incarnation: INC,
+          at: NOW,
+          providerState: 'unknown',
+          episodeId: EPISODE_ID,
+        },
+        now: NOW,
+        cause: 'control_disconnected',
+      },
+    ];
+    for (const testCase of cases) {
+      const decision = decideHealth(testCase.state, testCase.event, testCase.now);
+      const health = decision?.state;
+      expect(health?.kind, testCase.event.type).toBe('recovering');
+      expect(
+        health?.kind === 'recovering' && health.cause,
+        `${testCase.event.type} over ${testCase.state.kind}`
+      ).toBe(testCase.cause);
+    }
+  });
+
+  it('keeps the episode id and cause stable across attempts while attempts grow', () => {
+    const entered = decideHealth(
+      healthy(),
+      { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false, episodeId: EPISODE_ID },
+      NOW
+    )!;
+    const first = entered.state as Extract<HealthState, { kind: 'recovering' }>;
+    expect(first.episodeId).toBe(EPISODE_ID);
+    expect(first.cause).toBe('activation_pending');
+
+    const stepped = decideHealth(
+      first,
+      { type: 'RECOVERY_STEP', fence: fence(first.attempts + 1), step: 'reconnect_wrapper' },
+      NOW
+    )!;
+    const second = stepped.state as Extract<HealthState, { kind: 'recovering' }>;
+    expect(second.episodeId).toBe(EPISODE_ID);
+    expect(second.cause).toBe('activation_pending');
+    expect(second.attempts).toBe(first.attempts + 1);
+
+    const failed = decideHealth(
+      second,
+      { type: 'RECOVERY_ATTEMPT_FAILED', fence: fence(second.attempts + 1) },
+      NOW
+    )!;
+    const third = failed.state as Extract<HealthState, { kind: 'recovering' }>;
+    expect(third.episodeId).toBe(EPISODE_ID);
+    expect(third.cause).toBe('activation_pending');
+    expect(third.attempts).toBe(second.attempts + 1);
+  });
+
+  it('a late result from a same-timestamp episode is rejected by an episode with a different uuid', () => {
+    // Two episodes accepted at the same `at` share a deadline; only the uuid
+    // distinguishes them. A deadline-derived fence would accept A's result for B.
+    const deadlineAt = NOW + POLICY.recoveryDeadlineMs;
+    const episodeA = recovering('check_sandbox', 0, {
+      deadlineAt,
+      episodeId: EPISODE_ID,
+      cause: 'heartbeat_expired',
+    }) as Extract<HealthState, { kind: 'recovering' }>;
+    const episodeB = { ...episodeA, episodeId: OTHER_EPISODE_ID };
+    expect(episodeA.deadlineAt).toBe(episodeB.deadlineAt);
+
+    const fenceA = fence(1, {
+      episodeId: EPISODE_ID,
+      operationId: operationId('reconcile', INC, EPISODE_ID, 1),
+    });
+    const fenceB = fence(1, {
+      episodeId: OTHER_EPISODE_ID,
+      operationId: operationId('reconcile', INC, OTHER_EPISODE_ID, 1),
+    });
+    expect(fenceA.operationId).not.toBe(fenceB.operationId);
+
+    expect(
+      decideHealth(
+        episodeB,
+        { type: 'RECOVERY_STEP', fence: fenceA, step: 'reconnect_wrapper' },
+        NOW
+      )
+    ).toBeUndefined();
+    expect(
+      decideHealth(
+        episodeB,
+        { type: 'RECOVERY_SUCCEEDED', fence: fenceA, at: NOW, ready: true },
+        NOW
+      )
+    ).toBeUndefined();
+    expect(
+      decideHealth(
+        episodeB,
+        { type: 'RECOVERY_SUCCEEDED', fence: fenceB, at: NOW, ready: true },
+        NOW
+      )?.state.kind
+    ).toBe('healthy');
   });
 
   it('recovering + CANCEL{recovery} → unhealthy unresponsive', () => {

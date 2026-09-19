@@ -33,6 +33,7 @@ import { allocationRecordSchema } from './model/allocation.js';
 const NOW = 4_000_000;
 const FAR = NOW + 10_000_000;
 const INC = 'inc-1';
+const EPISODE_ID = '11111111-1111-4111-8111-111111111111';
 const CF_CAPS: ProviderCapabilities = { persistentWorkspace: false, destroysOnStop: true };
 const TARGET: AllocationTarget = {
   provider: 'cloudflare',
@@ -73,6 +74,8 @@ function recoveringHealth(attempts = 1): HealthState {
     step: 'check_sandbox',
     attempts,
     deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+    episodeId: EPISODE_ID,
+    cause: 'activation_pending',
   };
 }
 
@@ -156,21 +159,21 @@ function destroyProof(): StopProof {
   };
 }
 
-function recoveryFence(incarnation: string, episode: number, attempt: number): RecoveryFence {
+function recoveryFence(incarnation: string, episodeId: string, attempt: number): RecoveryFence {
   return {
     incarnation,
-    episode,
+    episodeId,
     attempt,
-    operationId: operationId('reconcile', incarnation, episode, attempt),
+    operationId: operationId('reconcile', incarnation, episodeId, attempt),
   };
 }
 
 function allocationRecoveryFence(state: AllocationRecord): RecoveryFence {
   if (state.state.kind === 'allocated' && state.state.health.kind === 'recovering') {
     const health = state.state.health;
-    return recoveryFence(health.incarnation, health.deadlineAt, health.attempts + 1);
+    return recoveryFence(health.incarnation, health.episodeId, health.attempts + 1);
   }
-  return recoveryFence(INC, NOW + POLICY.recoveryDeadlineMs, 1);
+  return recoveryFence(INC, EPISODE_ID, 1);
 }
 
 function allocationEvent(state: AllocationRecord, event: string): AllocationInputEvent {
@@ -271,13 +274,19 @@ function allocationEvent(state: AllocationRecord, event: string): AllocationInpu
     case 'CANCEL.RECOVERY':
       return { type: 'CANCEL', scope: 'recovery' };
     case 'DEADLINE':
-      return { type: 'DEADLINE' };
+      return { type: 'DEADLINE', episodeId: EPISODE_ID };
     case 'CONNECTED':
-      return { type: 'CONNECTED', incarnation: INC, at: NOW, ready: true };
+      return { type: 'CONNECTED', incarnation: INC, at: NOW, ready: true, episodeId: EPISODE_ID };
     case 'HEARTBEAT':
-      return { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: true };
+      return { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: true, episodeId: EPISODE_ID };
     case 'HEALTH_OBSERVED':
-      return { type: 'HEALTH_OBSERVED', incarnation: INC, at: NOW, providerState: 'active' };
+      return {
+        type: 'HEALTH_OBSERVED',
+        incarnation: INC,
+        at: NOW,
+        providerState: 'active',
+        episodeId: EPISODE_ID,
+      };
     case 'RECOVERY_STEP':
       return {
         type: 'RECOVERY_STEP',
@@ -317,18 +326,24 @@ function healthState(key: string): HealthState {
 
 function healthRecoveryFence(state: HealthState): RecoveryFence {
   return state.kind === 'recovering'
-    ? recoveryFence(state.incarnation, state.deadlineAt, state.attempts + 1)
-    : recoveryFence(INC, NOW + POLICY.recoveryDeadlineMs, 1);
+    ? recoveryFence(state.incarnation, state.episodeId, state.attempts + 1)
+    : recoveryFence(INC, EPISODE_ID, 1);
 }
 
 function healthEvent(state: HealthState, key: string): HealthEvent {
   switch (key) {
     case 'CONNECTED':
-      return { type: 'CONNECTED', incarnation: INC, at: NOW, ready: true };
+      return { type: 'CONNECTED', incarnation: INC, at: NOW, ready: true, episodeId: EPISODE_ID };
     case 'HEARTBEAT':
-      return { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: true };
+      return { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: true, episodeId: EPISODE_ID };
     case 'HEALTH_OBSERVED':
-      return { type: 'HEALTH_OBSERVED', incarnation: INC, at: NOW, providerState: 'active' };
+      return {
+        type: 'HEALTH_OBSERVED',
+        incarnation: INC,
+        at: NOW,
+        providerState: 'active',
+        episodeId: EPISODE_ID,
+      };
     case 'RECOVERY_STEP':
       return {
         type: 'RECOVERY_STEP',
@@ -349,7 +364,7 @@ function healthEvent(state: HealthState, key: string): HealthEvent {
     case 'CANCEL':
       return { type: 'CANCEL', scope: 'recovery' };
     case 'DEADLINE':
-      return { type: 'DEADLINE' };
+      return { type: 'DEADLINE', episodeId: EPISODE_ID };
     default:
       throw new Error(`unknown health event ${key}`);
   }
@@ -537,14 +552,20 @@ function payloadVariants(machine: MachineName, state: unknown, event: string): S
       case 'HEALTH_OBSERVED':
         return (['active', 'unknown', 'terminal'] as const).map(providerState => ({
           state,
-          event: { type: 'HEALTH_OBSERVED', incarnation: INC, at: NOW, providerState },
+          event: {
+            type: 'HEALTH_OBSERVED',
+            incarnation: INC,
+            at: NOW,
+            providerState,
+            episodeId: EPISODE_ID,
+          },
           now: NOW,
         }));
       case 'CONNECTED':
       case 'HEARTBEAT':
         return [true, false].map(ready => ({
           state,
-          event: { type: event, incarnation: INC, at: NOW, ready },
+          event: { type: event, incarnation: INC, at: NOW, ready, episodeId: EPISODE_ID },
           now: NOW,
         }));
       case 'HEALTH_UNHEALTHY':
@@ -561,8 +582,8 @@ function payloadVariants(machine: MachineName, state: unknown, event: string): S
         }));
       case 'DEADLINE':
         return [
-          { state, event: { type: 'DEADLINE' }, now: NOW },
-          { state, event: { type: 'DEADLINE' }, now: FAR },
+          { state, event: { type: 'DEADLINE', episodeId: EPISODE_ID }, now: NOW },
+          { state, event: { type: 'DEADLINE', episodeId: EPISODE_ID }, now: FAR },
         ];
       default:
         return [{ state, event: allocationEvent(record, event), now: NOW }];
@@ -575,19 +596,25 @@ function payloadVariants(machine: MachineName, state: unknown, event: string): S
       case 'HEARTBEAT':
         return [true, false].map(ready => ({
           state,
-          event: { type: event, incarnation: INC, at: NOW, ready },
+          event: { type: event, incarnation: INC, at: NOW, ready, episodeId: EPISODE_ID },
           now: NOW,
         }));
       case 'HEALTH_OBSERVED':
         return (['active', 'unknown', 'terminal'] as const).map(providerState => ({
           state,
-          event: { type: 'HEALTH_OBSERVED', incarnation: INC, at: NOW, providerState },
+          event: {
+            type: 'HEALTH_OBSERVED',
+            incarnation: INC,
+            at: NOW,
+            providerState,
+            episodeId: EPISODE_ID,
+          },
           now: NOW,
         }));
       case 'DEADLINE':
         return [
-          { state, event: { type: 'DEADLINE' }, now: NOW },
-          { state, event: { type: 'DEADLINE' }, now: FAR },
+          { state, event: { type: 'DEADLINE', episodeId: EPISODE_ID }, now: NOW },
+          { state, event: { type: 'DEADLINE', episodeId: EPISODE_ID }, now: FAR },
         ];
       default:
         return [{ state, event: healthEvent(health, event), now: NOW }];

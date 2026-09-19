@@ -18,6 +18,7 @@ import type {
   HealthVerdict,
   HealthyHealth,
   RecoveringHealth,
+  RecoveryCause,
   UnhealthyHealth,
   ConnectingHealth,
 } from '../model/health.js';
@@ -185,6 +186,8 @@ export const HEALTH_OWNED_FIELDS = [
   'health.step',
   'health.attempts',
   'health.deadlineAt',
+  'health.episodeId',
+  'health.cause',
   'health.verdict',
 ] as const;
 
@@ -219,27 +222,37 @@ function healthy(state: HealthState, incarnation: string, at: number): HealthyHe
   };
 }
 
-function reconcileCommand(
-  incarnation: string,
-  episode: number,
-  attempt: number,
-  expectedWrapperInstanceId?: string
-): Command {
+/**
+ * The single builder for a recovery attempt. The descriptor and phase cannot be
+ * assembled anywhere else: the episode id is the stored uuid identity (never the
+ * deadline, never the create intent, never per-attempt), `startedAt` is derived
+ * from the never-extended deadline, and the phase is the reducer's ladder step.
+ */
+function reconcileCommand(state: RecoveringHealth, expectedWrapperInstanceId?: string): Command {
+  const attempt = state.attempts + 1;
   return {
     kind: 'Reconcile',
-    // The episode (absolute deadline) is part of the operation id so a later
-    // recovery episode never reuses an earlier episode's command id.
-    operationId: operationId('reconcile', incarnation, episode, attempt),
-    incarnation,
+    operationId: operationId('reconcile', state.incarnation, state.episodeId, attempt),
+    incarnation: state.incarnation,
     attempt,
-    deadlineAt: episode,
+    deadlineAt: state.deadlineAt,
+    recovery: {
+      episodeId: state.episodeId,
+      cause: state.cause,
+      startedAt: state.deadlineAt - POLICY.recoveryDeadlineMs,
+      deadlineAt: state.deadlineAt,
+      attempt,
+    },
+    phase: state.step === 'check_sandbox' ? 'drain' : 'ready',
     ...(expectedWrapperInstanceId !== undefined ? { expectedWrapperInstanceId } : {}),
   };
 }
 
 function beginRecovery(
   state: HealthState,
-  at: number
+  at: number,
+  episodeId: string,
+  cause: RecoveryCause
 ): { state: RecoveringHealth; commands: Command[] } {
   const recovering: RecoveringHealth = {
     kind: 'recovering',
@@ -247,23 +260,22 @@ function beginRecovery(
     step: 'check_sandbox',
     attempts: 0,
     deadlineAt: at + POLICY.recoveryDeadlineMs,
+    episodeId,
+    cause,
   };
   return {
     state: recovering,
-    commands: [reconcileCommand(recovering.incarnation, recovering.deadlineAt, 1)],
+    commands: [reconcileCommand(recovering)],
   };
 }
 
 /** A recovery attempt result is valid only for the episode's in-flight attempt. */
 function recoveryFenceMatches(state: RecoveringHealth, fence: RecoveryFence): boolean {
   if (fence.incarnation !== state.incarnation) return false;
-  if (fence.episode !== state.deadlineAt) return false;
+  if (fence.episodeId !== state.episodeId) return false;
   const inFlight = state.attempts + 1;
   if (fence.attempt !== inFlight) return false;
-  return (
-    fence.operationId ===
-    reconcileCommand(state.incarnation, state.deadlineAt, inFlight).operationId
-  );
+  return fence.operationId === reconcileCommand(state).operationId;
 }
 
 /**
@@ -278,14 +290,34 @@ function consumeAttempt(state: RecoveringHealth, step?: HealthRecoveryStep): Dec
   const next: RecoveringHealth = { ...state, attempts, ...(step !== undefined ? { step } : {}) };
   return {
     state: next,
-    commands: [reconcileCommand(next.incarnation, next.deadlineAt, attempts + 1)],
+    commands: [reconcileCommand(next)],
     deadlineAt: next.deadlineAt,
+  };
+}
+
+/**
+ * Enter recovery from the entering event. An event that lacks the minted
+ * `episodeId` is rejected, so a neutral value can never stand in for the missing
+ * identity; `episodeId` is minted once at the impure dispatch boundary.
+ */
+function startRecovery(
+  state: HealthState,
+  at: number,
+  episodeId: string | undefined,
+  cause: RecoveryCause
+): Decision<HealthState> | undefined {
+  if (episodeId === undefined) return undefined;
+  const beginning = beginRecovery(state, at, episodeId, cause);
+  return {
+    state: beginning.state,
+    commands: beginning.commands,
+    deadlineAt: beginning.state.deadlineAt,
   };
 }
 
 function acceptHeartbeat(
   state: HealthState,
-  event: { incarnation: string; at: number; ready: boolean }
+  event: { incarnation: string; at: number; ready: boolean; episodeId?: string }
 ): Decision<HealthState> | undefined {
   if (!matches(state, event.incarnation)) return undefined;
   if (event.ready) {
@@ -297,21 +329,7 @@ function acceptHeartbeat(
     // budget nor re-emits Reconcile while an attempt is in flight.
     return { state, commands: [], deadlineAt: state.deadlineAt };
   }
-  const beginning = beginRecovery(state, event.at);
-  return {
-    state: beginning.state,
-    commands: beginning.commands,
-    deadlineAt: beginning.state.deadlineAt,
-  };
-}
-
-function startRecovery(state: HealthState, at: number): Decision<HealthState> {
-  const beginning = beginRecovery(state, at);
-  return {
-    state: beginning.state,
-    commands: beginning.commands,
-    deadlineAt: beginning.state.deadlineAt,
-  };
+  return startRecovery(state, event.at, event.episodeId, 'activation_pending');
 }
 
 export function decideHealth(
@@ -350,11 +368,11 @@ export function decideHealth(
           const next = { ...state, lastObservation: observation };
           return { state: next, commands: [], deadlineAt: next.deadlineAt };
         }
-        return startRecovery(state, event.at);
+        return startRecovery(state, event.at, event.episodeId, 'activation_pending');
       }
       // providerState 'unknown'
       if (state.kind === 'healthy') {
-        return startRecovery(state, event.at);
+        return startRecovery(state, event.at, event.episodeId, 'control_disconnected');
       }
       const next = { ...state, lastObservation: observation };
       return { state: next, commands: [], deadlineAt: next.deadlineAt };
@@ -390,7 +408,12 @@ export function decideHealth(
       if (now < state.deadlineAt) {
         return { state, commands: [], deadlineAt: state.deadlineAt };
       }
-      return startRecovery(state, now);
+      return startRecovery(
+        state,
+        now,
+        event.episodeId,
+        state.kind === 'healthy' ? 'heartbeat_expired' : 'activation_pending'
+      );
     }
   }
 }

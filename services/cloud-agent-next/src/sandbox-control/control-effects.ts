@@ -73,7 +73,7 @@ function fence(
 function recoveryFence(command: ReconcileCommand): RecoveryFence {
   return {
     incarnation: command.incarnation,
-    episode: command.deadlineAt,
+    episodeId: command.recovery.episodeId,
     attempt: command.attempt,
     operationId: command.operationId,
   };

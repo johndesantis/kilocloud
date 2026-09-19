@@ -101,35 +101,38 @@ export type AllocationEvent =
   | { type: 'CHECK' }
   | { type: 'OBSERVED'; fence: ResultFence; result: 'absent' | 'present' }
   | AllocationCancelEvent
-  | { type: 'DEADLINE' };
+  | { type: 'DEADLINE'; episodeId?: string };
 
 /**
- * Fence for a recovery attempt result. `episode` is the absolute recovery
- * deadline (the episode key), `attempt` is the 1-based attempt within the
- * episode, and `operationId` is the `Reconcile` command the result completes.
+ * Fence for a recovery attempt result. `episodeId` is the stored uuid episode
+ * identity (stable across the episode's attempts), `attempt` is the 1-based
+ * attempt within the episode, and `operationId` is the `Reconcile` command the
+ * result completes. The absolute deadline is deliberately not the identity: two
+ * episodes accepted at the same timestamp would otherwise share a fence.
  */
 export type RecoveryFence = {
   incarnation: string;
-  episode: number;
+  episodeId: string;
   attempt: number;
   operationId: string;
 };
 
 export type HealthEvent =
-  | { type: 'CONNECTED'; incarnation: string; at: number; ready: boolean }
-  | { type: 'HEARTBEAT'; incarnation: string; at: number; ready: boolean }
+  | { type: 'CONNECTED'; incarnation: string; at: number; ready: boolean; episodeId?: string }
+  | { type: 'HEARTBEAT'; incarnation: string; at: number; ready: boolean; episodeId?: string }
   | {
       type: 'HEALTH_OBSERVED';
       incarnation: string;
       at: number;
       providerState: 'active' | 'terminal' | 'unknown';
+      episodeId?: string;
     }
   | { type: 'RECOVERY_STEP'; fence: RecoveryFence; step: HealthRecoveryStep }
   | { type: 'RECOVERY_ATTEMPT_FAILED'; fence: RecoveryFence }
   | { type: 'RECOVERY_SUCCEEDED'; fence: RecoveryFence; at: number; ready: boolean }
   | { type: 'HEALTH_UNHEALTHY'; verdict: HealthVerdict }
   | HealthCancelEvent
-  | { type: 'DEADLINE' };
+  | { type: 'DEADLINE'; episodeId?: string };
 
 /**
  * Events the allocation machine accepts. In `allocated` it delegates `HealthEvent`s

@@ -12,6 +12,8 @@ import {
 
 const NOW = 1_000_000;
 const INC = 'inc-1';
+const EPISODE_ID = '11111111-1111-4111-8111-111111111111';
+const OTHER_EPISODE_ID = '22222222-2222-4222-8222-222222222222';
 
 const CAPS: AllocationTarget['capabilities'] = {
   persistentWorkspace: false,
@@ -64,14 +66,18 @@ function allocatedRecordWithIntent(intentId: string): AllocationRecord {
   };
 }
 
-function controllerFor(record: AllocationRecord | null, now = NOW) {
+function controllerFor(
+  record: AllocationRecord | null,
+  now = NOW,
+  mintEpisodeId: () => string = () => EPISODE_ID
+) {
   const data = new Map<string, unknown>();
   if (record) data.set(ALLOCATION_KEY, record);
   const storage = seededStorage(data);
   return {
     data,
     storage,
-    controller: createAllocationController({ storage, now: () => now }),
+    controller: createAllocationController({ storage, now: () => now, mintEpisodeId }),
   };
 }
 
@@ -117,11 +123,33 @@ describe('allocation controller — single writer / dispatcher', () => {
     const { controller } = controllerFor(allocatedRecord());
     const event = { type: 'HEARTBEAT', incarnation: INC, at: NOW, ready: false } as const;
     const throughController = await controller.dispatch(event, NOW);
-    const direct = decideAllocation(allocatedRecord(), event, NOW);
+    const direct = decideAllocation(allocatedRecord(), { ...event, episodeId: EPISODE_ID }, NOW);
     expect(throughController?.state).toEqual(direct?.state);
     expect(throughController?.commands).toEqual(direct?.commands);
     expect(throughController?.deadlineAt).toBe(direct?.deadlineAt);
     expect(throughController?.state.state.kind === 'allocated').toBe(true);
+    const health =
+      throughController?.state.state.kind === 'allocated'
+        ? throughController.state.state.health
+        : undefined;
+    expect(health?.kind === 'recovering' && health.episodeId).toBe(EPISODE_ID);
+  });
+
+  it('does not mint a second episode id for an event that already carries one', async () => {
+    const { controller } = controllerFor(allocatedRecord());
+    const decision = await controller.dispatch(
+      {
+        type: 'HEARTBEAT',
+        incarnation: INC,
+        at: NOW,
+        ready: false,
+        episodeId: OTHER_EPISODE_ID,
+      },
+      NOW
+    );
+    const health =
+      decision?.state.state.kind === 'allocated' ? decision.state.state.health : undefined;
+    expect(health?.kind === 'recovering' && health.episodeId).toBe(OTHER_EPISODE_ID);
   });
 
   it('fails closed on a malformed canonical value', async () => {

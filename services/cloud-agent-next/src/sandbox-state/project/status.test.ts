@@ -92,6 +92,8 @@ describe('public status projection', () => {
         step: 'check_sandbox',
         attempts: 1,
         deadlineAt: NOW + 1_000,
+        episodeId: '11111111-1111-4111-8111-111111111111',
+        cause: 'activation_pending',
       },
     };
     expect(projectStatus({ allocation: record(recovering), ownerPresent: true, now: NOW })).toEqual(

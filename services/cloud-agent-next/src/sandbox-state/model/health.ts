@@ -33,6 +33,14 @@ export type ProviderObservation = z.infer<typeof observationSchema>;
 export const healthRecoveryStepSchema = z.enum(['check_sandbox', 'reconnect_wrapper']);
 export type HealthRecoveryStep = z.infer<typeof healthRecoveryStepSchema>;
 
+/** Why recovery was entered; derived purely by the reducer from the entering event. */
+export const recoveryCauseSchema = z.enum([
+  'activation_pending',
+  'control_disconnected',
+  'heartbeat_expired',
+]);
+export type RecoveryCause = z.infer<typeof recoveryCauseSchema>;
+
 export const healthVerdictSchema = z.enum(['absent', 'unresponsive']);
 export type HealthVerdict = z.infer<typeof healthVerdictSchema>;
 
@@ -77,6 +85,9 @@ export const recoveringHealthSchema = z
     step: healthRecoveryStepSchema,
     attempts: z.number().int().nonnegative(),
     deadlineAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    /** Episode identity: minted once at the impure dispatch boundary, stable across attempts. */
+    episodeId: z.string().uuid(),
+    cause: recoveryCauseSchema,
   })
   .strict();
 

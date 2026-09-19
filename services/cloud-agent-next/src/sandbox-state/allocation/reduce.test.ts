@@ -13,6 +13,7 @@ import { POLICY } from '../schedule.js';
 
 const NOW = 1_000_000;
 const INC = 'inc-1';
+const EPISODE_ID = '11111111-1111-4111-8111-111111111111';
 
 const CF_CAPS: ProviderCapabilities = { persistentWorkspace: false, destroysOnStop: true };
 const VERCEL_CAPS: ProviderCapabilities = { persistentWorkspace: true, destroysOnStop: false };
@@ -84,6 +85,8 @@ function allocated(healthInput: HealthStateInput, idleAt: number | null = null):
               step: 'check_sandbox' as const,
               attempts: 1,
               deadlineAt: NOW + POLICY.recoveryDeadlineMs,
+              episodeId: EPISODE_ID,
+              cause: 'activation_pending' as const,
             }
           : { kind: 'unhealthy' as const, incarnation: INC, verdict: healthInput.verdict };
   return {
@@ -424,6 +427,7 @@ describe('allocation reducer — design §5 transitions', () => {
         incarnation: INC,
         at: NOW,
         ready: false,
+        episodeId: EPISODE_ID,
       },
       NOW
     );

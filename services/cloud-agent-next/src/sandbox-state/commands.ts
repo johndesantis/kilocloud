@@ -4,6 +4,8 @@
  * effect is idempotent.
  */
 import type { AllocationTarget, StopProof } from './model/allocation.js';
+import type { SandboxRecovery } from '../shared/sandbox-control-protocol.js';
+import type { ReconcilePhase } from './ports/reconcile.js';
 
 export type OperationId = string;
 
@@ -60,6 +62,10 @@ export type ReconcileCommand = {
   attempt: number;
   /** Absolute recovery deadline shared by all attempts; never extended. */
   deadlineAt: number;
+  /** Episode descriptor sent verbatim on the wire; built only by `reconcileCommand`. */
+  recovery: SandboxRecovery;
+  /** Ladder step this attempt executes; `commit` is never a command phase. */
+  phase: ReconcilePhase;
   expectedWrapperInstanceId?: string;
 };
 

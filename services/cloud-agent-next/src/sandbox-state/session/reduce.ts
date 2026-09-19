@@ -265,6 +265,28 @@ function deadlined(aggregate: SessionAggregate): Decision<SessionAggregate> {
   return { state: aggregate, commands: [], deadlineAt: sessionAlarmAt(aggregate) };
 }
 
+/**
+ * Canonical allocation-loss terminalization without the incarnation fence: every
+ * `queued`/`accepted` message becomes a coordinator `failed` carrying the loss
+ * reason, and the binding clears. `decideSession`'s `STOPPED` branch fences first
+ * and then applies exactly this; the stopped-seam adapter's proof-independent
+ * settlement calls it directly so the row map has one owner, not two.
+ */
+export function terminalizeOnStop(
+  aggregate: SessionAggregate,
+  reason: string,
+  now: number
+): SessionAggregate {
+  return {
+    binding: { kind: 'unbound' },
+    messages: aggregate.messages.map(message =>
+      message.state.kind === 'queued' || message.state.kind === 'accepted'
+        ? { ...message, state: terminal(message.state, 'failed', now, 'coordinator', { reason }) }
+        : message
+    ),
+  };
+}
+
 export function decideSession(
   aggregate: SessionAggregate,
   event: SessionEvent,
@@ -437,15 +459,11 @@ export function decideSession(
       if (event.proof.wrapper !== undefined && event.proof.wrapper !== handle.wrapper) {
         return undefined;
       }
-      const messages = aggregate.messages.map(message => {
-        if (message.state.kind !== 'queued' && message.state.kind !== 'accepted') return message;
-        return {
-          ...message,
-          state: terminal(message.state, 'failed', now, 'coordinator', { reason: event.reason }),
-        };
-      });
-      const next: SessionAggregate = { binding: { kind: 'unbound' }, messages };
-      return { state: next, commands: [], deadlineAt: null };
+      return {
+        state: terminalizeOnStop(aggregate, event.reason, now),
+        commands: [],
+        deadlineAt: null,
+      };
     }
     case 'DEADLINE': {
       let changed = false;
