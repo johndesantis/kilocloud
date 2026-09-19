@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { decideAllocation } from './reduce.js';
+import { ALLOCATION_TRANSITIONS, allocationStateKey, decideAllocation } from './reduce.js';
 import { operationId } from '../commands.js';
-import type { ResultFence } from '../events.js';
+import type { AllocationInputEvent, ResultFence } from '../events.js';
 import type {
   AllocationRecord,
   AllocationTarget,
@@ -298,14 +298,14 @@ describe('allocation reducer — design §5 transitions', () => {
     expect(commandKinds(decision)).toEqual(['Observe']);
   });
 
-  it('allocated + IDLE due and eligible → stopping.destroying with Destroy', () => {
+  it('allocated + IDLE due and eligible → stopping.destroying with Destroy and notify', () => {
     const decision = decideAllocation(
       allocated({ kind: 'healthy' }, NOW - 1),
       { type: 'IDLE', idleAt: NOW - 1 },
       NOW
     );
     expect(decision?.state.state.kind).toBe('stopping');
-    expect(commandKinds(decision)).toEqual(['Destroy']);
+    expect(commandKinds(decision)).toEqual(['Destroy', 'NotifySession']);
     expect(decision?.deadlineAt).toBe(NOW + POLICY.stopDeadlineMs);
   });
 
@@ -352,7 +352,7 @@ describe('allocation reducer — design §5 transitions', () => {
       NOW
     );
     expect(decision?.state.state.kind).toBe('stopping');
-    expect(commandKinds(decision)).toEqual(['Destroy']);
+    expect(commandKinds(decision)).toEqual(['Destroy', 'NotifySession']);
   });
 
   it('allocated + CANCEL{recovery} while healthy is rejected (nothing to recover)', () => {
@@ -403,7 +403,7 @@ describe('allocation reducer — design §5 transitions', () => {
       NOW
     );
     expect(decision?.state.state.kind).toBe('stopping');
-    expect(commandKinds(decision)).toEqual(['Destroy']);
+    expect(commandKinds(decision)).toEqual(['Destroy', 'NotifySession']);
   });
 
   it('allocated + DEADLINE while recovering past idleAt does not transition IDLE', () => {
@@ -680,7 +680,7 @@ describe('allocation reducer — design §5 transitions', () => {
       },
     };
     const decision = decideAllocation(record, { type: 'CANCEL', scope: 'allocation' }, NOW);
-    expect(commandKinds(decision)).toEqual(['Stop']);
+    expect(commandKinds(decision)).toEqual(['Stop', 'NotifySession']);
   });
 
   it('every emitted command carries an operation id', () => {
@@ -691,6 +691,33 @@ describe('allocation reducer — design §5 transitions', () => {
     );
     for (const command of decision!.commands) {
       expect(command.operationId.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('declared commands match the emitted commands when entering stopping from allocated', () => {
+    const cases: Array<{ record: AllocationRecord; event: AllocationInputEvent }> = [
+      { record: allocated({ kind: 'healthy' }), event: { type: 'IDLE', idleAt: NOW } },
+      { record: allocated({ kind: 'healthy' }), event: { type: 'CANCEL', scope: 'allocation' } },
+      { record: allocated({ kind: 'healthy' }, NOW - 1), event: { type: 'DEADLINE' } },
+    ];
+    const normalize = (kinds: readonly string[]) => {
+      const set = new Set(
+        kinds.map(kind => (kind === 'Stop' || kind === 'Destroy' ? 'EFFECT' : kind))
+      );
+      return [...set].sort();
+    };
+    for (const { record, event } of cases) {
+      const decision = decideAllocation(record, event, NOW)!;
+      const declared = ALLOCATION_TRANSITIONS.find(
+        transition =>
+          transition.from === allocationStateKey(record.state) &&
+          transition.event === event.type &&
+          transition.to === allocationStateKey(decision.state.state)
+      );
+      expect(declared, `${event.type} from allocated`).toBeDefined();
+      expect(normalize(decision.commands.map(command => command.kind))).toEqual(
+        normalize(declared!.commands)
+      );
     }
   });
 });

@@ -70,7 +70,8 @@ export const ALLOCATION_EVENT_TYPES = [
 ] as const;
 
 const EFFECT_COMMANDS = ['Stop', 'Destroy'] as const;
-const LOSS_COMMANDS = ['Stop', 'Destroy', 'NotifySession'] as const;
+/** Entering `stopping` from `allocated` always notifies attached sessions. */
+const STOPPING_COMMANDS = ['Stop', 'Destroy', 'NotifySession'] as const;
 
 export const ALLOCATION_TRANSITIONS: readonly TransitionMeta[] = [
   { from: 'stopped', event: 'DEMAND', to: 'creating', commands: ['Create'], deadline: 'create' },
@@ -125,14 +126,14 @@ export const ALLOCATION_TRANSITIONS: readonly TransitionMeta[] = [
     from: 'allocated.connecting',
     event: 'IDLE',
     to: 'stopping.destroying',
-    commands: EFFECT_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
   {
     from: 'allocated.healthy',
     event: 'IDLE',
     to: 'stopping.destroying',
-    commands: EFFECT_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
   {
@@ -153,35 +154,35 @@ export const ALLOCATION_TRANSITIONS: readonly TransitionMeta[] = [
     from: 'allocated.connecting',
     event: 'CANCEL',
     to: 'stopping.destroying',
-    commands: EFFECT_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
   {
     from: 'allocated.healthy',
     event: 'CANCEL',
     to: 'stopping.destroying',
-    commands: EFFECT_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
   {
     from: 'allocated.recovering',
     event: 'CANCEL',
     to: 'stopping.destroying',
-    commands: EFFECT_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
   {
     from: 'allocated.connecting',
     event: 'DEADLINE',
     to: 'stopping.destroying',
-    commands: EFFECT_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
   {
     from: 'allocated.healthy',
     event: 'DEADLINE',
     to: 'stopping.destroying',
-    commands: EFFECT_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
   {
@@ -223,7 +224,7 @@ export const ALLOCATION_TRANSITIONS: readonly TransitionMeta[] = [
     from: 'allocated.recovering',
     event: 'DEADLINE',
     to: 'stopping.destroying',
-    commands: LOSS_COMMANDS,
+    commands: STOPPING_COMMANDS,
     deadline: 'destroy',
   },
 
@@ -356,11 +357,17 @@ function fenceMatches(
   return true;
 }
 
-function effectCommand(target: AllocationTarget, reason: string, opKey: string): Command[] {
+function effectCommand(
+  target: AllocationTarget,
+  reason: string,
+  opKey: string,
+  incarnation?: string
+): Command[] {
   const effect = effectFor(target);
+  const origin = incarnation !== undefined ? { incarnation } : {};
   return effect === 'stop'
-    ? [{ kind: 'Stop', operationId: opKey, target, reason }]
-    : [{ kind: 'Destroy', operationId: opKey, target, reason }];
+    ? [{ kind: 'Stop', operationId: opKey, target, reason, ...origin }]
+    : [{ kind: 'Destroy', operationId: opKey, target, reason, ...origin }];
 }
 
 function effectOperationId(state: StoppingDestroying): string {
@@ -457,7 +464,7 @@ function applyHealth(
     return {
       state: { v: 2, resumable: record.resumable, state: stopping },
       commands: [
-        ...effectCommand(state.target, reason, effectOperationId(stopping)),
+        ...effectCommand(state.target, reason, effectOperationId(stopping), incarnation),
         notifyCommand(reason, now, lossProof(state.target, incarnation, reason, now)),
       ],
       deadlineAt: stopping.deadlineAt,
@@ -635,6 +642,9 @@ export function decideAllocation(
                 kind: 'Observe',
                 operationId: operationId('observe', state.stopIntent.createdAt),
                 target: state.target,
+                ...(state.stopIntent.incarnation !== undefined
+                  ? { incarnation: state.stopIntent.incarnation }
+                  : {}),
               },
             ],
             deadlineAt,
@@ -642,7 +652,12 @@ export function decideAllocation(
         }
         return {
           state: { v: 2, resumable: record.resumable, state: next },
-          commands: effectCommand(state.target, state.stopIntent.reason, effectOperationId(next)),
+          commands: effectCommand(
+            state.target,
+            state.stopIntent.reason,
+            effectOperationId(next),
+            state.stopIntent.incarnation
+          ),
           deadlineAt,
         };
       }
@@ -719,7 +734,8 @@ export function decideAllocation(
             commands: effectCommand(
               state.target,
               state.stopIntent.reason,
-              operationId('stop', state.stopIntent.createdAt, attempts)
+              operationId('stop', state.stopIntent.createdAt, attempts),
+              state.stopIntent.incarnation
             ),
             deadlineAt: state.deadlineAt,
           };
@@ -766,7 +782,12 @@ export function decideAllocation(
           }
           return {
             state: record,
-            commands: effectCommand(state.target, state.stopIntent.reason, expected),
+            commands: effectCommand(
+              state.target,
+              state.stopIntent.reason,
+              expected,
+              state.stopIntent.incarnation
+            ),
             deadlineAt: state.deadlineAt,
           };
         }
@@ -781,7 +802,12 @@ export function decideAllocation(
           if (event.scope !== 'allocation') return undefined;
           return {
             state: record,
-            commands: effectCommand(state.target, state.stopIntent.reason, expected),
+            commands: effectCommand(
+              state.target,
+              state.stopIntent.reason,
+              expected,
+              state.stopIntent.incarnation
+            ),
             deadlineAt: state.deadlineAt,
           };
         }
@@ -831,7 +857,8 @@ export function decideAllocation(
             commands: effectCommand(
               target,
               stopping.stopIntent.reason,
-              effectOperationId(stopping)
+              effectOperationId(stopping),
+              stopping.stopIntent.incarnation
             ),
             deadlineAt: stopping.deadlineAt,
           };
@@ -903,6 +930,14 @@ function toUnknown(
   return { state: next, commands, deadlineAt };
 }
 
+/**
+ * Entering `stopping` from `allocated` (idle, `CANCEL{allocation}` or an idle
+ * `DEADLINE`) emits the provider effect and the immediate session notification
+ * (`STOPPING_COMMANDS`). The notification is **not** exactly-once over the
+ * lifecycle: `DESTROY_CONFIRMED` and `OBSERVED absent` re-emit `NotifySession`
+ * with the stop proof, and the session seam (not the reducer) enforces exactly
+ * one terminalization by ignoring a duplicate/replayed `STOPPED`.
+ */
 function enterStoppingFromAllocated(
   record: AllocationRecord,
   state: AllocatedAllocation,
@@ -918,7 +953,15 @@ function enterStoppingFromAllocated(
   );
   return {
     state: { v: 2, resumable: record.resumable, state: stopping },
-    commands: effectCommand(state.target, reason, effectOperationId(stopping)),
+    commands: [
+      ...effectCommand(
+        state.target,
+        reason,
+        effectOperationId(stopping),
+        stopping.stopIntent.incarnation
+      ),
+      notifyCommand(reason, now),
+    ],
     deadlineAt: stopping.deadlineAt,
   };
 }

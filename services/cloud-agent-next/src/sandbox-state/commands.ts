@@ -28,6 +28,8 @@ export type StopCommand = {
   operationId: OperationId;
   target: AllocationTarget;
   reason: string;
+  /** Originating allocation incarnation; fences the stop result against a stale attempt. */
+  incarnation?: string;
 };
 
 export type DestroyCommand = {
@@ -35,12 +37,16 @@ export type DestroyCommand = {
   operationId: OperationId;
   target: AllocationTarget;
   reason: string;
+  /** Originating allocation incarnation; fences the stop result against a stale attempt. */
+  incarnation?: string;
 };
 
 export type ObserveCommand = {
   kind: 'Observe';
   operationId: OperationId;
   target: AllocationTarget;
+  /** Originating allocation incarnation; fences the observation against a stale attempt. */
+  incarnation?: string;
 };
 
 /**

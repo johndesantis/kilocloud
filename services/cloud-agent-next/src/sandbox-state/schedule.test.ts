@@ -181,6 +181,6 @@ describe('scheduler regression — recovery just before idle expiry', () => {
 
     const idle = decideAllocation(recoveredRecord, { type: 'IDLE', idleAt }, NOW + 30_000);
     expect(idle?.state.state.kind).toBe('stopping');
-    expect(idle?.commands.map(command => command.kind)).toEqual(['Destroy']);
+    expect(idle?.commands.map(command => command.kind)).toEqual(['Destroy', 'NotifySession']);
   });
 });
