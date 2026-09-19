@@ -55,6 +55,13 @@ import { logger } from '../logger.js';
 import { validateControlLogUploadGrant } from './log-upload-grant.js';
 import { summarizeHeartbeatIdle } from './status-projection.js';
 
+import {
+  writeSessionMessages,
+  seedAllocationRecord,
+  readAllocationRecordFrom,
+  readSessionMessagesFrom,
+  seedSessionValue,
+} from '../sandbox-state/persist/access.js';
 const mocks = vi.hoisted(() => ({
   getSandbox: vi.fn(),
   providerCreate: vi.fn(),
@@ -640,7 +647,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     const blocked = h.storage.transaction(async () => {
       entered.resolve();
       await gate.promise;
-      h.records.set('physical_record', {
+      seedAllocationRecord(h.records, {
         state: 'creating',
         providerRef: null,
         createIntent: { intentId: 'replacement', createdAt: Date.now() },
@@ -697,7 +704,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       };
       h.records.set('runtime_metadata', runtime);
       if (state !== 'missing') {
-        h.records.set('physical_record', {
+        seedAllocationRecord(h.records, {
           state,
           providerRef: state === 'stopped' ? null : 'instance_pending',
           resumable: false,
@@ -787,7 +794,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     };
     vi.spyOn(h.ctx, 'getWebSockets').mockReturnValue([socket as unknown as WebSocket]);
     h.records.set('provider_kind', 'cloudflare');
-    h.records.set('physical_record', {
+    seedAllocationRecord(h.records, {
       state: 'running',
       providerRef: identity.providerInstanceId,
       createIntent: null,
@@ -1096,7 +1103,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       await h.create();
       const identity = await h.ready();
       const physical = await h.control.getPhysicalRecord();
-      h.records.set('physical_record', {
+      seedAllocationRecord(h.records, {
         ...physical,
         containment: {
           ...physical.containment,
@@ -1732,7 +1739,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     await entered.promise;
     const physical = await h.control.getPhysicalRecord();
     // Synthetic defensive fixture: no production transition was established to produce this record.
-    h.records.set('physical_record', { ...physical, state: 'unknown', stopTombstone: null });
+    seedAllocationRecord(h.records, { ...physical, state: 'unknown', stopTombstone: null });
     billing.resolve();
     const changed = await acquiring.then(
       () => new Error('Expected a billing admission state rejection'),
@@ -1798,13 +1805,13 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.create();
     const original = await h.ready();
     const physical = await h.control.getPhysicalRecord();
-    h.records.set('physical_record', { ...physical, createIntent: null });
+    seedAllocationRecord(h.records, { ...physical, createIntent: null });
     const acquisition = { id: 'attempt_a', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
     await h.acquire(acquisition);
     expect(h.records.get('acquisition_receipts')).toEqual([
       { ...acquisition, allocation: { kind: 'provider', id: original.providerInstanceId } },
     ]);
-    h.records.set('physical_record', {
+    seedAllocationRecord(h.records, {
       ...physical,
       createIntent: { intentId: 'replacement_intent', createdAt: Date.now() },
     });
@@ -2128,7 +2135,7 @@ describe('SandboxControl lifecycle boundaries', () => {
         wrapperInstanceId: identity.wrapperInstanceId ?? '',
         reason: 'execution_failed',
       };
-      h.records.set('physical_record', {
+      seedAllocationRecord(h.records, {
         ...physical,
         state: 'stopping',
         stopTombstone: {
@@ -5481,9 +5488,9 @@ describe('SandboxControl lifecycle boundaries', () => {
       };
       const values = new Map<string, unknown>([
         ['session_metadata', await h.session.getCredentialMetadata()],
-        ['session_messages', [completed]],
         ['native_runtime_fence', nativeFence],
       ]);
+      seedSessionValue(values, [completed]);
       const kv: SyncKvStorage = {
         get: <T>(key: string): T | undefined => structuredClone(values.get(key)) as T | undefined,
         put: <T>(key: string, value: T) => {
@@ -5597,7 +5604,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       );
       const persisted = eventQueries.findByEntityPrefix('');
       expect(persisted).toHaveLength(1);
-      expect(values.get('session_messages')).toEqual([completed]);
+      expect(readSessionMessagesFrom(values)).toEqual([completed]);
       expect([...h.records]).toEqual(beforeControl);
 
       h.records.set('session_routes', [{ ...route, nativeRuntimeId: replacementRuntimeId }]);
@@ -5606,7 +5613,7 @@ describe('SandboxControl lifecycle boundaries', () => {
         nativeRuntimeId: replacementRuntimeId,
         attachmentEpoch: 2,
       });
-      kv.put('session_messages', [
+      writeSessionMessages(kv, [
         completed,
         {
           messageId: 'message_B',
@@ -5680,7 +5687,7 @@ describe('SandboxControl lifecycle boundaries', () => {
         })
       );
       expect(eventQueries.findByEntityPrefix('')).toHaveLength(2);
-      expect(values.get('session_messages')).toEqual([
+      expect(readSessionMessagesFrom(values)).toEqual([
         completed,
         expect.objectContaining({ messageId: 'message_B', state: 'accepted' }),
       ]);
@@ -6481,7 +6488,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.control.beginStop('execution_failed');
     const physical = await h.control.getPhysicalRecord();
     const tombstone = { ...physical.stopTombstone, attempts: 5 };
-    h.records.set('physical_record', { ...physical, stopTombstone: tombstone });
+    seedAllocationRecord(h.records, { ...physical, stopTombstone: tombstone });
     h.records.delete('deadlines');
     await h.storage.deleteAlarm();
     vi.setSystemTime(Date.now() + DEADLINE_MS.reconciliationWindow + 1);
@@ -6659,7 +6666,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     const h = await harness();
     const createdAt = Date.now();
     h.records.set('provider_kind', 'vercel');
-    h.records.set('physical_record', {
+    seedAllocationRecord(h.records, {
       state: 'unknown',
       providerRef: 'retired_instance',
       createIntent: { intentId: 'retired_intent', createdAt },
@@ -7195,8 +7202,8 @@ describe('SandboxControl lifecycle boundaries', () => {
 
     it('emits recovery_outcome skipped when recovery cannot commit', async () => {
       const { h } = await readyWithAcceptedHeartbeat(true);
-      const physical = h.records.get('physical_record') as Record<string, unknown>;
-      h.records.set('physical_record', { ...physical, state: 'stopped' });
+      const physical = readAllocationRecordFrom(h.records) as Record<string, unknown>;
+      seedAllocationRecord(h.records, { ...physical, state: 'stopped' });
 
       const fields = vi.spyOn(logger, 'withFields').mockReturnValue(logger);
       try {
@@ -7235,8 +7242,8 @@ describe('SandboxControl lifecycle boundaries', () => {
       }
 
       const skipped = await readyWithAcceptedHeartbeat();
-      const physical = skipped.h.records.get('physical_record') as Record<string, unknown>;
-      skipped.h.records.set('physical_record', { ...physical, state: 'stopped' });
+      const physical = readAllocationRecordFrom(skipped.h.records) as Record<string, unknown>;
+      seedAllocationRecord(skipped.h.records, { ...physical, state: 'stopped' });
       const skippedFields = vi.spyOn(logger, 'withFields').mockReturnValue(logger);
       try {
         await fireHeartbeatExpiry(skipped.h);
@@ -7387,7 +7394,7 @@ function cleanupInput(worktreeId: typeof WORKTREE_ID = WORKTREE_ID) {
 }
 
 function seedPhysical(records: Map<string, unknown>, state: 'running' | 'stopped') {
-  records.set('physical_record', {
+  seedAllocationRecord(records, {
     state,
     providerRef: 'instance_legacy',
     createIntent: null,
@@ -7408,6 +7415,8 @@ function installStopProvider(h: Awaited<ReturnType<typeof harness>>) {
   const stop = vi.fn(async () => (confirmed ? ('terminal' as const) : ('retryable' as const)));
   const provider: ProviderAdapter = {
     resumable: false,
+    persistentWorkspace: false,
+    destroysOnStop: false,
     ensureBillingAdmission: vi.fn(async () => undefined),
     create: vi.fn(async () => ({ providerRef: 'instance_running' })),
     launch: vi.fn(async () => undefined),

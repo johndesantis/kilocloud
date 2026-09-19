@@ -155,6 +155,7 @@ import {
 } from '../../src/sandbox-session/worktree-changes.js';
 import { waitFor } from './wait-for.js';
 
+import { readRawSessionMessages, readSessionValueSync, readSessionValue, writeSessionMessages, writeSessionValue, readAllocationRecord, writeAllocationRecord } from '../../src/sandbox-state/persist/access.js';
 vi.mock('@kilocode/db/client', () => ({
   getWorkerDb: () => {
     throw new Error('PostgreSQL must not be accessed by these Workers integration tests');
@@ -210,7 +211,7 @@ async function seedRunningCloudflare(instance: SandboxControl): Promise<string> 
       createdAt: Date.now() - DEADLINE_MS.createSettle - 1,
     },
   });
-  Object.assign(instance, { provider: fakeProvider() });
+  Object.assign(instance, { provider: fakeProvider('cloudflare') });
   return providerRef;
 }
 
@@ -598,6 +599,8 @@ async function installProvider(
       : cloudflareRef(sandboxName, instanceId);
   const provider = {
     resumable: false,
+    persistentWorkspace: sandboxProvider === 'vercel',
+    destroysOnStop: sandboxProvider !== 'vercel',
     ensureBillingAdmission: vi.fn<ProviderAdapter['ensureBillingAdmission']>(async () => undefined),
     create: vi.fn<ProviderAdapter['create']>(async intent => {
       if (!intent.allocationName) throw new Error('Expected a persisted allocation name');
@@ -736,9 +739,14 @@ const CONTAINMENT_POLICY: VercelSandboxNetworkPolicy = {
   ],
 };
 
-function fakeProvider(overrides: Partial<ProviderAdapter> = {}): ProviderAdapter {
+function fakeProvider(
+  providerKind: AgentSandboxProvider,
+  overrides: Partial<ProviderAdapter> = {}
+): ProviderAdapter {
   return {
     resumable: false,
+    persistentWorkspace: providerKind === 'vercel',
+    destroysOnStop: providerKind === 'cloudflare',
     async ensureBillingAdmission() {},
     async create() {
       return { unresolved: true };
@@ -818,8 +826,7 @@ async function seedRunningVercel(
   });
   await instance.initializeOwner(options?.ownerId ?? CONTAINMENT_OWNER);
   await state.storage.put('provider_kind', options?.providerKind ?? 'vercel');
-  await state.storage.put(
-    'physical_record',
+  await writeAllocationRecord(state.storage,
     options?.physical ?? containedRunningRecord(providerRef)
   );
   Object.assign(instance, {
@@ -1779,7 +1786,7 @@ describe('SandboxControl Vercel network policy updates', () => {
     const stub = env.SANDBOX_CONTROL.getByName(requestedSandboxId);
     await runInDurableObject(stub, async (instance, state) => {
       let updates = 0;
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async updateNetworkPolicy() {
           updates += 1;
         },
@@ -1797,7 +1804,7 @@ describe('SandboxControl Vercel network policy updates', () => {
     const requestedSandboxId = 'sbx__policy_provider_kind';
     const stub = env.SANDBOX_CONTROL.getByName(requestedSandboxId);
     await runInDurableObject(stub, async (instance, state) => {
-      await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider(), {
+      await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider('cloudflare'), {
         providerKind: 'cloudflare',
       });
       await expect(instance.updateNetworkPolicy(policyUpdateInput())).rejects.toThrow(
@@ -1816,7 +1823,7 @@ describe('SandboxControl Vercel network policy updates', () => {
           sandboxName: requestedSandboxId,
           sessionId: 'vsess_not_running',
         });
-        await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider(), {
+        await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider('vercel'), {
           physical: { ...containedRunningRecord(providerRef), state: physicalState },
         });
         await expect(instance.updateNetworkPolicy(policyUpdateInput())).rejects.toThrow(
@@ -1857,7 +1864,7 @@ describe('SandboxControl Vercel network policy updates', () => {
         resumable: false,
         ...(providerRef ? { containment: { ...CONTAINMENT_REQUIREMENTS, providerRef } } : {}),
       };
-      await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider(), { physical });
+      await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider('vercel'), { physical });
       await expect(instance.updateNetworkPolicy(policyUpdateInput())).rejects.toThrow(error);
     });
   });
@@ -1894,7 +1901,7 @@ describe('SandboxControl Vercel network policy updates', () => {
           resumable: false,
           ...(marker ? { containment: marker } : {}),
         };
-        await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider(), { physical });
+        await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider('vercel'), { physical });
         await expect(instance.updateNetworkPolicy(policyUpdateInput())).rejects.toThrow(
           'Sandbox credential containment mismatch'
         );
@@ -1910,7 +1917,7 @@ describe('SandboxControl Vercel network policy updates', () => {
         instance,
         state,
         requestedSandboxId,
-        fakeProvider({ updateNetworkPolicy: undefined })
+        fakeProvider('vercel', { updateNetworkPolicy: undefined })
       );
       await expect(instance.updateNetworkPolicy(policyUpdateInput())).rejects.toThrow(
         'Sandbox provider does not support network policy updates'
@@ -1923,7 +1930,7 @@ describe('SandboxControl Vercel network policy updates', () => {
     const stub = env.SANDBOX_CONTROL.getByName(requestedSandboxId);
     await runInDurableObject(stub, async (instance, state) => {
       const updates: Array<{ providerRef: string; networkPolicy: VercelSandboxNetworkPolicy }> = [];
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async updateNetworkPolicy(providerRef, networkPolicy) {
           updates.push({ providerRef, networkPolicy });
         },
@@ -1944,8 +1951,8 @@ describe('SandboxControl Vercel network policy updates', () => {
       registration,
     } = await credentialFixture('vercel');
     await runInDurableObject(stub, async (instance, state) => {
-      const replacementProvider = fakeProvider();
-      const provider = fakeProvider({
+      const replacementProvider = fakeProvider('vercel');
+      const provider = fakeProvider('vercel', {
         async updateNetworkPolicy() {
           await expect(
             instance.ensureReady({
@@ -1973,11 +1980,11 @@ describe('SandboxControl Vercel network policy updates', () => {
     const requestedSandboxId = 'sbx__policy_stale_physical';
     const stub = env.SANDBOX_CONTROL.getByName(requestedSandboxId);
     await runInDurableObject(stub, async (instance, state) => {
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async updateNetworkPolicy() {
-          const physical = await state.storage.get<PhysicalRecord>('physical_record');
+          const physical = await readAllocationRecord<PhysicalRecord>(state.storage);
           if (!physical) throw new Error('Missing test physical record');
-          await state.storage.put('physical_record', { ...physical, state: 'failed' });
+          await writeAllocationRecord(state.storage, { ...physical, state: 'failed' });
         },
       });
       await seedRunningVercel(instance, state, requestedSandboxId, provider);
@@ -1992,7 +1999,7 @@ describe('SandboxControl Vercel network policy updates', () => {
     const requestedSandboxId = 'sbx__policy_stale_provider';
     const stub = env.SANDBOX_CONTROL.getByName(requestedSandboxId);
     await runInDurableObject(stub, async (instance, state) => {
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async updateNetworkPolicy() {
           await state.storage.put('provider_kind', 'cloudflare');
         },
@@ -2191,7 +2198,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       await runInDurableObject(stub, async (instance, state) => {
         await instance.initializeOwner(CONTAINMENT_OWNER);
         await state.storage.put('provider_kind', 'vercel');
-        Object.assign(instance, { provider: fakeProvider(), providerKind: 'vercel' });
+        Object.assign(instance, { provider: fakeProvider('vercel'), providerKind: 'vercel' });
         await instance.claimCreate('intent_rejected', false, undefined, CONTAINMENT_REQUIREMENTS);
         await instance.setWrapperCredentialHash(await hashSandboxCredential(credential));
       });
@@ -2224,11 +2231,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       await runInDurableObject(stub, async (instance, state) => {
         await instance.initializeOwner(CONTAINMENT_OWNER);
         await state.storage.put('provider_kind', 'vercel');
-        await state.storage.put('physical_record', {
+        await writeAllocationRecord(state.storage, {
           ...containedRunningRecord(providerRef),
           state: physicalState,
         });
-        Object.assign(instance, { provider: fakeProvider(), providerKind: 'vercel' });
+        Object.assign(instance, { provider: fakeProvider('vercel'), providerKind: 'vercel' });
         await instance.setWrapperCredentialHash(await hashSandboxCredential(credential));
       });
 
@@ -2246,7 +2253,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
     const credential = generateSandboxCredential();
     let providerRef = '';
     await runInDurableObject(stub, async (instance, state) => {
-      providerRef = await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider());
+      providerRef = await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider('vercel'));
       await instance.setWrapperCredentialHash(await hashSandboxCredential(credential));
     });
 
@@ -2294,7 +2301,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
     let providerRef = '';
     let credential = '';
     await runInDurableObject(stub, async (instance, state) => {
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create(intent) {
           providerRef = encodeVercelProviderRef({
             sandboxName: intent.allocationName ?? requestedSandboxId,
@@ -2370,7 +2377,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       await runInDurableObject(stub, async (instance, state) => {
         await instance.initializeOwner(CONTAINMENT_OWNER);
         await state.storage.put('provider_kind', 'vercel');
-        Object.assign(instance, { provider: fakeProvider(), providerKind: 'vercel' });
+        Object.assign(instance, { provider: fakeProvider('vercel'), providerKind: 'vercel' });
         await instance.claimCreate('intent_race', false, undefined, CONTAINMENT_REQUIREMENTS);
         await instance.setWrapperCredentialHash(await hashSandboxCredential(credential));
         if (order === 'provider-first') {
@@ -2420,7 +2427,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       let creates = 0;
       let claims = 0;
       let competingReadiness: ReturnType<SandboxControl['ensureReady']> | undefined;
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create() {
           creates += 1;
           return { unresolved: true };
@@ -2495,7 +2502,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       const { control, registration, vercel } = await credentialFixture('vercel');
       await runInDurableObject(control, async (instance, state) => {
         const observations: Array<string | null> = [];
-        const provider = fakeProvider({
+        const provider = fakeProvider('vercel', {
           async create() {
             throw new Error('Create rejected before allocating an instance');
           },
@@ -2557,7 +2564,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
   it('retains a failed null-reference creation when the provider cannot confirm absence', async () => {
     const { control, registration } = await credentialFixture('vercel');
     await runInDurableObject(control, async (instance, state) => {
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create() {
           throw new Error('Create outcome unavailable');
         },
@@ -2608,7 +2615,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       });
       await runInDurableObject(control, async (instance, state) => {
         const physical = await instance.getPhysicalRecord();
-        await state.storage.put('physical_record', { ...physical, state: 'failed' });
+        await writeAllocationRecord(state.storage, { ...physical, state: 'failed' });
       });
       const closed = new Promise<number>(resolve => {
         previous.addEventListener('close', event => resolve(event.code), { once: true });
@@ -2781,7 +2788,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         };
         let creates = 0;
         const stoppedRefs: Array<string | null> = [];
-        const provider = fakeProvider({
+        const provider = fakeProvider('vercel', {
           async create() {
             creates += 1;
             return { unresolved: true };
@@ -2834,10 +2841,10 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       );
       const stoppedRefs: Array<string | null> = [];
       let creates = 0;
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async stop(ref) {
           stoppedRefs.push(ref);
-          await state.storage.put('physical_record', replacement);
+          await writeAllocationRecord(state.storage, replacement);
           return 'terminal';
         },
         async create() {
@@ -2873,7 +2880,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       });
       const stoppedRefs: Array<string | null> = [];
       let creates = 0;
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create() {
           creates += 1;
           return { unresolved: true };
@@ -2951,7 +2958,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         kilocode: false,
         github: true,
       });
-      await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider(), {
+      await seedRunningVercel(instance, state, requestedSandboxId, fakeProvider('vercel'), {
         physical,
         bypassPin: true,
       });
@@ -2979,7 +2986,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
     const stub = env.SANDBOX_CONTROL.getByName(requestedSandboxId);
     await runInDurableObject(stub, async (instance, state) => {
       let creates = 0;
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create() {
           creates += 1;
           return { unresolved: true };
@@ -3026,7 +3033,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       let capturedIntent: ProviderCreateIntent | undefined;
       let launchEnv: Record<string, string> | undefined;
       const stoppedRefs: Array<string | null> = [];
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create(intent) {
           capturedIntent = intent;
           providerRef = encodeVercelProviderRef({
@@ -3100,7 +3107,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
     await runInDurableObject(stub, async (instance, state) => {
       let providerRef = '';
       const stoppedRefs: Array<string | null> = [];
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create(intent) {
           providerRef = encodeVercelProviderRef({
             sandboxName: intent.allocationName ?? requestedSandboxId,
@@ -3157,7 +3164,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       let providerRef = '';
       let capturedIntent: ProviderCreateIntent | undefined;
       let launchEnv: Record<string, string> | undefined;
-      const provider = fakeProvider({
+      const provider = fakeProvider('vercel', {
         async create(intent) {
           capturedIntent = intent;
           providerRef = encodeVercelProviderRef({
@@ -3209,7 +3216,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       let capturedIntent: ProviderCreateIntent | undefined;
       let launchEnv: Record<string, string> | undefined;
       let providerRef = '';
-      const provider = fakeProvider({
+      const provider = fakeProvider('cloudflare', {
         async create(intent) {
           capturedIntent = intent;
           providerRef = cloudflareRef(intent.allocationName ?? requestedSandboxId, intent.intentId);
@@ -3897,8 +3904,7 @@ describe('SandboxControl mandatory worktree credentials', () => {
     const issue = broker.binding.issueKiloSessionCapability.bind(broker.binding);
     await runInDurableObject(control, (_instance, state) => {
       broker.binding.issueKiloSessionCapability = async subject => {
-        await state.storage.put(
-          'physical_record',
+        await writeAllocationRecord(state.storage,
           containedRunningRecord(cloudflareRef(fixture.sandboxId, 'replacement'))
         );
         return issue(subject);
@@ -5083,7 +5089,7 @@ describe('SandboxControl native worktree containment', () => {
         containers.running.add(otherContainer);
         const credential = generateSandboxCredential();
         await runInDurableObject(control, async (instance, state) => {
-          await state.storage.put('physical_record', physical);
+          await writeAllocationRecord(state.storage, physical);
           await instance.setWrapperCredentialHash(await hashSandboxCredential(credential));
         });
         const ws = await connect(credential, sandboxId);
@@ -5264,7 +5270,7 @@ describe('SandboxControl recovery watchdogs', () => {
         });
         const stoppedRefs: Array<string | null> = [];
         const observedRefs: Array<string | null> = [];
-        const provider = fakeProvider({
+        const provider = fakeProvider('vercel', {
           async stop(ref) {
             stoppedRefs.push(ref);
             return stoppedRefs.length === 1 ? 'retryable' : 'terminal';
@@ -5323,15 +5329,17 @@ describe('SandboxControl recovery watchdogs', () => {
       await waitForWrapperReady(fixture);
       captureAndAcceptControlRequests(socket);
       await runInDurableObject(control, async (instance, state) => {
-        const keys = [
-          'physical_record',
+        const restKeys = [
           'wrapper_credential_hash',
           'active_wrapper_runtime',
           'wrapper_ready_at',
           'deadlines',
           'transition_log',
         ];
-        const before = await state.storage.get(keys);
+        const before = {
+          allocation: await readAllocationRecord(state.storage),
+          rest: await state.storage.get(restKeys),
+        };
         const alarmAt = await state.storage.getAlarm();
         const setAlarm = state.storage.setAlarm.bind(state.storage);
         const failure = vi.spyOn(state.storage, 'setAlarm').mockImplementationOnce(async at => {
@@ -5345,7 +5353,10 @@ describe('SandboxControl recovery watchdogs', () => {
         } finally {
           failure.mockRestore();
         }
-        expect(await state.storage.get(keys)).toEqual(before);
+        expect({
+          allocation: await readAllocationRecord(state.storage),
+          rest: await state.storage.get(restKeys),
+        }).toEqual(before);
         expect(await state.storage.getAlarm()).toBe(alarmAt);
         await expect(instance.getStatus()).resolves.toMatchObject({
           physical: 'running',
@@ -5840,7 +5851,7 @@ describe('SandboxControl failed-instance reconciliation', () => {
       await seedGrant(instance, state);
       const stoppedRefs: Array<string | null> = [];
       const observedRefs: Array<string | null> = [];
-      const provider = fakeProvider({
+      const provider = fakeProvider('cloudflare', {
         async stop(ref) {
           stoppedRefs.push(ref);
           return 'terminal';
@@ -6417,6 +6428,8 @@ function forbidControlOperations(instance: SandboxControl) {
   };
   instance['provider'] = {
     resumable: false,
+    persistentWorkspace: false,
+    destroysOnStop: true,
     ensureBillingAdmission: forbidden,
     launch: forbidden,
     create: forbidden,
@@ -6736,7 +6749,7 @@ describe('SandboxControl passive status', () => {
     await completeStatusHello(ws, 'hello-status-busy');
     const runtime = await stub.getStatus();
     await runInDurableObject(session, (_instance, state) => {
-      state.storage.kv.put('session_messages', [
+      writeSessionMessages(state.storage.kv, [
         {
           messageId: 'msg_status_busy',
           state: 'accepted',
@@ -6854,7 +6867,7 @@ describe('SandboxControl passive status', () => {
       await runInDurableObject(stub, async (instance, state) => {
         if (owner !== undefined) await state.storage.put('owner_id', owner);
         if (provider !== undefined) await state.storage.put('provider_kind', provider);
-        await state.storage.put('physical_record', {
+        await writeAllocationRecord(state.storage, {
           state: 'stopped',
           providerRef: null,
           createIntent: null,
@@ -6929,7 +6942,7 @@ describe('SandboxSession passive delegation', () => {
         agent: { mode: 'code', model: 'test' },
         workspace: { sandboxId: id, sandboxProvider: 'cloudflare' },
       });
-      await state.storage.put('session_messages', [{ messageId: 'msg_status', state: 'queued' }]);
+      await writeSessionValue(state.storage, [{ messageId: 'msg_status', state: 'queued' }]);
       await state.storage.setAlarm(Date.now() + 86_400_000);
       const before = await state.storage.list();
       const alarm = await state.storage.getAlarm();
@@ -7423,7 +7436,7 @@ describe('SandboxSession operation authorization admission', () => {
         },
       });
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
+        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
         expect(messages).toMatchObject([
           {
             messageId,
@@ -7509,7 +7522,7 @@ describe('SandboxSession operation authorization admission', () => {
         },
       });
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
+        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
         expect(messages).toMatchObject([
           {
             messageId,
@@ -8414,9 +8427,9 @@ describe('SandboxSession worktree changes persistence', () => {
       fixture.noWake.claimCreate.mockClear();
       const before = await runInDurableObject(fixture.session, async (instance, state) => {
         const messages = (
-          state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? []
+          readRawSessionMessages<SessionMessageRecord>(state.storage.kv)
         ).map(message => ({ ...message, lastActivityAt: 1 }));
-        state.storage.kv.put('session_messages', messages);
+        writeSessionMessages(state.storage.kv, messages);
         const broadcast = vi.fn(instance['broadcastStoredEvent'].bind(instance));
         instance['broadcastStoredEvent'] = broadcast;
         return {
@@ -8454,7 +8467,7 @@ describe('SandboxSession worktree changes persistence', () => {
       });
       expect(fixture.captures).toHaveLength(3);
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        expect(state.storage.kv.get('session_messages')).toEqual(before.messages);
+        expect(readSessionValueSync(state.storage.kv)).toEqual(before.messages);
         expect(
           createEventQueries(drizzle(state.storage), state.storage.sql).findByFilters({})
         ).toEqual([
@@ -8498,7 +8511,7 @@ describe('SandboxSession worktree changes persistence', () => {
             lastActivityAt: 2,
           },
         ];
-        state.storage.kv.put('session_messages', messages);
+        writeSessionMessages(state.storage.kv, messages);
         const identity = {
           directory: fixture.directory,
           kiloSessionId: fixture.kiloSessionId,
@@ -8532,7 +8545,7 @@ describe('SandboxSession worktree changes persistence', () => {
             identity: { directory: fixture.directory },
           })
         ).resolves.toEqual({ applied: false });
-        expect(state.storage.kv.get('session_messages')).toEqual(messages);
+        expect(readSessionValueSync(state.storage.kv)).toEqual(messages);
         expect(
           createEventQueries(drizzle(state.storage), state.storage.sql).findByFilters({})
         ).toEqual([]);
@@ -8576,8 +8589,8 @@ describe('SandboxSession worktree changes persistence', () => {
       });
 
       await runInDurableObject(fixture.session, (_instance, state) => {
-        const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-        state.storage.kv.put('session_messages', [
+        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+        writeSessionMessages(state.storage.kv, [
           {
             ...createSessionMessageRecord({
               turn: { type: 'prompt', messageId: staleMessageId, prompt: 'previous wrapper turn' },
@@ -8913,7 +8926,7 @@ describe('SandboxSession worktree changes persistence', () => {
     async type => {
       const fixture = await worktreeFixture();
       await runInDurableObject(fixture.session, async (instance, state) => {
-        await state.storage.put('session_messages', [
+        await writeSessionValue(state.storage, [
           {
             messageId: 'msg_interrupted',
             state: 'accepted',
@@ -9380,7 +9393,7 @@ describe('SandboxSession control-plane regressions', () => {
       agent,
     });
     await runInDurableObject(session, (_instance, state) => {
-      state.storage.kv.put('session_messages', [
+      writeSessionMessages(state.storage.kv, [
         { messageId: 'msg_blocker', state: 'accepted', acceptedAt: Date.now() },
       ] satisfies SessionMessageRecord[]);
     });
@@ -9390,7 +9403,7 @@ describe('SandboxSession control-plane regressions', () => {
   function admissionState(session: SessionStub) {
     return runInDurableObject(session, (_instance, state) => ({
       metadata: state.storage.kv.get<SessionMetadata>('session_metadata'),
-      messages: state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [],
+      messages: readRawSessionMessages<SessionMessageRecord>(state.storage.kv),
     }));
   }
 
@@ -9997,9 +10010,8 @@ describe('SandboxSession control-plane regressions', () => {
         expect.objectContaining({ nativeRuntimeId }),
       ]);
       await runInDurableObject(session, (_instance, state) => {
-        const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-        state.storage.kv.put(
-          'session_messages',
+        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+        writeSessionMessages(state.storage.kv,
           messages.map(message =>
             message.messageId === INITIAL_MESSAGE_ID
               ? {
@@ -11086,7 +11098,7 @@ describe('SandboxSession control-plane regressions', () => {
         workspace: { sandboxId: fixture.sandboxId, workspacePath: '/workspace/terminal' },
       });
       await runInDurableObject(session, (_instance, state) => {
-        state.storage.kv.put('session_messages', [legacy]);
+        writeSessionMessages(state.storage.kv, [legacy]);
       });
       await expect(
         session.admitSubmittedMessage({
@@ -11186,8 +11198,8 @@ describe('SandboxSession control-plane regressions', () => {
     async outcome => {
       const { fixture, session } = await seedBlockedAdmission();
       await runInDurableObject(session, (_instance, state) => {
-        const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-        state.storage.kv.put('session_messages', [
+        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+        writeSessionMessages(state.storage.kv, [
           ...messages,
           { messageId: 'msg_legacy', state: 'queued', prompt: 'retain old format on rejection' },
         ] satisfies SessionMessageRecord[]);
@@ -11449,7 +11461,7 @@ describe('SandboxSession control-plane regressions', () => {
       { messageId: 'msg_old_prompt', state: 'queued', prompt: 'old prompt A' },
     ];
     await runInDurableObject(session, (_instance, state) => {
-      state.storage.kv.put('session_messages', [...history, ...legacy]);
+      writeSessionMessages(state.storage.kv, [...history, ...legacy]);
     });
     await expect(
       session.admitSubmittedMessage({
@@ -11496,7 +11508,7 @@ describe('SandboxSession control-plane regressions', () => {
         workspace: { sandboxId: fixture.sandboxId, workspacePath: '/workspace/terminal' },
       });
       await runInDurableObject(session, (_instance, state) => {
-        state.storage.kv.put('session_messages', [
+        writeSessionMessages(state.storage.kv, [
           { messageId: 'msg_upgrade_a', state: 'queued', prompt: 'old A' },
         ] satisfies SessionMessageRecord[]);
       });
@@ -11661,7 +11673,7 @@ describe('SandboxSession control-plane regressions', () => {
       }),
     ];
     await runInDurableObject(session, (_instance, state) => {
-      state.storage.kv.put('session_messages', records);
+      writeSessionMessages(state.storage.kv, records);
     });
     const response = await SELF.fetch(
       `http://worker.test/stream?sessionId=${fixture.sessionId}&userId=${fixture.ownerId}&replay=false`,
@@ -11738,7 +11750,7 @@ describe('SandboxSession control-plane regressions', () => {
           },
         });
         const acceptedAt = messageState === 'accepted_overdue' ? 1 : Date.now();
-        await state.storage.put('session_messages', [
+        await writeSessionValue(state.storage, [
           {
             messageId: 'msg_deleted',
             state: messageState === 'accepted' ? 'accepted' : 'failed',
@@ -11848,7 +11860,7 @@ describe('SandboxSession control-plane regressions', () => {
         acceptedAt: 1,
         lastActivityAt: 1,
       } satisfies SessionMessageRecord;
-      await state.storage.put('session_messages', [blocker]);
+      await writeSessionValue(state.storage, [blocker]);
 
       const repository = {
         type: 'github',
@@ -11887,7 +11899,7 @@ describe('SandboxSession control-plane regressions', () => {
       await expect(
         instance.admitSubmittedMessage({ userId, turn: followUpTurn })
       ).resolves.toMatchObject({ success: true, messageId: followUpTurn.id });
-      expect(await state.storage.get<SessionMessageRecord[]>('session_messages')).toEqual([
+      expect(await readSessionValue<SessionMessageRecord[]>(state.storage)).toEqual([
         blocker,
         {
           ...createSessionMessageRecord({
@@ -11940,7 +11952,7 @@ describe('SandboxSession control-plane regressions', () => {
           state: 'queued',
           turn: { type: 'command', messageId: 'msg_next', command: 'status', arguments: '' },
         } satisfies SessionMessageRecord;
-        await state.storage.put('session_messages', [accepted, queued]);
+        await writeSessionValue(state.storage, [accepted, queued]);
 
         await expect(
           instance.receiveSandboxControlEvent({
@@ -11954,7 +11966,7 @@ describe('SandboxSession control-plane regressions', () => {
           })
         ).resolves.toEqual({ applied: true });
 
-        const messages = await state.storage.get<SessionMessageRecord[]>('session_messages');
+        const messages = await readSessionValue<SessionMessageRecord[]>(state.storage);
         expect(messages).toEqual([accepted, queued]);
         expect(messages?.[0]?.lastActivityAt).toBe(accepted.lastActivityAt);
         await expect(instance.getCurrentMessageWork()).resolves.toEqual({
@@ -12263,8 +12275,7 @@ describe('SandboxControl terminal runtime coordination', () => {
           const issue = broker.binding.issueKiloSessionCapability.bind(broker.binding);
           broker.binding.issueKiloSessionCapability = async subject => {
             if (changed === 'runtime') {
-              await state.storage.put(
-                'physical_record',
+              await writeAllocationRecord(state.storage,
                 containedRunningRecord(cloudflareRef(sandboxId, 'replacement'))
               );
             } else if (changed === 'route') {
@@ -13470,7 +13481,7 @@ describe('SandboxSession worktree admission', () => {
           prompt: 'first grouped turn',
           turn: { type: 'prompt', prompt: 'first grouped turn' },
         });
-        expect(await state.storage.get('session_messages')).toEqual([
+        expect(await readSessionValue(state.storage)).toEqual([
           expect.objectContaining({
             messageId: INITIAL_MESSAGE_ID,
             intent: expect.objectContaining({
@@ -13565,7 +13576,7 @@ describe('SandboxSession worktree admission', () => {
         prompt: '/compact --aggressive',
         turn: { type: 'command', command: 'compact', arguments: '--aggressive' },
       });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({
           version: 2,
           intent: {
@@ -13685,7 +13696,7 @@ describe('SandboxSession worktree admission', () => {
 
     const attach = JSON.parse(await incomingAttach) as WrapperRequest;
     await runInDurableObject(session, async (_instance, state) => {
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({
           intent: {
             turn: {
@@ -13849,7 +13860,7 @@ describe('SandboxSession worktree admission', () => {
         code: 'BAD_REQUEST',
         error: 'Attachments cannot be attached to slash commands',
       });
-      expect(await state.storage.get('session_messages')).toBeUndefined();
+      expect(await readSessionValue(state.storage)).toBeUndefined();
     });
   });
 
@@ -13880,7 +13891,7 @@ describe('SandboxSession worktree admission', () => {
           state: 'accepted',
           acceptedAt: Date.now(),
         };
-        state.storage.kv.put('session_messages', [blocker]);
+        writeSessionMessages(state.storage.kv, [blocker]);
         const submissions = [
           { finalization: undefined, autoCommit: inheritedAutoCommit, condenseOnComplete: true },
           {
@@ -13918,7 +13929,7 @@ describe('SandboxSession worktree admission', () => {
             // Admission now persists a stable queue timestamp for reporting.
             queuedAt: expect.any(Number),
           });
-          expect(state.storage.kv.get('session_messages')).toEqual(expectedMessages);
+          expect(readSessionValueSync(state.storage.kv)).toEqual(expectedMessages);
           expect(await instance.getMetadata()).toEqual(metadata);
         }
       });
@@ -13963,7 +13974,7 @@ describe('SandboxSession worktree admission', () => {
             ...(messageState === 'accepted' ? { acceptedAt: Date.now() } : {}),
           },
         ];
-        state.storage.kv.put('session_messages', messages);
+        writeSessionMessages(state.storage.kv, messages);
         const request: SubmittedSessionMessageRequest = {
           userId: ownerId,
           turn: { type: 'prompt', id: messageId, prompt: 'frozen turn' },
@@ -13982,7 +13993,7 @@ describe('SandboxSession worktree admission', () => {
             instance.admitSubmittedMessage({ ...request, finalization })
           ).resolves.toMatchObject({ success: false, code: 'BAD_REQUEST' });
         }
-        expect(state.storage.kv.get('session_messages')).toEqual(messages);
+        expect(readSessionValueSync(state.storage.kv)).toEqual(messages);
         expect(await instance.getMetadata()).toEqual(metadata);
         expect(globalThis.fetch).not.toHaveBeenCalled();
       });
@@ -14037,7 +14048,7 @@ describe('SandboxSession worktree admission', () => {
           ...groupedRegistration({ ownerId, sessionId, kiloSessionId, sandboxId: targetSandboxId }),
           finalization: { autoCommit: persisted, condenseOnComplete: true },
         });
-        state.storage.kv.put('session_messages', [
+        writeSessionMessages(state.storage.kv, [
           format === 'frozen'
             ? frozen
             : { messageId, state: 'queued', prompt: 'recover an older prompt', finalization },
@@ -14051,7 +14062,7 @@ describe('SandboxSession worktree admission', () => {
         const metadata = await instance.getMetadata();
         if (!metadata) throw new Error('Expected grouped session metadata');
         expect(metadata.finalization).toEqual({ autoCommit: persisted, condenseOnComplete: true });
-        expect(state.storage.kv.get('session_messages')).toEqual([expect.objectContaining(frozen)]);
+        expect(readSessionValueSync(state.storage.kv)).toEqual([expect.objectContaining(frozen)]);
         state.storage.kv.put('session_metadata', {
           ...metadata,
           finalization: { autoCommit: !expected, condenseOnComplete: true },
@@ -14072,7 +14083,7 @@ describe('SandboxSession worktree admission', () => {
       respondToWrapperRequest(wrapper, prompt, { messageId, status: 'accepted' });
       await expect(dispatched).resolves.toBeUndefined();
       await runInDurableObject(session, async (instance, state) => {
-        expect(state.storage.kv.get('session_messages')).toEqual([
+        expect(readSessionValueSync(state.storage.kv)).toEqual([
           expect.objectContaining({ ...frozen, state: 'accepted' }),
         ]);
         expect((await instance.getMetadata())?.finalization).toEqual({
@@ -14263,7 +14274,7 @@ describe('SandboxSession root-owned terminal events', () => {
       await instance.registerSession(
         groupedRegistration({ ownerId, sessionId, kiloSessionId: root, sandboxId: targetSandboxId })
       );
-      await state.storage.put('session_messages', [
+      await writeSessionValue(state.storage, [
         { messageId: 'msg_active', state: 'accepted', acceptedAt: Date.now(), wrapperInstanceId },
         { messageId: 'msg_next', state: 'queued', prompt: 'next turn' },
       ]);
@@ -14279,7 +14290,7 @@ describe('SandboxSession root-owned terminal events', () => {
           sandboxId: targetSandboxId,
         })
       );
-      await state.storage.put('session_messages', [
+      await writeSessionValue(state.storage, [
         {
           messageId: 'msg_sibling_active',
           state: 'accepted',
@@ -14319,7 +14330,7 @@ describe('SandboxSession root-owned terminal events', () => {
           payload: { type: 'session.turn.close', properties: { sessionID: root } },
         })
       ).resolves.toEqual({ applied: false });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_active', state: 'accepted' }),
         expect.objectContaining({ messageId: 'msg_next', state: 'queued' }),
       ]);
@@ -14337,7 +14348,7 @@ describe('SandboxSession root-owned terminal events', () => {
           payload: { type: 'session.turn.close', properties: { sessionID: root } },
         })
       ).resolves.toEqual({ applied: false });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_sibling_active', state: 'accepted' }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
@@ -14375,7 +14386,7 @@ describe('SandboxSession root-owned terminal events', () => {
           wrapperInstanceId: crypto.randomUUID(),
         })
       ).resolves.toEqual({ applied: false });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_active', state: 'accepted' }),
         expect.objectContaining({ messageId: 'msg_next', state: 'queued' }),
       ]);
@@ -14386,7 +14397,7 @@ describe('SandboxSession root-owned terminal events', () => {
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
       });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_active', state: 'completed' }),
         expect.objectContaining({ messageId: 'msg_next', state: 'queued' }),
       ]);
@@ -14414,7 +14425,7 @@ describe('SandboxSession root-owned terminal events', () => {
     expect(terminalEvents.every(event => event.eventId > 0)).toBe(true);
 
     await runInDurableObject(sibling, async (_instance, state) => {
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_sibling_active', state: 'accepted' }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
@@ -14444,7 +14455,7 @@ describe('SandboxSession root-owned terminal events', () => {
           sandboxId: 'usr-abcdef123418',
         })
       );
-      await state.storage.put('session_messages', [
+      await writeSessionValue(state.storage, [
         { messageId: 'msg_grouped_failed', state: 'accepted', acceptedAt, wrapperInstanceId },
       ]);
     });
@@ -14478,7 +14489,7 @@ describe('SandboxSession root-owned terminal events', () => {
         wrapperInstanceId,
         payload: { type: 'session.error', properties: { sessionID: root } },
       });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_grouped_failed', state: 'accepted' }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
@@ -14488,7 +14499,7 @@ describe('SandboxSession root-owned terminal events', () => {
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
       });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_grouped_failed', state: 'failed' }),
       ]);
       expect(
@@ -14528,7 +14539,7 @@ describe('SandboxSession running stream state', () => {
           sandboxId: 'usr-abcdef123415',
         })
       );
-      await state.storage.put('session_messages', [
+      await writeSessionValue(state.storage, [
         {
           messageId: 'msg_running',
           state: 'accepted',
@@ -14593,7 +14604,7 @@ describe('SandboxSession running stream state', () => {
       }),
     ]);
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: 'msg_running', state: 'accepted' }),
         expect.objectContaining({ messageId: 'msg_waiting', state: 'queued' }),
       ]);
@@ -14632,7 +14643,7 @@ describe('SandboxSession root-scoped reconnect sync', () => {
           sandboxId: targetSandboxId,
         })
       );
-      await state.storage.put('session_messages', [
+      await writeSessionValue(state.storage, [
         {
           messageId: INITIAL_MESSAGE_ID,
           state: 'accepted',
@@ -14771,7 +14782,7 @@ describe('SandboxSession root-scoped reconnect sync', () => {
         questions,
         permissions,
       });
-      expect(await state.storage.get('session_messages')).toEqual([
+      expect(await readSessionValue(state.storage)).toEqual([
         expect.objectContaining({ messageId: INITIAL_MESSAGE_ID, state: 'accepted' }),
       ]);
     });
@@ -14781,7 +14792,7 @@ describe('SandboxSession root-scoped reconnect sync', () => {
       ]);
     });
     await runInDurableObject(empty, async (_instance, state) => {
-      expect(await state.storage.get('session_messages')).toBeUndefined();
+      expect(await readSessionValue(state.storage)).toBeUndefined();
     });
 
     activeResponse.webSocket.close();

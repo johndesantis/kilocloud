@@ -4,7 +4,7 @@
  * allocation incarnation. It never creates, destroys or observes a sandbox and
  * never decides health.
  *
- * The canonical schema is the stored shape written under `session_messages` as the
+ * The canonical schema is the stored shape written under the session-messages key as the
  * `{v: 2, binding, messages}` envelope. Attach/prompt/result-hash proofs live in a
  * sibling `proofs` field outside the lifecycle union; a pending cancellation and
  * the immutable intent survive terminalization so no durable metadata is dropped.

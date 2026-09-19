@@ -1,12 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { loadAllocation, loadSession } from './load.js';
-import {
-  ALLOCATION_KEY,
-  LEGACY_ALLOCATION_KEY,
-  SESSION_KEY,
-  storeAllocation,
-  type CanonicalStorage,
-} from './store.js';
+import { ALLOCATION_KEY, storeAllocation, type CanonicalStorage } from './store.js';
+import { isAllocationRecordKey, seedAllocationRecord, seedSessionValue } from './access.js';
 import { decideSession } from '../session/reduce.js';
 import { allocationEffect } from '../model/allocation.js';
 import { POLICY } from '../schedule.js';
@@ -102,18 +97,20 @@ describe('canonical load — allocation dispatch', () => {
   });
 
   it('invalid canonical fails closed without reading the legacy key', async () => {
-    const storage = storageWith({
-      [ALLOCATION_KEY]: { v: 2, resumable: true, state: { kind: 'nope' } },
-      [LEGACY_ALLOCATION_KEY]: legacyRunning,
-    });
+    const storage = storageWith(
+      seedAllocationRecord(
+        { [ALLOCATION_KEY]: { v: 2, resumable: true, state: { kind: 'nope' } } },
+        legacyRunning
+      )
+    );
     const result = await loadAllocation(storage);
     expect(result.ok).toBe(false);
     expect(result.ok === false && result.reason).toBe('invalid_canonical_allocation');
-    expect(storage.reads).not.toContain(LEGACY_ALLOCATION_KEY);
+    expect(storage.reads.some(isAllocationRecordKey)).toBe(false);
   });
 
-  it('legacy physical_record converts and preserves fields the lossy schema dropped', async () => {
-    const result = await loadAllocation(storageWith({ [LEGACY_ALLOCATION_KEY]: legacyRunning }));
+  it('legacy allocation record converts and preserves fields the lossy schema dropped', async () => {
+    const result = await loadAllocation(storageWith(seedAllocationRecord({}, legacyRunning)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.source).toBe('legacy');
@@ -130,7 +127,7 @@ describe('canonical load — allocation dispatch', () => {
   });
 
   it('legacy stopping preserves the stop tombstone wrapper identity and stop intent', async () => {
-    const result = await loadAllocation(storageWith({ [LEGACY_ALLOCATION_KEY]: legacyStopping }));
+    const result = await loadAllocation(storageWith(seedAllocationRecord({}, legacyStopping)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const state = result.value.state;
@@ -145,7 +142,7 @@ describe('canonical load — allocation dispatch', () => {
   });
 
   it('legacy exhausted unknown preserves the stop-attempt count through store→load', async () => {
-    const storage = storageWith({ [LEGACY_ALLOCATION_KEY]: legacyExhaustedUnknown });
+    const storage = storageWith(seedAllocationRecord({}, legacyExhaustedUnknown));
     const converted = await loadAllocation(storage);
     expect(converted.ok).toBe(true);
     if (!converted.ok) return;
@@ -161,7 +158,7 @@ describe('canonical load — allocation dispatch', () => {
   });
 
   it('legacy failed preserves a stop tombstone count', async () => {
-    const result = await loadAllocation(storageWith({ [LEGACY_ALLOCATION_KEY]: legacyFailed }));
+    const result = await loadAllocation(storageWith(seedAllocationRecord({}, legacyFailed)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const state = result.value.state;
@@ -173,39 +170,38 @@ describe('canonical load — allocation dispatch', () => {
 
   it('malformed legacy fails closed', async () => {
     const result = await loadAllocation(
-      storageWith({ [LEGACY_ALLOCATION_KEY]: { state: 'running' } })
+      storageWith(seedAllocationRecord({}, { state: 'running' }))
     );
-    expect(result).toEqual({
-      ok: false,
-      reason: 'invalid_legacy_allocation',
-      key: LEGACY_ALLOCATION_KEY,
-    });
+    expect(result).toMatchObject({ ok: false, reason: 'invalid_legacy_allocation' });
+    expect(result.ok === false && isAllocationRecordKey(result.key)).toBe(true);
   });
 
   it('legacy foreign v marker fails closed', async () => {
     const result = await loadAllocation(
-      storageWith({ [LEGACY_ALLOCATION_KEY]: { ...legacyRunning, v: 2 } })
+      storageWith(seedAllocationRecord({}, { ...legacyRunning, v: 2 }))
     );
     expect(result.ok).toBe(false);
   });
 
   it('canonical allocation blocks legacy fallback', async () => {
-    const storage = storageWith({
-      [ALLOCATION_KEY]: { v: 2, resumable: true, state: { kind: 'stopped', summary: null } },
-      [LEGACY_ALLOCATION_KEY]: legacyRunning,
-    });
+    const storage = storageWith(
+      seedAllocationRecord(
+        { [ALLOCATION_KEY]: { v: 2, resumable: true, state: { kind: 'stopped', summary: null } } },
+        legacyRunning
+      )
+    );
     const result = await loadAllocation(storage);
     expect(result.ok === true && result.source).toBe('canonical');
-    expect(storage.reads).not.toContain(LEGACY_ALLOCATION_KEY);
+    expect(storage.reads.some(isAllocationRecordKey)).toBe(false);
   });
 
   it('legacy conflicting version fails closed but the free 2 is tolerated', async () => {
     const conflict = await loadAllocation(
-      storageWith({ [LEGACY_ALLOCATION_KEY]: { ...legacyRunning, version: 3 } })
+      storageWith(seedAllocationRecord({}, { ...legacyRunning, version: 3 }))
     );
     expect(conflict.ok).toBe(false);
     const tolerated = await loadAllocation(
-      storageWith({ [LEGACY_ALLOCATION_KEY]: { ...legacyRunning, version: 2 } })
+      storageWith(seedAllocationRecord({}, { ...legacyRunning, version: 2 }))
     );
     expect(tolerated.ok).toBe(true);
   });
@@ -243,7 +239,7 @@ describe('canonical load — session dispatch', () => {
         terminalAt: 222,
       },
     ];
-    const result = await loadSession(storageWith({ [SESSION_KEY]: rows }));
+    const result = await loadSession(storageWith(seedSessionValue({}, rows)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.source).toBe('legacy');
@@ -264,9 +260,7 @@ describe('canonical load — session dispatch', () => {
   });
 
   it('legacy accepted rows resolve against the decoded allocation and accept its real loss proof', async () => {
-    const allocation = await loadAllocation(
-      storageWith({ [LEGACY_ALLOCATION_KEY]: legacyRunning })
-    );
+    const allocation = await loadAllocation(storageWith(seedAllocationRecord({}, legacyRunning)));
     expect(allocation.ok).toBe(true);
     if (!allocation.ok || allocation.value.state.kind !== 'allocated') {
       throw new Error('expected a decoded allocated record');
@@ -287,13 +281,13 @@ describe('canonical load — session dispatch', () => {
 
     // Without authoritative migration context the binding must stay unresolved;
     // it must never fabricate an incarnation from the wrapper identity.
-    const unresolved = await loadSession(storageWith({ [SESSION_KEY]: rows }));
+    const unresolved = await loadSession(storageWith(seedSessionValue({}, rows)));
     expect(unresolved.ok).toBe(true);
     if (!unresolved.ok) return;
     expect(unresolved.value.binding.kind).toBe('unresolved');
 
     const handle = { incarnation, wrapper: 'w-1', epoch: 0 };
-    const result = await loadSession(storageWith({ [SESSION_KEY]: rows }), {
+    const result = await loadSession(storageWith(seedSessionValue({}, rows)), {
       legacyBindingHandle: handle,
     });
     expect(result.ok).toBe(true);
@@ -360,7 +354,7 @@ describe('canonical load — session dispatch', () => {
         },
       },
     ];
-    const result = await loadSession(storageWith({ [SESSION_KEY]: rows }));
+    const result = await loadSession(storageWith(seedSessionValue({}, rows)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.source).toBe('legacy');
@@ -409,7 +403,7 @@ describe('canonical load — session dispatch', () => {
         },
       ],
     };
-    const result = await loadSession(storageWith({ [SESSION_KEY]: envelope }));
+    const result = await loadSession(storageWith(seedSessionValue({}, envelope)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.source).toBe('canonical');
@@ -429,20 +423,20 @@ describe('canonical load — session dispatch', () => {
         },
       ],
     };
-    const result = await loadSession(storageWith({ [SESSION_KEY]: envelope }));
+    const result = await loadSession(storageWith(seedSessionValue({}, envelope)));
     expect(result.ok).toBe(false);
   });
 
   it('container foreign v is rejected', async () => {
     const result = await loadSession(
-      storageWith({ [SESSION_KEY]: { v: 1, binding: { kind: 'unbound' }, messages: [] } })
+      storageWith(seedSessionValue({}, { v: 1, binding: { kind: 'unbound' }, messages: [] }))
     );
     expect(result.ok === false && result.reason).toBe('foreign_marker');
   });
 
   it('bare array row owning v is rejected', async () => {
     const result = await loadSession(
-      storageWith({ [SESSION_KEY]: [{ messageId: 'm1', state: 'queued', v: 2 }] })
+      storageWith(seedSessionValue({}, [{ messageId: 'm1', state: 'queued', v: 2 }]))
     );
     expect(result.ok === false && result.reason).toBe('invalid_legacy_session');
   });
@@ -450,7 +444,7 @@ describe('canonical load — session dispatch', () => {
   it('bare array container owning v is rejected', async () => {
     const rows: unknown[] & { v?: number } = [];
     rows.v = 2;
-    const result = await loadSession(storageWith({ [SESSION_KEY]: rows }));
+    const result = await loadSession(storageWith(seedSessionValue({}, rows)));
     expect(result.ok === false && result.reason).toBe('foreign_marker');
   });
 
@@ -473,13 +467,13 @@ describe('canonical load — session dispatch', () => {
         },
       ],
     };
-    const result = await loadSession(storageWith({ [SESSION_KEY]: envelope }));
+    const result = await loadSession(storageWith(seedSessionValue({}, envelope)));
     expect(result.ok).toBe(false);
   });
 
   it('unknown shapes fail closed', async () => {
     for (const value of ['nope', 42, { v: 2 }, { binding: { kind: 'unbound' } }, null]) {
-      const result = await loadSession(storageWith({ [SESSION_KEY]: value }));
+      const result = await loadSession(storageWith(seedSessionValue({}, value)));
       expect(result.ok).toBe(false);
     }
   });

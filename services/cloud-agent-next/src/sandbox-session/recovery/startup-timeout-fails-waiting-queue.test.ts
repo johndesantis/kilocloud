@@ -3,6 +3,10 @@ import { DEADLINE_MS } from '../../sandbox-control/deadlines.js';
 import { createSessionFixture, RUNTIME_ID } from '../session-fixture.test-helpers.js';
 import type { SessionMessageRecord } from '../session-message-queue.js';
 
+import {
+  readRawSessionMessages,
+  writeSessionMessages,
+} from '../../sandbox-state/persist/access.js';
 const orchestrationMocks = vi.hoisted(() => ({
   eventQueries: vi.fn(),
   signedAttachments: vi.fn(),
@@ -84,9 +88,9 @@ describe('startup timeout', () => {
     await fixture.flush();
 
     const deadlineAt = Date.now() + 20_000;
-    const stored = fixture.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-    fixture.storage.kv.put(
-      'session_messages',
+    const stored = readRawSessionMessages<SessionMessageRecord>(fixture.storage.kv);
+    writeSessionMessages(
+      fixture.storage.kv,
       stored.map(message =>
         message.messageId === 'a' ? { ...message, deliveryDeadlineAt: deadlineAt } : message
       )

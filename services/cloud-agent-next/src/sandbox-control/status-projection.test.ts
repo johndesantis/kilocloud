@@ -11,6 +11,7 @@ import type { SessionRoute } from './session-routes.js';
 import type { SandboxControlConnectionObservation } from './socket.js';
 import type { SandboxHeartbeatPayload } from '../shared/sandbox-control-protocol.js';
 import { SandboxStatusSnapshotSchema } from '../shared/sandbox-status.js';
+import { seedAllocationRecord } from '../sandbox-state/persist/access.js';
 
 describe('projectReportedStatus', () => {
   it('reports off when physical is stopped', () => {
@@ -363,11 +364,13 @@ describe('passive sandbox status projection', () => {
     const input = await fixture();
     const first = { ...route, worktreeId: 'worktree_shared' };
     const sibling = { ...first, sessionId: 'workspace_2', kiloSessionId: 'kilo_2' };
-    const values = {
-      physical_record: physical,
-      deadlines: input.stored.deadlines,
-      session_routes: [first, sibling],
-    };
+    const values = seedAllocationRecord(
+      {
+        deadlines: input.stored.deadlines,
+        session_routes: [first, sibling],
+      },
+      physical
+    );
     const stored = await readSandboxControlState({
       get: async key => values[key as keyof typeof values],
     });
@@ -465,10 +468,16 @@ describe('validation-only control storage reads', () => {
   });
 
   it.each([
-    { physical_record: { state: 'stopped' } },
-    { physical_record: { ...physical, state: 'unsupported' } },
-    { physical_record: { ...physical, providerRef: 10 } },
-    { physical_record: { ...physical, createIntent: { intentId: 'intent', createdAt: Infinity } } },
+    seedAllocationRecord({}, { state: 'stopped' }),
+    seedAllocationRecord({}, { ...physical, state: 'unsupported' }),
+    seedAllocationRecord({}, { ...physical, providerRef: 10 }),
+    seedAllocationRecord(
+      {},
+      {
+        ...physical,
+        createIntent: { intentId: 'intent', createdAt: Infinity },
+      }
+    ),
     { deadlines: { idleStop: NaN } },
     { deadlines: { idleStop: Infinity } },
     { deadlines: { idleStop: -1 } },
@@ -490,11 +499,13 @@ describe('validation-only control storage reads', () => {
   });
 
   it('preserves valid storage and strips unrelated fields from the projection inputs', async () => {
-    const values = {
-      physical_record: { ...physical, internal: 'private-value' },
-      session_routes: [{ ...route, internal: 'private-value' }],
-      deadlines: { idleStop: now + DEADLINE_MS.idleStop },
-    };
+    const values = seedAllocationRecord(
+      {
+        session_routes: [{ ...route, internal: 'private-value' }],
+        deadlines: { idleStop: now + DEADLINE_MS.idleStop },
+      },
+      { ...physical, internal: 'private-value' }
+    );
     const before = structuredClone(values);
     const target = storage(values);
     expect(await readSandboxControlState(target)).toEqual({

@@ -12,6 +12,7 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { readSessionValue } from '../../../src/sandbox-state/persist/access.js';
 const userId = 'oauth/google:prepared-admission-control-plane';
 const kiloSessionId = 'ses_00000000000000000000000000';
 const sandboxId = `usr-${'a'.repeat(48)}` as const;
@@ -69,7 +70,7 @@ describe('SandboxSession prepared initial admission (control plane)', () => {
     const result = await runInDurableObject(stub, async instance => {
       await instance.registerSession(preparedRegistration(sessionId));
       const admission = await instance.admitPreparedInitialMessage({ userId });
-      const messages = (await instance.ctx.storage.get('session_messages')) as
+      const messages = (await readSessionValue(instance.ctx.storage)) as
         | { messageId: string; state: string }[]
         | undefined;
       return { admission, messages };
@@ -91,7 +92,7 @@ describe('SandboxSession prepared initial admission (control plane)', () => {
       await instance.registerSession(preparedRegistration(sessionId));
       const first = await instance.admitPreparedInitialMessage({ userId });
       const retry = await instance.admitPreparedInitialMessage({ userId });
-      const messages = (await instance.ctx.storage.get('session_messages')) as
+      const messages = (await readSessionValue(instance.ctx.storage)) as
         | { messageId: string }[]
         | undefined;
       return { first, retry, messages };

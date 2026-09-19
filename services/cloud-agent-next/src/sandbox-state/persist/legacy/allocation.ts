@@ -1,5 +1,5 @@
 /**
- * Frozen decoder for today's flat `physical_record` (design §9; plan §3).
+ * Frozen decoder for today's flat allocation record (design §9; plan §3).
  *
  * This module is imported only by `persist/load.ts` (enforced by the quarantine
  * compliance test). It freezes the production `PhysicalRecord` shape instead of

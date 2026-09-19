@@ -204,6 +204,8 @@ async function harness() {
   const env = {} as Env;
   const provider = {
     resumable: false,
+    persistentWorkspace: false,
+    destroysOnStop: false,
     create: vi.fn<ProviderAdapter['create']>(),
     launch: vi.fn<ProviderAdapter['launch']>(),
     ensureBillingAdmission: vi.fn(async () => undefined),

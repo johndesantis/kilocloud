@@ -269,9 +269,13 @@ import {
   retireControlEventReceiptIdentity,
   type ControlEventReceiptDisposition,
 } from './control-event-receipts.js';
+import {
+  readActiveSessionMessages,
+  readRawSessionMessages,
+  writeSessionMessages,
+} from '../sandbox-state/persist/access.js';
 
 const METADATA_KEY = SANDBOX_SESSION_METADATA_KEY;
-const MESSAGES_KEY = 'session_messages';
 const DELETED_WORKTREE_KEY = SANDBOX_SESSION_DELETED_WORKTREE_KEY;
 const DELETION_COMPLETED_KEY = 'deletion_completed';
 
@@ -833,7 +837,7 @@ export class SandboxSession extends DurableObject<Env> {
       if (isRealTurnActivity(input.payload.type, input.payload.properties)) {
         const activeMessages = recordAcceptedMessageActivity(this.loadMessages(), Date.now());
         if (activeMessages && this.terminalLifecycle.isCurrent(epoch))
-          this.ctx.storage.kv.put(MESSAGES_KEY, activeMessages);
+          writeSessionMessages(this.ctx.storage.kv, activeMessages);
       }
       this.recordControlEventReceipt(input);
       return 'apply' as const;
@@ -2442,7 +2446,7 @@ export class SandboxSession extends DurableObject<Env> {
   }
 
   private snapshotDeletedMessages(metadata: SessionMetadata | null): void {
-    const messages = this.ctx.storage.kv.get<MessageRecord[]>(MESSAGES_KEY) ?? [];
+    const messages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
     const now = Date.now();
     const newlyTerminalMessageIds = new Set<string>();
     const cancelled = messages.map(message => {
@@ -2458,7 +2462,7 @@ export class SandboxSession extends DurableObject<Env> {
       this.recordMessageReport(next, acceptanceObserved);
       return next;
     });
-    this.ctx.storage.kv.put(MESSAGES_KEY, cancelled);
+    writeSessionMessages(this.ctx.storage.kv, cancelled);
     this.messageCallbacks.persistDrainedBatchCallback(cancelled, newlyTerminalMessageIds, metadata);
   }
 
@@ -2494,7 +2498,7 @@ export class SandboxSession extends DurableObject<Env> {
     if (this.deletedWorktreeId) throw new Error('worktree_deleting');
     this.worktreeChanges.suppress();
     const metadata = this.terminalLifecycle.getStoredMetadata();
-    const active = (this.ctx.storage.kv.get<MessageRecord[]>(MESSAGES_KEY) ?? []).filter(
+    const active = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv).filter(
       message => message.state === 'queued' || message.state === 'accepted'
     );
     const accepted = active.find(message => message.state === 'accepted');
@@ -3225,7 +3229,7 @@ export class SandboxSession extends DurableObject<Env> {
         }
       : input;
     const messageId = input.turn.messageId;
-    const messages = this.ctx.storage.kv.get<MessageRecord[]>(MESSAGES_KEY) ?? [];
+    const messages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
     const existing = messages.find(message => message.messageId === messageId);
     const intent = existing
       ? undefined
@@ -3313,7 +3317,7 @@ export class SandboxSession extends DurableObject<Env> {
       if (!this.terminalLifecycle.isCurrent(epoch) || !latestMetadata) {
         return { success: false, code: 'NOT_FOUND', error: 'Session not found' };
       }
-      const latestMessages = this.ctx.storage.kv.get<MessageRecord[]>(MESSAGES_KEY) ?? [];
+      const latestMessages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
       const duplicate = latestMessages.find(message => message.messageId === messageId);
       if (duplicate) {
         const [frozen] = freezeLegacyQueuedMessages(
@@ -3378,7 +3382,7 @@ export class SandboxSession extends DurableObject<Env> {
               model: intent.agent.model,
               variant: intent.agent.variant,
             });
-      this.ctx.storage.kv.put(MESSAGES_KEY, nextMessages);
+      writeSessionMessages(this.ctx.storage.kv, nextMessages);
       if (nextMetadata) {
         this.ctx.storage.kv.put(METADATA_KEY, serializeSessionMetadata(nextMetadata));
       }
@@ -3434,7 +3438,7 @@ export class SandboxSession extends DurableObject<Env> {
       return;
     }
     const assigned = this.ctx.storage.transactionSync(() => {
-      const messages = this.ctx.storage.kv.get<MessageRecord[]>(MESSAGES_KEY) ?? [];
+      const messages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
       if (!this.terminalLifecycle.isCurrent(epoch) || nextQueuedMessageId(messages) !== messageId) {
         return undefined;
       }
@@ -3448,7 +3452,7 @@ export class SandboxSession extends DurableObject<Env> {
           : message
       );
       const prepared = assignPreparationAttemptId(frozen, messageId, () => crypto.randomUUID());
-      if (prepared) this.ctx.storage.kv.put(MESSAGES_KEY, prepared.messages);
+      if (prepared) writeSessionMessages(this.ctx.storage.kv, prepared.messages);
       return prepared;
     });
     if (!assigned) return;
@@ -5317,8 +5321,10 @@ export class SandboxSession extends DurableObject<Env> {
   }
 
   private loadMessages(): MessageRecord[] {
-    if (this.deletedWorktreeId || this.terminalLifecycle.isBlocked()) return [];
-    return this.ctx.storage.kv.get<MessageRecord[]>(MESSAGES_KEY) ?? [];
+    return readActiveSessionMessages<MessageRecord>(
+      this.ctx.storage.kv,
+      this.deletedWorktreeId !== undefined || this.terminalLifecycle.isBlocked()
+    );
   }
 
   private saveMessages(
@@ -5479,7 +5485,7 @@ export class SandboxSession extends DurableObject<Env> {
         }
         return terminal;
       });
-      this.ctx.storage.kv.put(MESSAGES_KEY, next);
+      writeSessionMessages(this.ctx.storage.kv, next);
       callbackPersisted = this.messageCallbacks.persistDrainedBatchCallback(
         next,
         newlyTerminalMessageIds

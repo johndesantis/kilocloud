@@ -98,6 +98,14 @@ import {
   type SessionFixtureDeps,
 } from './session-fixture.test-helpers.js';
 
+import {
+  readRawSessionMessages,
+  readSessionValueSync,
+  writeSessionMessages,
+  seedSessionValue,
+  readSessionMessagesFrom,
+  isSessionMessagesKey,
+} from '../sandbox-state/persist/access.js';
 const orchestrationMocks = vi.hoisted(() => ({
   eventQueries: vi.fn(),
   signedAttachments: vi.fn(),
@@ -1461,8 +1469,8 @@ describe('SandboxSession orchestration', () => {
     const fixture = sessionFixture({
       callback: { target: { url: 'https://example.com/callback' } },
     });
-    fixture.storage.kv.put(
-      'session_messages',
+    writeSessionMessages(
+      fixture.storage.kv,
       Array.from({ length: PENDING_SESSION_MESSAGE_LIMIT }, (_, index) => ({
         messageId: `existing_${index}`,
         state: index === 0 ? ('accepted' as const) : ('queued' as const),
@@ -1473,7 +1481,7 @@ describe('SandboxSession orchestration', () => {
       success: false,
       code: 'PENDING_QUEUE_FULL',
     });
-    expect(fixture.values.get('session_messages')).toHaveLength(PENDING_SESSION_MESSAGE_LIMIT);
+    expect(readSessionMessagesFrom(fixture.values)).toHaveLength(PENDING_SESSION_MESSAGE_LIMIT);
   });
 
   it('arms callback repair after the outer operation-result transaction', async () => {
@@ -1534,7 +1542,7 @@ describe('SandboxSession orchestration', () => {
     const expectedWrapperInstanceId = RUNTIME_ID;
     const wrapperInstanceId = '44444444-4444-4444-8444-444444444444';
     const fenceNativeRuntimeId = NEXT_RUNTIME_ID;
-    fixture.storage.kv.put('session_messages', [
+    writeSessionMessages(fixture.storage.kv, [
       { messageId: 'queued', state: 'queued', wrapperInstanceId: expectedWrapperInstanceId },
     ]);
     fixture.storage.kv.put('native_runtime_fence', {
@@ -1583,7 +1591,7 @@ describe('SandboxSession orchestration', () => {
 
   it('keeps an unreceipted outcome on the early publication path', async () => {
     const fixture = sessionFixture();
-    fixture.storage.kv.put('session_messages', [
+    writeSessionMessages(fixture.storage.kv, [
       { messageId: 'queued', state: 'queued', wrapperInstanceId: RUNTIME_ID },
     ]);
     const fields = vi.spyOn(logger, 'withFields').mockReturnValue(logger);
@@ -1631,7 +1639,7 @@ describe('SandboxSession orchestration', () => {
 
   it('rejects an unreceipted remaining event from a stale wrapper', async () => {
     const fixture = sessionFixture();
-    fixture.storage.kv.put('session_messages', [
+    writeSessionMessages(fixture.storage.kv, [
       { messageId: 'queued', state: 'queued', wrapperInstanceId: RUNTIME_ID },
     ]);
     const fields = vi.spyOn(logger, 'withFields').mockReturnValue(logger);
@@ -1664,7 +1672,7 @@ describe('SandboxSession orchestration', () => {
 
   it('rejects partial receipt identities without recording events or receipts', async () => {
     const fixture = sessionFixture();
-    fixture.storage.kv.put('session_messages', [
+    writeSessionMessages(fixture.storage.kv, [
       {
         messageId: 'queued',
         state: 'queued',
@@ -1773,7 +1781,7 @@ describe('SandboxSession orchestration', () => {
         authorization,
       });
       fixture.storage.kv.put('native_runtime_fence', fence(nativeRuntimeId));
-      fixture.storage.kv.put('session_messages', [
+      writeSessionMessages(fixture.storage.kv, [
         {
           messageId: 'queued',
           state: 'queued',
@@ -1825,7 +1833,7 @@ describe('SandboxSession orchestration', () => {
             const epochCheck = vi.spyOn(lifecycle, 'isCurrent').mockReturnValue(false);
             restoreEpochCheck = () => epochCheck.mockRestore();
           } else if (disposition === 'runtime_mismatch') {
-            fixture.storage.kv.put('session_messages', [
+            writeSessionMessages(fixture.storage.kv, [
               {
                 messageId: 'replacement',
                 state: 'queued',
@@ -1833,7 +1841,7 @@ describe('SandboxSession orchestration', () => {
               },
             ]);
           } else if (disposition === 'native_runtime_mismatch' && family === 'session.preparing') {
-            fixture.storage.kv.put('session_messages', [
+            writeSessionMessages(fixture.storage.kv, [
               {
                 messageId: 'queued',
                 state: 'queued',
@@ -1924,7 +1932,7 @@ describe('SandboxSession orchestration', () => {
       wrapperInstanceId: RUNTIME_ID,
       dispatchDeadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS,
     };
-    fixture.storage.kv.put('session_messages', [
+    writeSessionMessages(fixture.storage.kv, [
       {
         messageId: 'queued',
         state: 'queued',
@@ -2231,7 +2239,7 @@ describe('SandboxSession orchestration', () => {
       wrapperInstanceId: RUNTIME_ID,
       operationResults: true,
     });
-    fixture.storage.kv.put('session_messages', [
+    writeSessionMessages(fixture.storage.kv, [
       { messageId: 'mixed', state: 'queued', wrapperInstanceId: RUNTIME_ID },
     ]);
     const items = [
@@ -2938,7 +2946,7 @@ describe('SandboxSession orchestration', () => {
       wrapperInstanceId: RUNTIME_ID,
       operationResults: true,
     });
-    fixture.storage.kv.put('session_messages', [
+    writeSessionMessages(fixture.storage.kv, [
       {
         ...createSessionMessageRecord({
           turn: { type: 'prompt', messageId: 'recovered', prompt: 'continue delivery' },
@@ -3015,7 +3023,7 @@ describe('SandboxSession orchestration', () => {
         events: [],
         preparing: [],
       };
-      fixture.storage.kv.put('session_messages', [
+      writeSessionMessages(fixture.storage.kv, [
         {
           ...createSessionMessageRecord({
             turn: { type: 'prompt', messageId: 'warm', prompt: 'warm retry' },
@@ -3144,7 +3152,7 @@ describe('SandboxSession orchestration', () => {
             wrapperInstanceId: '11111111-1111-4111-8111-111111111111',
             dispatchDeadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS,
           };
-          fixture.storage.kv.put('session_messages', [
+          writeSessionMessages(fixture.storage.kv, [
             {
               messageId: 'previous',
               state: 'completed',
@@ -3342,7 +3350,7 @@ describe('SandboxSession orchestration', () => {
       };
       const transactionSync = storage.transactionSync.bind(storage);
       storage.transactionSync = callback => {
-        fixture.storage.kv.put('session_messages', [
+        writeSessionMessages(fixture.storage.kv, [
           { ...message, cancellation: { operationId: 'cancel', deadlineAt: Date.now() } },
         ]);
         return transactionSync(callback);
@@ -3420,7 +3428,7 @@ describe('SandboxSession orchestration', () => {
       const proof = trigger?.operations?.attach;
       const attemptId = trigger?.preparationAttemptId;
       if (!trigger || !proof || !attemptId) throw new Error('Missing trigger attach authority');
-      fixture.storage.kv.put('session_messages', [
+      writeSessionMessages(fixture.storage.kv, [
         {
           messageId: 'head',
           state: 'queued',
@@ -3478,7 +3486,7 @@ describe('SandboxSession orchestration', () => {
       const trigger = fixture.record('trigger');
       const attemptId = trigger?.preparationAttemptId;
       if (!trigger || !attemptId) throw new Error('Missing trigger attach authority');
-      fixture.storage.kv.put('session_messages', [
+      writeSessionMessages(fixture.storage.kv, [
         { messageId: 'head', state: 'queued', wrapperInstanceId: RUNTIME_ID },
         trigger,
       ]);
@@ -3585,7 +3593,7 @@ describe('SandboxSession orchestration', () => {
                       }
                     : { attach: proof },
       };
-      fixture.storage.kv.put('session_messages', [altered]);
+      writeSessionMessages(fixture.storage.kv, [altered]);
       const preparing = receiptedPreparing(
         1,
         {
@@ -3657,7 +3665,7 @@ describe('SandboxSession orchestration', () => {
       });
       expect(fixture.eventQueries.findByEntityPrefix('')).toEqual(events);
 
-      fixture.storage.kv.put('session_messages', [{ ...message, state: 'accepted' }]);
+      writeSessionMessages(fixture.storage.kv, [{ ...message, state: 'accepted' }]);
       fixture.storage.kv.put('native_runtime_fence', {
         sandboxId: SANDBOX_ID,
         wrapperInstanceId: RUNTIME_ID,
@@ -3665,7 +3673,7 @@ describe('SandboxSession orchestration', () => {
         attachmentEpoch: 1,
         authorization,
       });
-      const settledMessages = structuredClone(fixture.values.get('session_messages'));
+      const settledMessages = structuredClone(readSessionMessagesFrom(fixture.values));
       const settledReceipts = structuredClone(fixture.values.get('control_event_receipts'));
       const fields = vi.spyOn(logger, 'withFields').mockReturnValue(logger);
       try {
@@ -3679,7 +3687,7 @@ describe('SandboxSession orchestration', () => {
           })
         );
         expect(fixture.eventQueries.findByEntityPrefix('')).toEqual(events);
-        expect(fixture.values.get('session_messages')).toEqual(settledMessages);
+        expect(readSessionMessagesFrom(fixture.values)).toEqual(settledMessages);
         expect(fixture.values.get('control_event_receipts')).toEqual(settledReceipts);
         const newReceipt = receiptedPreparing(2, preparing.payload, RUNTIME_ID, NEXT_RUNTIME_ID);
         const before = structuredClone([...fixture.values]);
@@ -3918,7 +3926,7 @@ describe('SandboxSession orchestration', () => {
             wrapperInstanceId: RUNTIME_ID,
             dispatchDeadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS,
           };
-          fixture.storage.kv.put('session_messages', [
+          writeSessionMessages(fixture.storage.kv, [
             {
               messageId: 'previous',
               state: 'completed',
@@ -4030,7 +4038,7 @@ describe('SandboxSession orchestration', () => {
           operationId: 'attach-a',
           messageId: 'a',
         };
-        fixture.storage.kv.put('session_messages', [
+        writeSessionMessages(fixture.storage.kv, [
           {
             messageId: 'a',
             state: 'completed',
@@ -5882,7 +5890,7 @@ describe('SandboxSession orchestration', () => {
     const writes: SessionMessageRecord[] = [];
     const put = fixture.storage.kv.put.bind(fixture.storage.kv);
     vi.spyOn(fixture.storage.kv, 'put').mockImplementation((key, value) => {
-      if (key === 'session_messages' && acknowledged) {
+      if (isSessionMessagesKey(key) && acknowledged) {
         writes.push(...structuredClone(value as SessionMessageRecord[]));
       }
       put(key, value);
@@ -6248,7 +6256,7 @@ describe('SandboxSession orchestration', () => {
     await fixture.flush();
     await fixture.outcome('a', 'completed');
     await fixture.flush();
-    const messages = fixture.storage.kv.get('session_messages');
+    const messages = readSessionValueSync(fixture.storage.kv);
     const events = fixture.eventQueries.findByEntityPrefix('');
     const alarmAt = fixture.alarmAt();
     const attemptId = fixture.record('a')?.preparationAttemptId;
@@ -6277,7 +6285,7 @@ describe('SandboxSession orchestration', () => {
         },
       })
     ).resolves.toEqual({ applied: true });
-    expect(fixture.storage.kv.get('session_messages')).toEqual(messages);
+    expect(readSessionValueSync(fixture.storage.kv)).toEqual(messages);
     expect(fixture.eventQueries.findByEntityPrefix('')).toEqual(events);
     expect(fixture.alarmAt()).toBe(alarmAt);
     await expect(fixture.session.getCurrentMessageWork()).resolves.toEqual({
@@ -6581,7 +6589,7 @@ describe('SandboxSession orchestration', () => {
       wrapperInstanceId: RUNTIME_ID,
       dispatchDeadlineAt: Date.now() + 60_000,
     } satisfies SessionOperationAuthorization;
-    fixture.values.set('session_messages', [
+    seedSessionValue(fixture.values, [
       {
         messageId: 'a',
         state: 'accepted',
@@ -6710,7 +6718,7 @@ describe('SandboxSession orchestration', () => {
       wrapperInstanceId: RUNTIME_ID,
       dispatchDeadlineAt: Date.now() + 60_000,
     } satisfies SessionOperationAuthorization;
-    fixture.values.set('session_messages', [
+    seedSessionValue(fixture.values, [
       {
         messageId: 'a',
         state: 'accepted',
@@ -6766,7 +6774,7 @@ describe('SandboxSession orchestration', () => {
       wrapperInstanceId: RUNTIME_ID,
       dispatchDeadlineAt: Date.now() + 60_000,
     } satisfies SessionOperationAuthorization;
-    fixture.values.set('session_messages', [
+    seedSessionValue(fixture.values, [
       {
         messageId: 'a',
         state: 'accepted',
@@ -6781,7 +6789,7 @@ describe('SandboxSession orchestration', () => {
       authorization,
     });
     expect(fixture.values.get('native_runtime_fence')).toBeUndefined();
-    fixture.values.set('session_messages', [
+    seedSessionValue(fixture.values, [
       {
         messageId: 'a',
         state: 'accepted',
@@ -6838,7 +6846,7 @@ describe('SandboxSession orchestration', () => {
       '22222222-2222-4222-8222-222222222222',
       Date.now() + 2_000
     );
-    fixture.values.set('session_messages', [
+    seedSessionValue(fixture.values, [
       {
         messageId: 'old',
         state: 'accepted',
@@ -8875,9 +8883,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         fixture.control.request.mock.calls.filter(([input]) => input.operation === 'session.prompt')
       ).toHaveLength(0);
       expect(
-        nextQueuedMessageId(
-          fixture.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? []
-        )
+        nextQueuedMessageId(readRawSessionMessages<SessionMessageRecord>(fixture.storage.kv))
       ).toBe('b');
 
       // The follower is still a usable head.
@@ -8948,7 +8954,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
 
     it('terminalizes accepted/dispatched rows but preserves never-dispatched queued work', async () => {
       const fixture = sessionFixture();
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('accepted', {
           state: 'accepted',
           acceptedAt: 1_000,
@@ -8986,7 +8992,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
     it('releases a completed attach proof while preserving the original deadline and can rebind', async () => {
       const fixture = sessionFixture();
       const deadlineAt = Date.now() + 60_000;
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('attached', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-old',
@@ -9025,7 +9031,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
 
     it('keeps an ambiguous attach bound without an authoritative retirement', async () => {
       const fixture = sessionFixture();
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('ambiguous', {
           wrapperInstanceId: wrapper,
           unresolvedDispatch: true,
@@ -9052,7 +9058,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         attachmentEpoch: 1,
         authorization: authorization('session.attach', 'ambiguous', 'attempt-ambiguous'),
       });
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('ambiguous', {
           wrapperInstanceId: wrapper,
           unresolvedDispatch: true,
@@ -9121,7 +9127,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         dispatchDeadlineAt: Date.now() + 60_000,
       };
       const deadlineAt = attachAuthorization.dispatchDeadlineAt;
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: attachAuthorization.operationId,
@@ -9173,7 +9179,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         ...authorization('session.attach', 'a', 'attempt-continuation'),
         dispatchDeadlineAt: Date.now() + 60_000,
       };
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: attachAuthorization.operationId,
@@ -9237,7 +9243,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         dispatchDeadlineAt: Date.now() + 60_000,
       };
       const deadlineAt = attachAuthorization.dispatchDeadlineAt;
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: attachAuthorization.operationId,
@@ -9289,7 +9295,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         ...authorization('session.attach', 'a', 'attempt-rejected'),
         dispatchDeadlineAt: Date.now() + 60_000,
       };
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: attachAuthorization.operationId,
@@ -9349,7 +9355,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         wrapperInstanceId: wrapper,
         reason: 'runtime_unhealthy',
       });
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-1',
@@ -9385,7 +9391,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         dispatchDeadlineAt: Date.now() + 60_000,
       };
       const executionDeadlineAt = Date.now() + 60_000;
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-old',
@@ -9446,7 +9452,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         ...authorization('session.prompt', 'a', 'a'),
         dispatchDeadlineAt: passedAt,
       };
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-old',
@@ -9498,7 +9504,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
     it('emits and exposes the wait reason across a pending cleanup without a later drain', async () => {
       const fixture = sessionFixture();
       seedPendingCleanup(fixture);
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           preparationAttemptId: 'attempt-1',
           deliveryDeadlineAt: Date.now() + 60_000,
@@ -9538,7 +9544,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
       finalized.onProgress('workspace_setup', 'Setting up workspace…');
       finalized.finalize({ status: 'completed' });
       seedPendingCleanup(fixture);
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           preparationAttemptId: 'finalized-attempt',
           deliveryDeadlineAt: Date.now() + 60_000,
@@ -9565,7 +9571,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         connection: 'disconnected',
         wrapperInstanceId: wrapper,
       });
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-1',
@@ -9599,7 +9605,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         connection: 'disconnected',
         wrapperInstanceId: wrapper,
       });
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-1',
@@ -9647,7 +9653,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
       finalized.onProgress('workspace_setup', 'Setting up workspace…');
       finalized.finalize({ status: 'completed' });
       seedPendingCleanup(fixture);
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-old',
@@ -9688,7 +9694,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
       finalized.onProgress('workspace_setup', 'Setting up workspace…');
       finalized.finalize({ status: 'completed' });
       seedPendingCleanup(fixture);
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-old',
@@ -9742,7 +9748,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         completedAt: 1_500,
         attachmentEpoch: 1,
       };
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-old',
@@ -9811,7 +9817,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
 
     it('fails queued immediately when coordinator metadata is missing', async () => {
       const fixture = sessionFixture({ workspace: { workspacePath: DIRECTORY } });
-      fixture.values.set('session_messages', [queuedRecord('a')]);
+      seedSessionValue(fixture.values, [queuedRecord('a')]);
 
       await fixture.fireAlarm();
       await fixture.flush();
@@ -9824,7 +9830,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
 
     it('interrupts a waiting queued row without sending it', async () => {
       const fixture = sessionFixture();
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           preparationAttemptId: 'attempt-1',
@@ -9862,7 +9868,7 @@ describe('recovery chunk 1: proof-based wait classification', () => {
         wrapperInstanceId: wrapper,
         reason: 'runtime_unhealthy',
       });
-      fixture.values.set('session_messages', [
+      seedSessionValue(fixture.values, [
         queuedRecord('a', {
           wrapperInstanceId: wrapper,
           attachFailures: 1,

@@ -6,11 +6,10 @@
  */
 import type { AllocationRecord } from '../model/allocation.js';
 import type { SessionAggregate, SessionEnvelope } from '../model/session.js';
+import { eraseAllocationRecord, writeSessionValue } from './access.js';
 
-/** Canonical allocation key. The legacy key is `physical_record`. */
+/** Canonical allocation key; the current raw allocation key is owned by access.ts. */
 export const ALLOCATION_KEY = 'sandbox_allocation_state';
-export const SESSION_KEY = 'session_messages';
-export const LEGACY_ALLOCATION_KEY = 'physical_record';
 
 export type CanonicalStorage = {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -38,15 +37,15 @@ export async function storeSession(
     binding: aggregate.binding,
     messages: aggregate.messages,
   };
-  await storage.put(SESSION_KEY, envelope);
+  await writeSessionValue(storage, envelope);
 }
 
 /**
  * Erase the allocation aggregate. `SandboxControl.eraseRecord` owns allocation
- * storage only; deleting both the canonical and the legacy key blocks legacy
- * fallback, so a later load is an explicit first boot rather than a resurrection.
- * The session aggregate is untouched.
+ * storage only; deleting both the canonical and the raw allocation key blocks
+ * legacy fallback, so a later load is an explicit first boot rather than a
+ * resurrection. The session aggregate is untouched.
  */
 export async function eraseAllocation(storage: ErasableStorage): Promise<void> {
-  await storage.delete([ALLOCATION_KEY, LEGACY_ALLOCATION_KEY]);
+  await eraseAllocationRecord(storage, [ALLOCATION_KEY]);
 }

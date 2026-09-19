@@ -23,6 +23,7 @@ import {
   readReportAnchor,
 } from '../../src/sandbox-session/report-outbox.js';
 
+import { readRawSessionMessages, writeSessionMessages } from '../../src/sandbox-state/persist/access.js';
 const ownerId = 'report-owner';
 const kiloSessionId = 'ses_12345678901234567890123456';
 const agent = { mode: 'code' as const, model: 'anthropic/claude-sonnet-4' };
@@ -50,7 +51,7 @@ function suppressDispatch(instance: SandboxSession): void {
 }
 
 function readMessages(state: DurableObjectState): SessionMessageRecord[] {
-  return state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
+  return readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
 }
 
 function readObligation(
@@ -145,7 +146,7 @@ describe('control-plane run-state reporting', () => {
       suppressDispatch(instance);
       await register(instance, id);
       // Pre-existing message and no anchor: a legacy/unanchored session.
-      state.storage.kv.put('session_messages', [
+      writeSessionMessages(state.storage.kv, [
         { messageId: seededMessageId, state: 'completed', terminalAt: Date.now() },
       ]);
       await admit(instance, followUpId);
@@ -371,7 +372,7 @@ describe('control-plane run-state reporting', () => {
         expect(updated?.find(message => message.messageId === messageId)?.acceptedAt).toEqual(
           expect.any(Number)
         );
-        state.storage.kv.put('session_messages', messages);
+        writeSessionMessages(state.storage.kv, messages);
         instance['saveMessages'](updated as SessionMessageRecord[]);
         await instance.alarm();
         return true;

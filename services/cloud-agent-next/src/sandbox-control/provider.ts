@@ -26,6 +26,10 @@ export type ProviderObservation = {
 
 export type ProviderAdapter = {
   readonly resumable: boolean;
+  /** The workspace survives a stop; a persistent provider is never destroyed. */
+  readonly persistentWorkspace: boolean;
+  /** `stop` destroys the container rather than only stopping it. */
+  readonly destroysOnStop: boolean;
   ensureBillingAdmission(ref: string, billing?: SandboxBillingInput): Promise<void>;
   create(intent: ProviderCreateIntent): Promise<{ providerRef: string } | { unresolved: true }>;
   launch(ref: string, env: Record<string, string>): Promise<void>;
@@ -53,6 +57,8 @@ export function createMemoryProviderAdapter(options?: {
 
   return {
     resumable: options?.resumable ?? false,
+    persistentWorkspace: false,
+    destroysOnStop: false,
     get lastLeaseMs() {
       return lastLeaseMs;
     },

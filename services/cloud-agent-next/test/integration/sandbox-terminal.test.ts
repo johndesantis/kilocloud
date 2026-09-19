@@ -34,6 +34,7 @@ import {
 import type { GitTokenService, SandboxId } from '../../src/types.js';
 import { getSessionWorkspacePath } from '../../src/workspace.js';
 
+import { readSessionValue, writeAllocationRecord } from '../../src/sandbox-state/persist/access.js';
 type SocketFrame = string | ArrayBuffer;
 
 type SocketInbox = {
@@ -548,7 +549,7 @@ describe('SandboxSession terminal bridge in the Workers runtime', () => {
     await runInDurableObject(control, async (instance, state) => {
       const physical = await instance.getPhysicalRecord();
       if (!physical.providerRef) throw new Error('Missing terminal fixture provider reference');
-      await state.storage.put('physical_record', {
+      await writeAllocationRecord(state.storage, {
         ...physical,
         containment: marker(physical.providerRef),
       });
@@ -574,7 +575,7 @@ describe('SandboxSession terminal bridge in the Workers runtime', () => {
     const control = env.SANDBOX_CONTROL.getByName(fixture.sandboxId);
     await runInDurableObject(control, async (instance, state) => {
       const physical = await instance.getPhysicalRecord();
-      await state.storage.put('physical_record', {
+      await writeAllocationRecord(state.storage, {
         ...physical,
         providerRef: fixture.sandboxId,
         containment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef: fixture.sandboxId },
@@ -1098,7 +1099,7 @@ describe('SandboxSession terminal bridge in the Workers runtime', () => {
     await fixture.dispose();
     const session = getSandboxSessionStub(env, fixture.ownerId, fixture.sessionId);
     await runInDurableObject(session, async (_instance, state) => {
-      const messages = (await state.storage.get('session_messages')) as
+      const messages = (await readSessionValue(state.storage)) as
         | { state: string }[]
         | undefined;
       expect(

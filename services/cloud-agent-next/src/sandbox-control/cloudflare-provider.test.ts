@@ -22,6 +22,7 @@ import {
   type PhysicalRecord,
 } from './physical-lifecycle.js';
 import { deriveSandboxAllocationId } from '../sandbox-id.js';
+import { seedAllocationRecord, writeAllocationRecord } from '../sandbox-state/persist/access.js';
 
 const PROVIDER_REF = encodeCloudflareProviderRef({
   sandboxId: 'sbx_1',
@@ -62,6 +63,16 @@ const billing = parseSandboxBillingInput({
 afterEach(() => vi.useRealTimers());
 
 describe('cloudflare provider adapter', () => {
+  it('declares a non-persistent workspace that is destroyed on stop', () => {
+    const provider = createCloudflareProviderAdapter({
+      sandboxId: logicalId,
+      getSandbox: () => fakeSandbox(),
+      destroy: async () => undefined,
+    });
+    expect(provider.persistentWorkspace).toBe(false);
+    expect(provider.destroysOnStop).toBe(true);
+  });
+
   it.each([true, false, undefined])(
     'uses persisted containment %s for billing and launch regardless of launch environment',
     async enabled => {
@@ -148,7 +159,7 @@ describe('cloudflare provider adapter', () => {
         resumable: false,
         containment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
       };
-      const values = new Map<string, unknown>([['physical_record', physical]]);
+      const values = seedAllocationRecord(new Map<string, unknown>(), physical);
       const storage = {
         get: async (key: string) => values.get(key),
         put: async (key: string, value: unknown) => {
@@ -168,10 +179,10 @@ describe('cloudflare provider adapter', () => {
       const launch = vi.spyOn(provider, 'launch');
       const stopRuntime = vi.fn(async () => {
         physical = recordStopAttempt(beginStop(physical, 'worktree_deleted', 2_000));
-        await storage.put('physical_record', physical);
+        await writeAllocationRecord(storage, physical);
         const result = await provider.stop(physical.providerRef, physical.createIntent);
         if (result === 'terminal') physical = confirmStopped(physical);
-        await storage.put('physical_record', physical);
+        await writeAllocationRecord(storage, physical);
         return physical;
       });
       const worktreeId = 'worktree_11111111-1111-4111-8111-111111111111';

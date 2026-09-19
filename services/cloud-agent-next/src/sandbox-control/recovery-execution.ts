@@ -1,9 +1,10 @@
-import {
-  SANDBOX_CONTROL_RECOVERY_ATTEMPT_TIMEOUT_MS,
-  sandboxReconcileResultSchema,
-  sandboxStatusResultSchema,
-} from '../shared/sandbox-control-protocol.js';
+import { SANDBOX_CONTROL_RECOVERY_ATTEMPT_TIMEOUT_MS } from '../shared/sandbox-control-protocol.js';
 import * as recovery from './control-recovery.js';
+import {
+  createReconcilePort,
+  ReconcilePortError,
+  type ReconcilePhase,
+} from '../sandbox-state/ports/reconcile.js';
 import {
   loadDeadlines,
   loadPhysicalRecord,
@@ -173,26 +174,25 @@ export function createRecoveryExecution(dependencies: Dependencies) {
         )
           throw new SandboxControlConnectionError('Recovery attempt expired', false);
       };
-      const phase = async (phase: 'drain' | 'ready' | 'commit') => {
+      const reconcilePort = createReconcilePort(dependencies.sendRequest);
+      const phase = async (phase: ReconcilePhase) => {
         const deadlineAt = requestDeadlineAt();
         const wireRecovery = recovery.wireRecovery(claimed.recovery);
-        const response = await dependencies.sendRequest({
-          operation: 'sandbox.reconcile',
-          expectedWrapperInstanceId: runtime.identity.wrapperInstanceId,
-          payload: { recovery: wireRecovery, phase },
-          deadlineAt,
-          timeoutMs: Math.max(1, deadlineAt - Date.now()),
-        });
+        try {
+          await reconcilePort.sendPhase({
+            expectedWrapperInstanceId: runtime.identity.wrapperInstanceId,
+            episodeId: claimed.recovery.episodeId,
+            attempt: wireRecovery.attempt,
+            deadlineAt,
+            recovery: wireRecovery,
+            phase,
+          });
+        } catch (error) {
+          if (error instanceof ReconcilePortError)
+            throw new SandboxControlConnectionError(error.message, error.retryable);
+          throw error;
+        }
         await assertCurrent();
-        if (!response.ok)
-          throw new SandboxControlConnectionError('Recovery was not acknowledged', true);
-        const acknowledgement = sandboxReconcileResultSchema.parse(response.result);
-        if (
-          acknowledgement.episodeId !== claimed.recovery.episodeId ||
-          acknowledgement.attempt !== wireRecovery.attempt ||
-          acknowledgement.phase !== phase
-        )
-          throw new SandboxControlConnectionError('Recovery acknowledgement changed', false);
       };
       const finish = async () => {
         await persist(current => {
@@ -249,15 +249,14 @@ export function createRecoveryExecution(dependencies: Dependencies) {
       if (claimed.recovery.activationAcknowledgedAt !== undefined) return await finish();
       await phase('ready');
       const statusDeadlineAt = requestDeadlineAt();
-      const status = await dependencies.sendRequest({
-        operation: 'sandbox.status',
-        payload: {},
+      const kiloReady = await reconcilePort.probeReady({
         expectedWrapperInstanceId: runtime.identity.wrapperInstanceId,
+        episodeId: claimed.recovery.episodeId,
+        attempt: claimed.recovery.attempt,
         deadlineAt: statusDeadlineAt,
-        timeoutMs: Math.max(1, statusDeadlineAt - Date.now()),
       });
       await assertCurrent();
-      if (!status.ok || !sandboxStatusResultSchema.parse(status.result).kiloReady)
+      if (!kiloReady)
         throw new SandboxControlConnectionError('Recovered wrapper is not ready', true);
       if (!(await dependencies.onReady(runtime.identity, claimed.recovery)))
         throw new SandboxControlConnectionError('Recovery activation was not committed', true);

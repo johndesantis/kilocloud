@@ -95,6 +95,8 @@ export function createCloudflareProviderAdapter(deps: {
 
   return {
     resumable: false,
+    persistentWorkspace: false,
+    destroysOnStop: true,
     ensureBillingAdmission,
     async create(intent: ProviderCreateIntent) {
       const providerRef = encodeCloudflareProviderRef({

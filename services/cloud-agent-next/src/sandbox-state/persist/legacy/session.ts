@@ -1,5 +1,5 @@
 /**
- * Frozen decoder for today's bare `session_messages` array (design §9; plan §3).
+ * Frozen decoder for today's bare session-message array (design §9; plan §3).
  *
  * Imported only by `persist/load.ts`. It accepts both row eras: the v2 rows that
  * own `version: 2` and an `intent`, and the pre-intent rows that carry

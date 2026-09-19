@@ -2,7 +2,7 @@
  * Canonical loader with the split dispatch from plan §3.
  *
  * Allocation: canonical key present → strict parse or fail closed; absent → decode
- * the legacy `physical_record`; both absent → the initial record.
+ * the legacy allocation record; both absent → the initial record.
  *
  * Session: missing → empty aggregate; marker-free bare array → legacy decode;
  * canonical `{v: 2}` envelope → strict decode; anything else → fail closed.
@@ -23,12 +23,8 @@ import {
 } from '../model/session.js';
 import { decodeLegacyAllocation } from './legacy/allocation.js';
 import { decodeLegacySession } from './legacy/session.js';
-import {
-  ALLOCATION_KEY,
-  LEGACY_ALLOCATION_KEY,
-  SESSION_KEY,
-  type CanonicalStorage,
-} from './store.js';
+import { readAllocationEntry, readSessionEntry } from './access.js';
+import { ALLOCATION_KEY, type CanonicalStorage } from './store.js';
 
 export type LoadSource = 'canonical' | 'legacy' | 'initial';
 
@@ -52,13 +48,13 @@ export async function loadAllocation(
     }
     return { ok: true, source: 'canonical', value: parsed.data };
   }
-  const legacy = await storage.get(LEGACY_ALLOCATION_KEY);
+  const legacy = await readAllocationEntry(storage);
   if (legacy === undefined) {
     return { ok: true, source: 'initial', value: initialAllocationRecord(resumable) };
   }
-  const converted = decodeLegacyAllocation(legacy);
+  const converted = decodeLegacyAllocation(legacy.value);
   if (!converted) {
-    return { ok: false, reason: 'invalid_legacy_allocation', key: LEGACY_ALLOCATION_KEY };
+    return { ok: false, reason: 'invalid_legacy_allocation', key: legacy.key };
   }
   return { ok: true, source: 'legacy', value: converted };
 }
@@ -75,27 +71,28 @@ export async function loadSession(
   storage: CanonicalStorage,
   options: SessionLoadOptions = {}
 ): Promise<LoadResult<SessionAggregate>> {
-  const raw = await storage.get(SESSION_KEY);
+  const raw = await readSessionEntry(storage);
   if (raw === undefined) {
     return { ok: true, source: 'initial', value: emptySessionAggregate() };
   }
-  if (Array.isArray(raw)) {
-    if (hasOwn(raw, 'v')) {
-      return { ok: false, reason: 'foreign_marker', key: SESSION_KEY };
+  const value = raw.value;
+  if (Array.isArray(value)) {
+    if (hasOwn(value, 'v')) {
+      return { ok: false, reason: 'foreign_marker', key: raw.key };
     }
-    const converted = decodeLegacySession(raw, options.legacyBindingHandle);
+    const converted = decodeLegacySession(value, options.legacyBindingHandle);
     if (!converted) {
-      return { ok: false, reason: 'invalid_legacy_session', key: SESSION_KEY };
+      return { ok: false, reason: 'invalid_legacy_session', key: raw.key };
     }
     return { ok: true, source: 'legacy', value: converted };
   }
-  if (typeof raw === 'object' && raw !== null) {
-    if (hasOwn(raw, 'v') && (raw as { v?: unknown }).v !== 2) {
-      return { ok: false, reason: 'foreign_marker', key: SESSION_KEY };
+  if (typeof value === 'object' && value !== null) {
+    if (hasOwn(value, 'v') && (value as { v?: unknown }).v !== 2) {
+      return { ok: false, reason: 'foreign_marker', key: raw.key };
     }
-    const parsed = sessionEnvelopeSchema.safeParse(raw);
+    const parsed = sessionEnvelopeSchema.safeParse(value);
     if (!parsed.success) {
-      return { ok: false, reason: 'invalid_canonical_session', key: SESSION_KEY };
+      return { ok: false, reason: 'invalid_canonical_session', key: raw.key };
     }
     return {
       ok: true,
@@ -103,5 +100,5 @@ export async function loadSession(
       value: { binding: parsed.data.binding, messages: parsed.data.messages },
     };
   }
-  return { ok: false, reason: 'invalid_session_shape', key: SESSION_KEY };
+  return { ok: false, reason: 'invalid_session_shape', key: raw.key };
 }

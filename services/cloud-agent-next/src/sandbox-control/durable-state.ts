@@ -21,8 +21,12 @@ import {
 } from './session-credentials.js';
 import { emptyTransitionLog, type TransitionRow } from './transition-log.js';
 import { sandboxRecoveryDecisionSchema, type SandboxRecoveryDecision } from './control-recovery.js';
+import {
+  eraseAllocationRecord,
+  readAllocationRecord,
+  writeAllocationRecord,
+} from '../sandbox-state/persist/access.js';
 
-export const PHYSICAL_KEY = 'physical_record';
 const ROUTES_KEY = 'session_routes';
 export const SESSION_REFERENCES_KEY = 'session_references';
 const DEADLINES_KEY = 'deadlines';
@@ -155,7 +159,7 @@ export async function readSandboxControlState(storage: {
   get(key: string): Promise<unknown>;
 }): Promise<StoredSandboxControlState> {
   const [physical, deadlines, routes, runtime] = await Promise.all([
-    storage.get(PHYSICAL_KEY),
+    readAllocationRecord<unknown>(storage),
     storage.get(DEADLINES_KEY),
     storage.get(ROUTES_KEY),
     loadRuntimeMetadata(storage),
@@ -175,7 +179,7 @@ export async function loadPhysicalRecord(
   storage: ControlStorage,
   resumable = false
 ): Promise<PhysicalRecord> {
-  const stored = await storage.get<PhysicalRecord>(PHYSICAL_KEY);
+  const stored = await readAllocationRecord<PhysicalRecord>(storage);
   return stored ?? initialPhysicalRecord(resumable);
 }
 
@@ -183,7 +187,7 @@ export async function savePhysicalRecord(
   storage: ControlStorage,
   record: PhysicalRecord
 ): Promise<void> {
-  await storage.put(PHYSICAL_KEY, record);
+  await writeAllocationRecord(storage, record);
 }
 
 export async function loadRouteTable(storage: ControlStorage): Promise<Map<string, SessionRoute>> {
@@ -292,8 +296,7 @@ export async function saveSessionCredentialGrants(
 }
 
 export async function eraseSandboxRecord(storage: ControlStorage): Promise<void> {
-  await storage.delete([
-    PHYSICAL_KEY,
+  await eraseAllocationRecord(storage, [
     ROUTES_KEY,
     SESSION_REFERENCES_KEY,
     DEADLINES_KEY,

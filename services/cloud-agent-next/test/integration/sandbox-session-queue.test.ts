@@ -24,6 +24,7 @@ import {
 } from '../../src/session/session-message-state.js';
 import type { SessionMetadata } from '../../src/persistence/session-metadata.js';
 
+import { readRawSessionMessages, writeSessionMessages } from '../../src/sandbox-state/persist/access.js';
 const access = vi.hoisted(() => new Map<string, string>());
 vi.mock('@kilocode/db/client', () => ({ getWorkerDb: () => ({}) }));
 vi.mock('@kilocode/worker-utils/cloud-agent-session-access', () => ({
@@ -75,7 +76,7 @@ function cancel(sessionId: string, index: number, userId = ownerId) {
 
 function snapshot(session: Session) {
   return runInDurableObject(session, async (_instance, state) => ({
-    messages: state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [],
+    messages: readRawSessionMessages<SessionMessageRecord>(state.storage.kv),
     metadata: state.storage.kv.get<SessionMetadata>('session_metadata'),
     events: createEventQueries(drizzle(state.storage), state.storage.sql).findByFilters({}),
     alarm: await state.storage.getAlarm(),
@@ -92,7 +93,7 @@ async function fixture() {
     agent,
   });
   await runInDurableObject(session, (_instance, state) => {
-    state.storage.kv.put('session_messages', [
+    writeSessionMessages(state.storage.kv, [
       {
         ...createSessionMessageRecord({
           turn: { type: 'prompt', messageId: id(0), prompt: 'accepted head' },
@@ -305,9 +306,8 @@ describe('public control queue capacity and cancellation', () => {
     await send(sessionId, 1);
     await send(sessionId, 2);
     await runInDurableObject(session, async (_instance, state) => {
-      const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-      state.storage.kv.put(
-        'session_messages',
+      const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+      writeSessionMessages(state.storage.kv,
         messages.filter(message => message.messageId !== id(0))
       );
       await state.storage.deleteAlarm();
@@ -345,9 +345,8 @@ describe('public control queue capacity and cancellation', () => {
     const { session, sessionId } = await fixture();
     await send(sessionId, 1);
     await runInDurableObject(session, (_instance, state) => {
-      const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-      state.storage.kv.put(
-        'session_messages',
+      const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+      writeSessionMessages(state.storage.kv,
         messages.map(message => (message.messageId === id(1) ? { ...message, ...patch } : message))
       );
     });
@@ -368,9 +367,8 @@ describe('public control queue capacity and cancellation', () => {
     const { session, sessionId } = await fixture();
     await send(sessionId, 1);
     await runInDurableObject(session, (_instance, state) => {
-      const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-      state.storage.kv.put(
-        'session_messages',
+      const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+      writeSessionMessages(state.storage.kv,
         messages.map(message => (message.messageId === id(1) ? { ...message, ...patch } : message))
       );
     });
@@ -393,9 +391,8 @@ describe('public control queue capacity and cancellation', () => {
     for (let index = 1; index <= PENDING_SESSION_MESSAGE_LIMIT; index++)
       await send(sessionId, index);
     await runInDurableObject(session, (_instance, state) => {
-      const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
-      state.storage.kv.put(
-        'session_messages',
+      const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+      writeSessionMessages(state.storage.kv,
         messages
           .filter(message => message.messageId !== id(0))
           .map(message =>

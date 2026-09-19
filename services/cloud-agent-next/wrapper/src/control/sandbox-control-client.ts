@@ -58,6 +58,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Read one advertised worker capability by name. Tolerant so the worker can drop
+ * an advertised field without breaking this wrapper build.
+ */
+function advertisedCapability(capabilities: unknown, name: string): boolean {
+  return isRecord(capabilities) && capabilities[name] === true;
+}
+
 export type EventPublicationObservation = {
   outcome:
     | 'acknowledged'
@@ -863,11 +871,12 @@ export function createSandboxControlClient(
             fail();
             return;
           }
-          kiloVersionHeartbeat = hello.data.capabilities?.kiloVersionHeartbeat === true;
-          connectionRecovery = hello.data.capabilities?.connectionRecovery === true;
-          negotiatedEventReceipts = hello.data.capabilities?.eventReceipts === true;
-          negotiatedEventBatches = hello.data.capabilities?.eventBatches === true;
-          negotiatedScopedCleanupResult = hello.data.capabilities?.scopedCleanupResult === true;
+          const capabilities: unknown = hello.data.capabilities;
+          kiloVersionHeartbeat = advertisedCapability(capabilities, 'kiloVersionHeartbeat');
+          connectionRecovery = advertisedCapability(capabilities, 'connectionRecovery');
+          negotiatedEventReceipts = advertisedCapability(capabilities, 'eventReceipts');
+          negotiatedEventBatches = advertisedCapability(capabilities, 'eventBatches');
+          negotiatedScopedCleanupResult = advertisedCapability(capabilities, 'scopedCleanupResult');
           phase = 'status';
           diagnostic('hello_accepted', ws);
           return;

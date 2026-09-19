@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   ALLOCATION_KEY,
-  LEGACY_ALLOCATION_KEY,
-  SESSION_KEY,
   eraseAllocation,
   storeAllocation,
   storeSession,
   type ErasableStorage,
 } from './store.js';
+import {
+  isAllocationRecordKey,
+  readSessionValueFrom,
+  writeAllocationRecord,
+  writeSessionValue,
+} from './access.js';
 import { loadAllocation, loadSession } from './load.js';
 import { initialAllocationRecord } from '../model/allocation.js';
 import type { SessionAggregate } from '../model/session.js';
@@ -75,7 +79,7 @@ describe('canonical store', () => {
   it('stores the session aggregate as a {v:2} envelope', async () => {
     const storage = memoryStorage();
     await storeSession(storage, SESSION);
-    expect(storage.data.get(SESSION_KEY)).toEqual({ v: 2, ...SESSION });
+    expect(readSessionValueFrom(storage.data)).toEqual({ v: 2, ...SESSION });
   });
 
   it('allocation store→load round-trip is identity', async () => {
@@ -96,17 +100,17 @@ describe('canonical store', () => {
   it('eraseAllocation deletes both allocation keys and leaves the session alone', async () => {
     const storage = memoryStorage();
     await storage.put(ALLOCATION_KEY, initialAllocationRecord(true));
-    await storage.put(LEGACY_ALLOCATION_KEY, { state: 'running', providerRef: 'ref' });
-    await storage.put(SESSION_KEY, { v: 2, binding: { kind: 'unbound' }, messages: [] });
+    await writeAllocationRecord(storage, { state: 'running', providerRef: 'ref' });
+    await writeSessionValue(storage, { v: 2, binding: { kind: 'unbound' }, messages: [] });
     await eraseAllocation(storage);
     expect(storage.data.has(ALLOCATION_KEY)).toBe(false);
-    expect(storage.data.has(LEGACY_ALLOCATION_KEY)).toBe(false);
-    expect(storage.data.has(SESSION_KEY)).toBe(true);
+    expect([...storage.data.keys()].some(isAllocationRecordKey)).toBe(false);
+    expect(readSessionValueFrom(storage.data)).toBeDefined();
   });
 
   it('erasing both allocation keys blocks legacy fallback: a later load is first boot', async () => {
     const storage: ErasableStorage & { data: Map<string, unknown> } = memoryStorage();
-    await storage.put(LEGACY_ALLOCATION_KEY, {
+    await writeAllocationRecord(storage, {
       state: 'running',
       providerRef: 'ref',
       createIntent: { intentId: 'i', createdAt: 1 },

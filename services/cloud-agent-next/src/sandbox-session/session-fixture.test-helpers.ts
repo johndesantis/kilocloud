@@ -21,6 +21,7 @@ import {
 } from '../shared/sandbox-control-protocol.js';
 import type { AcceptedPromptTurn, AgentSelection } from '../execution/types.js';
 import type { ControlSessionMessageInput, SessionMessageRecord } from './session-message-queue.js';
+import { readSessionValueSync } from '../sandbox-state/persist/access.js';
 
 export const SESSION_ID = 'workspace_11111111-1111-4111-8111-111111111111';
 export const SANDBOX_ID = 'ses-11111111111141118111111111111111';
@@ -296,13 +297,13 @@ export function createSessionFixture(
       return session.alarm();
     },
     record: (messageId: string) =>
-      kv
-        .get<SessionMessageRecord[]>('session_messages')
-        ?.find(message => message.messageId === messageId),
+      readSessionValueSync<SessionMessageRecord[]>(kv)?.find(
+        message => message.messageId === messageId
+      ),
     acquisition: (messageId: string) => {
-      const record = kv
-        .get<SessionMessageRecord[]>('session_messages')
-        ?.find(message => message.messageId === messageId);
+      const record = readSessionValueSync<SessionMessageRecord[]>(kv)?.find(
+        message => message.messageId === messageId
+      );
       if (!record?.preparationAttemptId || record.deliveryDeadlineAt === undefined) {
         throw new Error('Missing durable acquisition request');
       }
