@@ -26,7 +26,7 @@ import {
   saveSessionCredentialGrants,
 } from '../../src/sandbox-control/durable-state';
 import { DEADLINE_MS } from '../../src/sandbox-control/deadlines';
-import { WORKTREE_CREDENTIAL_CONTAINMENT } from '../../src/sandbox-control/physical-lifecycle';
+import { WORKTREE_CREDENTIAL_CONTAINMENT } from '../../src/sandbox-state/model/allocation';
 import { encodeCloudflareProviderRef } from '../../src/sandbox-control/cloudflare-provider';
 import {
   createVercelProviderAdapter,

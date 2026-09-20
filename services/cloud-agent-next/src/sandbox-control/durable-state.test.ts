@@ -28,12 +28,8 @@ import {
   serializedReferenceBytes,
 } from './session-references.js';
 import { createControlPlaneCredential } from './managed-credential.js';
-import {
-  claimCreate,
-  confirmRunning,
-  initialPhysicalRecord,
-  WORKTREE_CREDENTIAL_CONTAINMENT,
-} from './physical-lifecycle.js';
+import { claimCreate, confirmRunning, initialPhysicalRecord } from './physical-lifecycle.js';
+import { WORKTREE_CREDENTIAL_CONTAINMENT } from '../sandbox-state/model/allocation.js';
 import type { SessionCredentialGrant } from './session-credentials.js';
 import { attachRoute, emptyRouteTable, resolveSessionEventRoute } from './session-routes.js';
 

@@ -10,9 +10,9 @@ import {
   initialPhysicalRecord,
   observe,
   recordStopAttempt,
-  WORKTREE_CREDENTIAL_CONTAINMENT,
   type PhysicalRecord,
 } from './physical-lifecycle.js';
+import { WORKTREE_CREDENTIAL_CONTAINMENT } from '../sandbox-state/model/allocation.js';
 
 const NOW = 1_000;
 const INTENT_ID = 'intent_1';

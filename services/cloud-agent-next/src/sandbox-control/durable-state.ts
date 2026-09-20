@@ -20,7 +20,6 @@ import {
   type SessionCredentialGrant,
 } from './session-credentials.js';
 import { emptyTransitionLog, type TransitionRow } from './transition-log.js';
-import { sandboxRecoveryDecisionSchema, type SandboxRecoveryDecision } from './control-recovery.js';
 import {
   eraseAllocationRecord,
   readAllocationRecord,
@@ -37,7 +36,6 @@ const LOG_KEY = 'transition_log';
 const CREDENTIAL_GRANTS_KEY = 'worktree_credential_grants';
 const RUNTIME_METADATA_KEY = 'runtime_metadata';
 const NATIVE_RUNTIME_RETIREMENTS_KEY = 'native_runtime_retirements';
-const RECOVERY_DECISIONS_KEY = 'recovery_decisions';
 
 type ControlStorage = {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -271,21 +269,6 @@ export async function saveNativeRuntimeRetirements(
   );
 }
 
-export async function loadRecoveryDecisions(
-  storage: ControlStorage
-): Promise<SandboxRecoveryDecision[]> {
-  return sandboxRecoveryDecisionSchema
-    .array()
-    .parse((await storage.get(RECOVERY_DECISIONS_KEY)) ?? []);
-}
-
-export async function saveRecoveryDecisions(
-  storage: ControlStorage,
-  recovery: SandboxRecoveryDecision[]
-): Promise<void> {
-  await storage.put(RECOVERY_DECISIONS_KEY, sandboxRecoveryDecisionSchema.array().parse(recovery));
-}
-
 export async function loadDeadlines(storage: ControlStorage): Promise<DeadlineTable> {
   return (await storage.get<DeadlineTable>(DEADLINES_KEY)) ?? emptyDeadlines();
 }
@@ -330,6 +313,5 @@ export async function eraseSandboxRecord(storage: ControlStorage): Promise<void>
     CREDENTIAL_GRANTS_KEY,
     RUNTIME_METADATA_KEY,
     NATIVE_RUNTIME_RETIREMENTS_KEY,
-    RECOVERY_DECISIONS_KEY,
   ]);
 }

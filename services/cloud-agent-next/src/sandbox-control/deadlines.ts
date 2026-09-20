@@ -3,8 +3,6 @@ export const DEADLINE_IDS = [
   'socketHandshake',
   'wrapperReadiness',
   'heartbeatExpiry',
-  'recoveryExpiry',
-  'recoveryRetry',
   'acceptedAlarmCap',
   'idleStop',
   'stopAttempt',

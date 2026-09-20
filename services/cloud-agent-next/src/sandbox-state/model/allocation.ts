@@ -44,6 +44,12 @@ export const credentialContainmentSchema = z
 
 export type CredentialContainmentRequirements = z.infer<typeof credentialContainmentSchema>;
 
+export const WORKTREE_CREDENTIAL_CONTAINMENT = {
+  kilocode: true,
+  github: true,
+  worktreeScoped: true,
+} satisfies CredentialContainmentRequirements;
+
 export const allocationContainmentSchema = credentialContainmentSchema.extend({
   providerRef: z.string().min(1),
 });

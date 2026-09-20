@@ -95,14 +95,16 @@ import {
   saveSessionCredentialGrants,
   storeAllocation,
 } from '../../src/sandbox-control/durable-state.js';
-import type { AllocationRecord } from '../../src/sandbox-state/model/allocation.js';
+import {
+  WORKTREE_CREDENTIAL_CONTAINMENT,
+  type AllocationRecord,
+  type CredentialContainmentRequirements,
+} from '../../src/sandbox-state/model/allocation.js';
 import { allocationAlarmAt } from '../../src/sandbox-state/schedule.js';
 import {
   beginStop,
   claimCreate,
   initialPhysicalRecord,
-  WORKTREE_CREDENTIAL_CONTAINMENT,
-  type CredentialContainmentRequirements,
   type PhysicalRecord,
 } from '../../src/sandbox-control/physical-lifecycle.js';
 import type { ProviderAdapter, ProviderCreateIntent } from '../../src/sandbox-control/provider.js';

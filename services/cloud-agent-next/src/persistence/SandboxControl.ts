@@ -94,8 +94,6 @@ import {
   getWorktreeCredentialContainment,
   sandboxProviderConfigurationSchema,
   type SandboxProviderConfiguration,
-  WORKTREE_CREDENTIAL_CONTAINMENT,
-  type CredentialContainmentRequirements,
   type CreateIntent,
   type PhysicalRecord,
 } from '../sandbox-control/physical-lifecycle.js';
@@ -152,13 +150,15 @@ import {
 import type { NotifyEffectResult } from '../sandbox-control/control-effects.js';
 import { createReconcilePort } from '../sandbox-state/ports/reconcile.js';
 import { loadAllocation as loadAllocationResult } from '../sandbox-state/persist/load.js';
-import type {
-  AllocatedAllocation,
-  AllocationContainment,
-  AllocationRecord,
-  AllocationTarget,
-  CreatingAllocation,
-  StopProof,
+import {
+  WORKTREE_CREDENTIAL_CONTAINMENT,
+  type AllocatedAllocation,
+  type AllocationContainment,
+  type AllocationRecord,
+  type AllocationTarget,
+  type CreatingAllocation,
+  type StopProof,
+  type CredentialContainmentRequirements,
 } from '../sandbox-state/model/allocation.js';
 import type { AcquireEvent, AllocationInputEvent, DemandEvent } from '../sandbox-state/events.js';
 import type { Command } from '../sandbox-state/commands.js';
@@ -189,7 +189,6 @@ import {
   saveTransitionLog,
   loadSessionCredentialGrants,
   saveSessionCredentialGrants,
-  saveRecoveryDecisions,
 } from '../sandbox-control/durable-state.js';
 import {
   buildControlNetworkPolicy,
@@ -1976,7 +1975,6 @@ export class SandboxControl extends DurableObject<Env> {
     }
     if (to.state.kind === 'stopped') {
       await saveSessionCredentialGrants(this.ctx.storage, []);
-      await saveRecoveryDecisions(this.ctx.storage, []);
       await this.ctx.storage.delete(CREDENTIAL_POLICY_DIRTY_KEY);
       // No grants remain, so the credential-expiry anchor is meaningless and
       // must not keep an alarm armed.

@@ -12,10 +12,8 @@ import {
   hashSandboxCredential,
 } from '../../src/sandbox-control/credential.js';
 import { createControlPlaneCredential } from '../../src/sandbox-control/managed-credential.js';
-import {
-  WORKTREE_CREDENTIAL_CONTAINMENT,
-  type PhysicalRecord,
-} from '../../src/sandbox-control/physical-lifecycle.js';
+import type { PhysicalRecord } from '../../src/sandbox-control/physical-lifecycle.js';
+import { WORKTREE_CREDENTIAL_CONTAINMENT } from '../../src/sandbox-state/model/allocation.js';
 import {
   sessionCredentialGrantSchema,
   type SessionCredentialGrant,

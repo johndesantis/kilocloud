@@ -109,6 +109,8 @@ import { DEADLINE_MS } from '../../src/sandbox-control/deadlines.js';
 import { healthUnhealthyReason } from '../../src/sandbox-state/allocation/reduce.js';
 import type { LifecycleArgs, LifecycleResult } from './lifecycle.js';
 
+const SETTLED_REAP_REASON = healthUnhealthyReason('unresponsive');
+
 export const CONTINUITY_SCENARIO_TIMEOUT_MS: Record<string, number> = {
   'recover-same-session': 8 * 60_000,
   'interrupt-then-continue': 6 * 60_000,
@@ -2570,7 +2572,7 @@ async function requireHeartbeatExpiryFault(
  * does not re-state it.
  */
 export function isSettledReapStopRecord(record: LogRecord, sandboxId: string): boolean {
-  const reason = healthUnhealthyReason('unresponsive');
+  const reason = SETTLED_REAP_REASON;
   return (
     isControlRecord(record) &&
     record.diagnosticEvent === 'physical_committed' &&
@@ -2598,7 +2600,7 @@ async function waitForSettledReapStop(
   );
   if (!record) {
     throw new Error(
-      `${input.label}: no physical_committed cause/stopCause=${RECOVERY_SETTLED_REAP_REASON} for sandbox ${input.sandboxId}`
+      `${input.label}: no physical_committed cause/stopCause=${SETTLED_REAP_REASON} for sandbox ${input.sandboxId}`
     );
   }
   return record;
@@ -2969,7 +2971,7 @@ export async function lifecycleWrapperFreezeSettledReap(
       true,
       [
         ...evidence,
-        `cause=${RECOVERY_SETTLED_REAP_REASON}`,
+        `cause=${SETTLED_REAP_REASON}`,
         'settledReap=true',
         'wrapperFrozenThroughCleanupDeadline=true',
       ].join('; ')
@@ -3197,7 +3199,7 @@ export async function lifecycleWrapperFreezeInflightReap(
       true,
       [
         ...evidence,
-        `cause=${RECOVERY_SETTLED_REAP_REASON}`,
+        `cause=${SETTLED_REAP_REASON}`,
         'runtimeUnhealthy=true',
         'routeStaleActive=true',
         'sameSessionFollowUp=true',

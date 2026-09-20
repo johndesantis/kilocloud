@@ -18,9 +18,9 @@ import {
   confirmStopped,
   getWorktreeCredentialContainment,
   recordStopAttempt,
-  WORKTREE_CREDENTIAL_CONTAINMENT,
   type PhysicalRecord,
 } from './physical-lifecycle.js';
+import { WORKTREE_CREDENTIAL_CONTAINMENT } from '../sandbox-state/model/allocation.js';
 import { deriveSandboxAllocationId } from '../sandbox-id.js';
 import { seedAllocationRecord, writeAllocationRecord } from '../sandbox-state/persist/access.js';
 

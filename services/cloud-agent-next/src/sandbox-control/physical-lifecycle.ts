@@ -1,6 +1,10 @@
 import { vercelSandboxResourcesSchema } from '@kilocode/worker-utils/sandbox-allocation';
 import { z } from 'zod';
 import type { VercelSandboxRuntimeConfig } from '../agent-sandbox/vercel/vercel-runtime-config.js';
+import {
+  WORKTREE_CREDENTIAL_CONTAINMENT,
+  type CredentialContainmentRequirements,
+} from '../sandbox-state/model/allocation.js';
 
 export const sandboxProviderConfigurationSchema = z.discriminatedUnion('provider', [
   z.object({ provider: z.literal('cloudflare') }).strict(),
@@ -12,18 +16,6 @@ export const sandboxProviderConfigurationSchema = z.discriminatedUnion('provider
 export type SandboxProviderConfiguration = z.infer<typeof sandboxProviderConfigurationSchema>;
 
 export type PhysicalState = 'stopped' | 'creating' | 'running' | 'stopping' | 'failed' | 'unknown';
-
-export type CredentialContainmentRequirements = {
-  kilocode: boolean;
-  github: boolean;
-  worktreeScoped?: true;
-};
-
-export const WORKTREE_CREDENTIAL_CONTAINMENT = {
-  kilocode: true,
-  github: true,
-  worktreeScoped: true,
-} satisfies CredentialContainmentRequirements;
 
 export function getWorktreeCredentialContainment(
   enabled: boolean
