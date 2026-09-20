@@ -93,6 +93,7 @@ export type AllocationEvent =
     }
   | { type: 'CREATE_FAILED'; fence: ResultFence; reason: string; at: number }
   | { type: 'CREATE_UNKNOWN'; fence: ResultFence; reason: string; at: number }
+  | { type: 'LAUNCH_FAILED'; fence: ResultFence; reason: string; at: number }
   | { type: 'HEALTH_UNHEALTHY'; verdict: HealthVerdict }
   | { type: 'DESTROY_CONFIRMED'; fence: ResultFence; proof: StopProof }
   | { type: 'DESTROY_NOT_CONFIRMED'; fence: ResultFence; detail?: string }
@@ -118,14 +119,29 @@ export type RecoveryFence = {
 };
 
 export type HealthEvent =
-  | { type: 'CONNECTED'; incarnation: string; at: number; ready: boolean; episodeId?: string }
-  | { type: 'HEARTBEAT'; incarnation: string; at: number; ready: boolean; episodeId?: string }
+  | {
+      type: 'CONNECTED';
+      incarnation: string;
+      at: number;
+      ready: boolean;
+      episodeId?: string;
+      expectedWrapperInstanceId?: string;
+    }
+  | {
+      type: 'HEARTBEAT';
+      incarnation: string;
+      at: number;
+      ready: boolean;
+      episodeId?: string;
+      expectedWrapperInstanceId?: string;
+    }
   | {
       type: 'HEALTH_OBSERVED';
       incarnation: string;
       at: number;
       providerState: 'active' | 'terminal' | 'unknown';
       episodeId?: string;
+      expectedWrapperInstanceId?: string;
     }
   | { type: 'RECOVERY_STEP'; fence: RecoveryFence; step: HealthRecoveryStep }
   | { type: 'RECOVERY_ATTEMPT_FAILED'; fence: RecoveryFence }

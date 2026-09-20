@@ -153,6 +153,11 @@ function commandKinds(decision: ReturnType<typeof decideAllocation>): string[] {
   return decision?.commands.map(command => command.kind) ?? [];
 }
 
+function notifyCommandOf(decision: ReturnType<typeof decideAllocation>) {
+  const command = decision?.commands.find(candidate => candidate.kind === 'NotifySession');
+  return command?.kind === 'NotifySession' ? command : undefined;
+}
+
 function destroyProof(overrides: Partial<StopProof> = {}): StopProof {
   return {
     effect: 'destroy',
@@ -221,6 +226,40 @@ describe('allocation reducer — design §5 transitions', () => {
     expect(decision?.deadlineAt).toBe(NOW + POLICY.connectingDeadlineMs);
   });
 
+  it('uses the create effect incarnation (not the intent id) for the stop proof', () => {
+    // The create effect may confirm an incarnation that differs from the create
+    // intent id. The aggregate must carry the returned incarnation, and the
+    // immediate stop notification must be fenced to it — never to the intent id.
+    const confirmed = decideAllocation(
+      creating(),
+      {
+        type: 'CREATE_CONFIRMED',
+        fence: fence(CREATE_OP, 'provider-ref-1', 'inc-created'),
+        providerRef: 'provider-ref-1',
+        incarnation: 'inc-created',
+        at: NOW,
+        resolvedContainment: { kilocode: true, github: true, providerRef: 'provider-ref-1' },
+      },
+      NOW
+    );
+    const allocatedState = confirmed!.state.state;
+    expect(allocatedState.kind === 'allocated' && allocatedState.health.incarnation).toBe(
+      'inc-created'
+    );
+
+    const stopped = decideAllocation(
+      confirmed!.state,
+      { type: 'CANCEL', scope: 'allocation', reason: 'cancel_allocation' },
+      NOW
+    );
+    const notify = notifyCommandOf(stopped);
+    expect(notify?.stopProof?.incarnation).toBe('inc-created');
+    expect(notify?.stopProof?.incarnation).not.toBe(CREATE_INTENT.intentId);
+    expect(notify?.stopProof).toEqual(
+      destroyProof({ reason: 'cancel_allocation', incarnation: 'inc-created' })
+    );
+  });
+
   it('creating rejects CREATE_CONFIRMED with a stale fence', () => {
     expect(
       decideAllocation(
@@ -268,7 +307,7 @@ describe('allocation reducer — design §5 transitions', () => {
     ).toBeUndefined();
   });
 
-  it('creating + CREATE_UNKNOWN → unknown and emits Observe', () => {
+  it('creating + CREATE_UNKNOWN → unknown retaining the startup deadline, no Observe', () => {
     const decision = decideAllocation(
       creating(),
       {
@@ -280,8 +319,8 @@ describe('allocation reducer — design §5 transitions', () => {
       NOW
     );
     expect(decision?.state.state.kind).toBe('unknown');
-    expect(commandKinds(decision)).toEqual(['Observe']);
-    expect(decision?.deadlineAt).toBe(NOW + POLICY.observeDeadlineMs);
+    expect(commandKinds(decision)).toEqual([]);
+    expect(decision?.deadlineAt).toBe(NOW + POLICY.createDeadlineMs);
   });
 
   it('creating + DEADLINE before the deadline is preserved', () => {
@@ -356,6 +395,9 @@ describe('allocation reducer — design §5 transitions', () => {
     );
     expect(decision?.state.state.kind).toBe('stopping');
     expect(commandKinds(decision)).toEqual(['Destroy', 'NotifySession']);
+    expect(notifyCommandOf(decision)?.stopProof).toEqual(
+      destroyProof({ reason: 'cancel_allocation' })
+    );
   });
 
   it('allocated + CANCEL{recovery} while healthy is rejected (nothing to recover)', () => {
@@ -388,6 +430,9 @@ describe('allocation reducer — design §5 transitions', () => {
     const state = decision!.state.state;
     expect(state.kind === 'stopping' && state.stopIntent.reason).toContain('unresponsive');
     expect(state.kind === 'stopping' && state.stopIntent.incarnation).toBe(INC);
+    expect(notifyCommandOf(decision)?.stopProof).toEqual(
+      destroyProof({ reason: 'health_unhealthy_unresponsive' })
+    );
   });
 
   it('allocated + CANCEL{recovery} gives recovery up → stopping.destroying', () => {
@@ -397,6 +442,10 @@ describe('allocation reducer — design §5 transitions', () => {
       NOW
     );
     expect(decision?.state.state.kind).toBe('stopping');
+    expect(commandKinds(decision)).toEqual(['Destroy', 'NotifySession']);
+    expect(notifyCommandOf(decision)?.stopProof).toEqual(
+      destroyProof({ reason: 'health_unhealthy_unresponsive' })
+    );
   });
 
   it('allocated + DEADLINE with idle due and eligible stops', () => {
@@ -407,6 +456,7 @@ describe('allocation reducer — design §5 transitions', () => {
     );
     expect(decision?.state.state.kind).toBe('stopping');
     expect(commandKinds(decision)).toEqual(['Destroy', 'NotifySession']);
+    expect(notifyCommandOf(decision)?.stopProof).toEqual(destroyProof({ reason: 'idle' }));
   });
 
   it('allocated + DEADLINE while recovering past idleAt does not transition IDLE', () => {
@@ -645,6 +695,35 @@ describe('allocation reducer — design §5 transitions', () => {
     expect(commandKinds(decision)).toEqual(['Destroy']);
   });
 
+  it('unknown + OBSERVED present adopts a discovered reference and stops it', () => {
+    const record: AllocationRecord = {
+      v: 2,
+      resumable: true,
+      state: {
+        kind: 'unknown',
+        target: UNRESOLVED_TARGET,
+        createIntent: CREATE_INTENT,
+        stopIntent: null,
+        attempts: 0,
+        reason: 'create_deadline',
+        deadlineAt: NOW + POLICY.observeDeadlineMs,
+      },
+    };
+    const decision = decideAllocation(
+      record,
+      {
+        type: 'OBSERVED',
+        fence: fence(operationId('observe', CREATE_INTENT.intentId), 'discovered-ref'),
+        result: 'present',
+      },
+      NOW
+    );
+    expect(decision?.state.state.kind).toBe('stopping');
+    if (decision?.state.state.kind !== 'stopping') return;
+    expect(decision.state.state.target.providerRef).toBe('discovered-ref');
+    expect(commandKinds(decision)).toEqual(['Destroy']);
+  });
+
   it('unknown rejects OBSERVED with a stale fence', () => {
     expect(
       decideAllocation(
@@ -659,11 +738,19 @@ describe('allocation reducer — design §5 transitions', () => {
     ).toBeUndefined();
   });
 
-  it('unknown + DEADLINE re-arms Observe', () => {
+  it('unknown + DEADLINE before the retained deadline is inert', () => {
     const decision = decideAllocation(unknown(), { type: 'DEADLINE' }, NOW);
+    expect(decision?.state).toEqual(unknown());
+    expect(commandKinds(decision)).toEqual([]);
+    expect(decision?.deadlineAt).toBe(NOW + POLICY.observeDeadlineMs);
+  });
+
+  it('unknown + DEADLINE at the retained deadline re-arms Observe', () => {
+    const at = NOW + POLICY.observeDeadlineMs;
+    const decision = decideAllocation(unknown(), { type: 'DEADLINE' }, at);
     expect(decision?.state.state.kind).toBe('unknown');
     expect(commandKinds(decision)).toEqual(['Observe']);
-    expect(decision?.deadlineAt).toBe(NOW + POLICY.observeDeadlineMs);
+    expect(decision?.deadlineAt).toBe(at + POLICY.observeDeadlineMs);
   });
 
   it('persistent providers take Stop, not Destroy', () => {

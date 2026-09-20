@@ -94,7 +94,9 @@ const NOTIFY: NotifySessionCommand = {
 };
 
 type PortOverrides = Partial<ControlEffectPort>;
-type PortCalls = Array<'create' | 'stop' | 'destroy' | 'observe' | 'reconcile' | 'notify'>;
+type PortCalls = Array<
+  'create' | 'launch' | 'stop' | 'destroy' | 'observe' | 'reconcile' | 'notify'
+>;
 type FakePort = ControlEffectPort & { calls: PortCalls };
 
 function fakePort(overrides: PortOverrides = {}): FakePort {
@@ -104,6 +106,10 @@ function fakePort(overrides: PortOverrides = {}): FakePort {
     create: async () => {
       calls.push('create');
       return { outcome: 'confirmed', providerRef: 'ref-1', incarnation: INC };
+    },
+    launch: async () => {
+      calls.push('launch');
+      return { outcome: 'confirmed' };
     },
     stop: async () => {
       calls.push('stop');
@@ -352,6 +358,26 @@ describe('control effects — command to event runner', () => {
       NOW
     );
     expect(thrown).toMatchObject({ type: 'RECOVERY_ATTEMPT_FAILED' });
+  });
+
+  it('defers reconcile without attempting it while recovery is deferred', async () => {
+    let attempts = 0;
+    const port = fakePort({
+      reconcile: async () => {
+        attempts += 1;
+        return { outcome: 'attempt-failed' };
+      },
+    });
+
+    // The runner owns the deferral decision: no attempt and no event, so the
+    // episode and its absolute deadline stay intact for the next alarm.
+    expect(await runCommands(port, [RECONCILE], NOW, () => true)).toEqual([]);
+    expect(attempts).toBe(0);
+
+    expect(await runCommands(port, [RECONCILE], NOW, () => false)).toMatchObject([
+      { type: 'RECOVERY_ATTEMPT_FAILED' },
+    ]);
+    expect(attempts).toBe(1);
   });
 
   it('executes notification without producing a result event', async () => {

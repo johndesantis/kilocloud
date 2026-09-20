@@ -46,7 +46,7 @@ const CF_TARGET: AllocationTarget = {
 };
 
 describe('allocation view — canonical to flat projection', () => {
-  it('projects the stopped terminal shape with null allocation fields', async () => {
+  it('carries a stopped record’s retained provider identity into the flat shape', async () => {
     const records = new Map<string, unknown>();
     await storageFrom(records).put('sandbox_allocation_state', {
       v: 2,
@@ -58,7 +58,7 @@ describe('allocation view — canonical to flat projection', () => {
     if (!loaded.ok) return;
     expect(projectAllocationToFlat(loaded.value)).toEqual({
       state: 'stopped',
-      providerRef: null,
+      providerRef: 'ref-1',
       createIntent: null,
       stopTombstone: null,
       resumable: true,

@@ -50,8 +50,6 @@ describe('sandbox control frames', () => {
       capabilities: {
         kiloVersionHeartbeat: true,
         sessionOperationResults: true,
-        scopedStopAbort: true,
-        nativeRuntimeRetirement: true,
       },
     });
     const previous = { protocolVersion: 1, handshakeComplete: true };
@@ -69,9 +67,6 @@ describe('sandbox control frames', () => {
     expect(
       sandboxHelloResultSchema.safeParse({ ...helloResult(), handshakeComplete: false }).success
     ).toBe(false);
-    expect(
-      sandboxHelloResultSchema.parse(helloResult({ scopedCleanupResult: true })).capabilities
-    ).toMatchObject({ scopedCleanupResult: true });
   });
 
   it('accepts a valid request envelope', () => {

@@ -26,6 +26,21 @@ import { SandboxAcquisitionLostError } from '../shared/sandbox-control-protocol.
 /** Receipt key used by the live DO today; kept identical for the cutover. */
 export const ACQUISITION_RECEIPTS_KEY = 'acquisition_receipts';
 
+/**
+ * Bounded record of requests that reopened the current exhausted cleanup. It is
+ * scoped to one cleanup allocation and dropped with the request deadline, so a
+ * request's own polls wait instead of restarting the ladder while a different
+ * request may reopen it. Kept apart from allocation receipts so a request that
+ * consumed a cleanup can still bind to the next allocation.
+ */
+export const ACQUISITION_CLEANUP_REOPENS_KEY = 'acquisition_cleanup_reopens';
+
+/**
+ * Upper bound on retained reopen markers (they also expire by deadline). A full
+ * ledger fails closed: a new request waits instead of evicting a live marker.
+ */
+export const MAX_ACQUISITION_CLEANUP_REOPENS = 32;
+
 export type AllocationIdentity = { kind: 'intent' | 'provider'; id: string };
 
 /** A session's acquisition demand: one request id, one delivery deadline. */
@@ -41,6 +56,14 @@ const acquisitionReceiptsSchema = z.array(
       z.object({ kind: z.literal('intent'), id: z.string().min(1) }),
       z.object({ kind: z.literal('provider'), id: z.string().min(1) }),
     ]),
+  })
+);
+
+const cleanupReopensSchema = z.array(
+  z.object({
+    id: z.string().min(1).max(128),
+    deadlineAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    allocationId: z.string().min(1),
   })
 );
 
@@ -61,6 +84,7 @@ export type AllocationControllerDeps = {
   /** Legacy-migration flag for a first-boot record. */
   resumable?: boolean;
   receiptsKey?: string;
+  cleanupReopensKey?: string;
   /**
    * The single impure owner of the recovery episode id: mints one uuid for a
    * recovery-opening event that lacks one. Defaults to `crypto.randomUUID`.
@@ -82,6 +106,20 @@ export type AllocationController = {
     acquisition: AllocationAcquisition,
     now?: number
   ): Promise<boolean>;
+  /**
+   * Acquisition-owner guard for an exhausted `check_required` cleanup. Returns
+   * `true` when this request already reopened the cleanup's current episode, so
+   * its later polls must `wait`; `false` for a fresh request, which is recorded
+   * and may advance. The record is scoped to the cleanup's allocation and
+   * bounded by the request deadline plus [MAX_ACQUISITION_CLEANUP_REOPENS]. A
+   * full ledger fails closed: a new request `wait`s rather than evicting a live
+   * replay marker, and advances only once a slot expires.
+   */
+  reopenCleanup(
+    record: AllocationRecord,
+    acquisition: AllocationAcquisition,
+    now?: number
+  ): Promise<boolean>;
 };
 
 /** `stopped` has no identity; otherwise the intent id, then the provider ref. */
@@ -96,6 +134,11 @@ export function allocationIdentity(record: AllocationRecord): AllocationIdentity
 /** A live allocation accepts reuse: creating or allocated, with no stop tombstone. */
 export function isLiveAllocation(record: AllocationRecord): boolean {
   return record.state.kind === 'creating' || record.state.kind === 'allocated';
+}
+
+/** The allocation identity a `stopping` cleanup belongs to. */
+export function cleanupAllocationId(record: AllocationRecord): string | undefined {
+  return record.state.kind === 'stopping' ? record.state.createIntent.intentId : undefined;
 }
 
 /**
@@ -119,6 +162,7 @@ function withEpisodeId(event: AllocationInputEvent, mint: () => string): Allocat
 export function createAllocationController(deps: AllocationControllerDeps): AllocationController {
   const clock = deps.now ?? (() => Date.now());
   const receiptsKey = deps.receiptsKey ?? ACQUISITION_RECEIPTS_KEY;
+  const cleanupReopensKey = deps.cleanupReopensKey ?? ACQUISITION_CLEANUP_REOPENS_KEY;
   const mintEpisodeId = deps.mintEpisodeId ?? (() => crypto.randomUUID());
 
   async function load(): Promise<AllocationRecord> {
@@ -173,6 +217,49 @@ export function createAllocationController(deps: AllocationControllerDeps): Allo
         await deps.storage.put(receiptsKey, receipts);
       }
       return receipt !== undefined || available;
+    },
+
+    async reopenCleanup(record, acquisition, now) {
+      const at = now ?? clock();
+      if (at >= acquisition.deadlineAt) throw new Error('Sandbox acquisition expired');
+      const allocationId = cleanupAllocationId(record);
+      if (allocationId === undefined) return false;
+
+      const raw = await deps.storage.get<unknown>(cleanupReopensKey);
+      const stored = raw === undefined ? [] : cleanupReopensSchema.parse(raw);
+      // Drop expired markers and markers for a superseded cleanup: only the
+      // current cleanup episode can be reopened by the same request id.
+      const current = stored.filter(
+        marker => marker.deadlineAt > at && marker.allocationId === allocationId
+      );
+      const existing = current.find(marker => marker.id === acquisition.id);
+      if (existing) {
+        if (existing.deadlineAt !== acquisition.deadlineAt) {
+          throw new Error('Sandbox acquisition deadline changed');
+        }
+        if (current.length !== stored.length) {
+          await deps.storage.put(cleanupReopensKey, current);
+        }
+        return true;
+      }
+
+      // Fail closed when every slot is occupied by a live marker: the ledger
+      // keeps its protection rather than evicting an active replay marker, which
+      // would let that request restart the exhausted ladder. A genuinely
+      // different request advances only once a slot is free (or expires).
+      if (current.length >= MAX_ACQUISITION_CLEANUP_REOPENS) {
+        if (current.length !== stored.length) {
+          await deps.storage.put(cleanupReopensKey, current);
+        }
+        return true;
+      }
+
+      const next = [
+        ...current,
+        { id: acquisition.id, deadlineAt: acquisition.deadlineAt, allocationId },
+      ];
+      await deps.storage.put(cleanupReopensKey, next);
+      return false;
     },
   };
 }

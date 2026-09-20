@@ -11,7 +11,7 @@ import {
 import type { VercelSandboxRuntimeConfig } from '../agent-sandbox/vercel/vercel-runtime-config.js';
 import { DEADLINE_MS } from './deadlines.js';
 import { logControlDiagnostic } from './diagnostics.js';
-import type { ObserveResult } from './physical-lifecycle.js';
+import type { ObserveResult } from './provider.js';
 import type { ProviderAdapter, ProviderCreateIntent } from './provider.js';
 
 const CONTROL_WRAPPER_PATH = '/usr/local/bin/kilocode-control-wrapper.js';

@@ -1,5 +1,5 @@
 import type { DeadlineId } from './deadlines.js';
-import type { PhysicalState } from './physical-lifecycle.js';
+import type { FlatAllocationState } from './allocation-view.js';
 import type { ConnectionState } from './status-projection.js';
 import type { SessionActivityState } from './session-routes.js';
 
@@ -50,8 +50,8 @@ export function trimTransitionLog(log: TransitionRow[], now: number): Transition
 
 export function physicalTransition(
   at: number,
-  from: PhysicalState,
-  to: PhysicalState,
+  from: FlatAllocationState,
+  to: FlatAllocationState,
   cause: string,
   providerRef: string | null
 ): TransitionRow {

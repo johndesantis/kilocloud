@@ -1,8 +1,8 @@
 import type { SandboxBillingInput } from '../container-usage-context.js';
 import type { VercelSandboxNetworkPolicy } from '../agent-sandbox/vercel/vercel-sandbox-rest-client.js';
-import type { CreateIntent, ObserveResult } from './physical-lifecycle.js';
+import type { FlatCreateIntent } from './allocation-view.js';
 
-export type { ObserveResult };
+export type ObserveResult = 'active' | 'terminal' | 'unknown';
 
 export type StopResult = 'terminal' | 'retryable';
 
@@ -14,7 +14,7 @@ export function observeFromWrapperObservation(status: WrapperObservationStatus):
   return 'active';
 }
 
-export type ProviderCreateIntent = CreateIntent & {
+export type ProviderCreateIntent = FlatCreateIntent & {
   billing?: SandboxBillingInput;
   networkPolicy?: VercelSandboxNetworkPolicy;
 };
@@ -33,8 +33,8 @@ export type ProviderAdapter = {
   ensureBillingAdmission(ref: string, billing?: SandboxBillingInput): Promise<void>;
   create(intent: ProviderCreateIntent): Promise<{ providerRef: string } | { unresolved: true }>;
   launch(ref: string, env: Record<string, string>): Promise<void>;
-  observe(ref: string | null, intent?: CreateIntent | null): Promise<ProviderObservation>;
-  stop(ref: string | null, intent?: CreateIntent | null): Promise<StopResult>;
+  observe(ref: string | null, intent?: FlatCreateIntent | null): Promise<ProviderObservation>;
+  stop(ref: string | null, intent?: FlatCreateIntent | null): Promise<StopResult>;
   ensureLeaseAtLeast(ref: string, ms: number): Promise<void>;
   logs(ref: string): Promise<string>;
   updateNetworkPolicy?(

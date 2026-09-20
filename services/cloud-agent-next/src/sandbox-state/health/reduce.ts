@@ -252,7 +252,8 @@ function beginRecovery(
   state: HealthState,
   at: number,
   episodeId: string,
-  cause: RecoveryCause
+  cause: RecoveryCause,
+  expectedWrapperInstanceId?: string
 ): { state: RecoveringHealth; commands: Command[] } {
   const recovering: RecoveringHealth = {
     kind: 'recovering',
@@ -262,10 +263,11 @@ function beginRecovery(
     deadlineAt: at + POLICY.recoveryDeadlineMs,
     episodeId,
     cause,
+    ...(expectedWrapperInstanceId !== undefined ? { expectedWrapperInstanceId } : {}),
   };
   return {
     state: recovering,
-    commands: [reconcileCommand(recovering)],
+    commands: [reconcileCommand(recovering, expectedWrapperInstanceId)],
   };
 }
 
@@ -275,7 +277,7 @@ function recoveryFenceMatches(state: RecoveringHealth, fence: RecoveryFence): bo
   if (fence.episodeId !== state.episodeId) return false;
   const inFlight = state.attempts + 1;
   if (fence.attempt !== inFlight) return false;
-  return fence.operationId === reconcileCommand(state).operationId;
+  return fence.operationId === reconcileCommand(state, state.expectedWrapperInstanceId).operationId;
 }
 
 /**
@@ -290,7 +292,7 @@ function consumeAttempt(state: RecoveringHealth, step?: HealthRecoveryStep): Dec
   const next: RecoveringHealth = { ...state, attempts, ...(step !== undefined ? { step } : {}) };
   return {
     state: next,
-    commands: [reconcileCommand(next)],
+    commands: [reconcileCommand(next, next.expectedWrapperInstanceId)],
     deadlineAt: next.deadlineAt,
   };
 }
@@ -304,10 +306,11 @@ function startRecovery(
   state: HealthState,
   at: number,
   episodeId: string | undefined,
-  cause: RecoveryCause
+  cause: RecoveryCause,
+  expectedWrapperInstanceId?: string
 ): Decision<HealthState> | undefined {
   if (episodeId === undefined) return undefined;
-  const beginning = beginRecovery(state, at, episodeId, cause);
+  const beginning = beginRecovery(state, at, episodeId, cause, expectedWrapperInstanceId);
   return {
     state: beginning.state,
     commands: beginning.commands,
@@ -317,7 +320,13 @@ function startRecovery(
 
 function acceptHeartbeat(
   state: HealthState,
-  event: { incarnation: string; at: number; ready: boolean; episodeId?: string }
+  event: {
+    incarnation: string;
+    at: number;
+    ready: boolean;
+    episodeId?: string;
+    expectedWrapperInstanceId?: string;
+  }
 ): Decision<HealthState> | undefined {
   if (!matches(state, event.incarnation)) return undefined;
   if (event.ready) {
@@ -329,7 +338,13 @@ function acceptHeartbeat(
     // budget nor re-emits Reconcile while an attempt is in flight.
     return { state, commands: [], deadlineAt: state.deadlineAt };
   }
-  return startRecovery(state, event.at, event.episodeId, 'activation_pending');
+  return startRecovery(
+    state,
+    event.at,
+    event.episodeId,
+    'activation_pending',
+    event.expectedWrapperInstanceId
+  );
 }
 
 export function decideHealth(
@@ -368,11 +383,23 @@ export function decideHealth(
           const next = { ...state, lastObservation: observation };
           return { state: next, commands: [], deadlineAt: next.deadlineAt };
         }
-        return startRecovery(state, event.at, event.episodeId, 'activation_pending');
+        return startRecovery(
+          state,
+          event.at,
+          event.episodeId,
+          'activation_pending',
+          event.expectedWrapperInstanceId
+        );
       }
       // providerState 'unknown'
       if (state.kind === 'healthy') {
-        return startRecovery(state, event.at, event.episodeId, 'control_disconnected');
+        return startRecovery(
+          state,
+          event.at,
+          event.episodeId,
+          'control_disconnected',
+          event.expectedWrapperInstanceId
+        );
       }
       const next = { ...state, lastObservation: observation };
       return { state: next, commands: [], deadlineAt: next.deadlineAt };

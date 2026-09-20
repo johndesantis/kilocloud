@@ -23,10 +23,16 @@ export type HealthDispatcher = {
  * starts bounded recovery. The state, not the adapter, chooses the consequence.
  */
 export type HealthObservation =
-  | { kind: 'handshake'; incarnation: string; at: number }
-  | { kind: 'ready'; incarnation: string; at: number }
-  | { kind: 'heartbeat'; incarnation: string; at: number; ready: boolean }
-  | { kind: 'socket-closed'; incarnation: string; at: number }
+  | { kind: 'handshake'; incarnation: string; at: number; expectedWrapperInstanceId?: string }
+  | { kind: 'ready'; incarnation: string; at: number; expectedWrapperInstanceId?: string }
+  | {
+      kind: 'heartbeat';
+      incarnation: string;
+      at: number;
+      ready: boolean;
+      expectedWrapperInstanceId?: string;
+    }
+  | { kind: 'socket-closed'; incarnation: string; at: number; expectedWrapperInstanceId?: string }
   | { kind: 'unhealthy'; verdict: HealthVerdict }
   | { kind: 'check' }
   | { kind: 'observed'; fence: ResultFence; result: 'absent' | 'present' };
@@ -40,6 +46,9 @@ export function toAllocationEvent(observation: HealthObservation): AllocationInp
         incarnation: observation.incarnation,
         at: observation.at,
         providerState: 'unknown',
+        ...(observation.expectedWrapperInstanceId !== undefined
+          ? { expectedWrapperInstanceId: observation.expectedWrapperInstanceId }
+          : {}),
       };
     case 'ready':
       return {
@@ -47,6 +56,9 @@ export function toAllocationEvent(observation: HealthObservation): AllocationInp
         incarnation: observation.incarnation,
         at: observation.at,
         ready: true,
+        ...(observation.expectedWrapperInstanceId !== undefined
+          ? { expectedWrapperInstanceId: observation.expectedWrapperInstanceId }
+          : {}),
       };
     case 'heartbeat':
       return {
@@ -54,6 +66,9 @@ export function toAllocationEvent(observation: HealthObservation): AllocationInp
         incarnation: observation.incarnation,
         at: observation.at,
         ready: observation.ready,
+        ...(observation.expectedWrapperInstanceId !== undefined
+          ? { expectedWrapperInstanceId: observation.expectedWrapperInstanceId }
+          : {}),
       };
     case 'unhealthy':
       return { type: 'HEALTH_UNHEALTHY', verdict: observation.verdict };

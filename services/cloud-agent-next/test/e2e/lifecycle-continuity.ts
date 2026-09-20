@@ -106,7 +106,7 @@ import {
   waitForOwnedCompletion,
 } from './worktree-support.js';
 import { DEADLINE_MS } from '../../src/sandbox-control/deadlines.js';
-import { RECOVERY_SETTLED_REAP_REASON } from '../../src/sandbox-control/recovery-cleanup.js';
+import { healthUnhealthyReason } from '../../src/sandbox-state/allocation/reduce.js';
 import type { LifecycleArgs, LifecycleResult } from './lifecycle.js';
 
 export const CONTINUITY_SCENARIO_TIMEOUT_MS: Record<string, number> = {
@@ -2565,19 +2565,20 @@ async function requireHeartbeatExpiryFault(
 
 /**
  * The one record that proves a settled reap for this sandbox: the
- * `running -> stopping` `physical_committed` transition, with the tombstone
- * reason in BOTH `cause` and `stopCause`. A later `stop_attempt` does not
- * re-state it.
+ * `running -> stopping` `physical_committed` transition, with the canonical
+ * unhealthy-stop reason in BOTH `cause` and `stopCause`. A later `stop_attempt`
+ * does not re-state it.
  */
 export function isSettledReapStopRecord(record: LogRecord, sandboxId: string): boolean {
+  const reason = healthUnhealthyReason('unresponsive');
   return (
     isControlRecord(record) &&
     record.diagnosticEvent === 'physical_committed' &&
     record.sandboxId === sandboxId &&
     record.fromState === 'running' &&
     record.toState === 'stopping' &&
-    record.cause === RECOVERY_SETTLED_REAP_REASON &&
-    record.stopCause === RECOVERY_SETTLED_REAP_REASON
+    record.cause === reason &&
+    record.stopCause === reason
   );
 }
 

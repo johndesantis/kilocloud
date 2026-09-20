@@ -51,6 +51,7 @@ export const ALLOCATION_EVENT_TYPES = [
   'CREATE_CONFIRMED',
   'CREATE_FAILED',
   'CREATE_UNKNOWN',
+  'LAUNCH_FAILED',
   'HEALTH_UNHEALTHY',
   'DESTROY_CONFIRMED',
   'DESTROY_NOT_CONFIRMED',
@@ -81,7 +82,7 @@ export const ALLOCATION_TRANSITIONS: readonly TransitionMeta[] = [
     from: 'creating',
     event: 'CREATE_CONFIRMED',
     to: 'allocated.connecting',
-    commands: [],
+    commands: ['Launch'],
     deadline: 'connect',
   },
   { from: 'creating', event: 'CREATE_FAILED', to: 'stopped', commands: [], deadline: null },
@@ -89,7 +90,14 @@ export const ALLOCATION_TRANSITIONS: readonly TransitionMeta[] = [
     from: 'creating',
     event: 'CREATE_UNKNOWN',
     to: 'unknown',
-    commands: ['Observe'],
+    commands: [],
+    deadline: 'create',
+  },
+  {
+    from: 'allocated.connecting',
+    event: 'LAUNCH_FAILED',
+    to: 'unknown',
+    commands: [],
     deadline: 'observe',
   },
   {
@@ -442,6 +450,19 @@ function stoppedFromLoss(
   };
 }
 
+/**
+ * The canonical stop reason for an unhealthy allocation. Exported so E2E reason
+ * consumers name the emitted reason instead of a legacy recovery constant.
+ */
+export function healthUnhealthyReason(verdict: 'absent' | 'unresponsive'): string {
+  return `health_unhealthy_${verdict}`;
+}
+
+/** The live wrapper identity the recovery episode was reconciling, when known. */
+function recoveryWrapper(state: AllocatedAllocation): string | undefined {
+  return state.health.kind === 'recovering' ? state.health.expectedWrapperInstanceId : undefined;
+}
+
 function applyHealth(
   record: AllocationRecord,
   state: AllocatedAllocation,
@@ -450,22 +471,32 @@ function applyHealth(
   now: number
 ): Decision<AllocationRecord> | undefined {
   const incarnation = state.health.incarnation;
+  const wrapper = recoveryWrapper(state);
   if (health.kind === 'unhealthy') {
-    const reason = `health_unhealthy_${health.verdict}`;
+    const reason = healthUnhealthyReason(health.verdict);
     if (health.verdict === 'absent') {
-      const next = stoppedFromLoss(state.target, incarnation, reason, now);
+      const next = stoppedFromLoss(state.target, incarnation, reason, now, wrapper);
       return {
         state: { v: 2, resumable: record.resumable, state: next },
-        commands: [notifyCommand(reason, now, lossProof(state.target, incarnation, reason, now))],
+        commands: [
+          notifyCommand(reason, now, lossProof(state.target, incarnation, reason, now, wrapper)),
+        ],
         deadlineAt: null,
       };
     }
-    const stopping = enterStopping(state.target, state.createIntent, reason, now, incarnation);
+    const stopping = enterStopping(
+      state.target,
+      state.createIntent,
+      reason,
+      now,
+      incarnation,
+      wrapper
+    );
     return {
       state: { v: 2, resumable: record.resumable, state: stopping },
       commands: [
         ...effectCommand(state.target, reason, effectOperationId(stopping), incarnation),
-        notifyCommand(reason, now, lossProof(state.target, incarnation, reason, now)),
+        notifyCommand(reason, now, lossProof(state.target, incarnation, reason, now, wrapper)),
       ],
       deadlineAt: stopping.deadlineAt,
     };
@@ -541,7 +572,14 @@ export function decideAllocation(
           const allocated = allocatedConnecting(target, state.createIntent, health);
           return {
             state: { v: 2, resumable: record.resumable, state: allocated },
-            commands: [],
+            commands: [
+              {
+                kind: 'Launch',
+                operationId: operationId('launch', state.createIntent.intentId),
+                target,
+                incarnation: event.incarnation,
+              },
+            ],
             deadlineAt: health.deadlineAt,
           };
         }
@@ -562,9 +600,24 @@ export function decideAllocation(
           };
           return { state: next, commands: [], deadlineAt: null };
         }
-        case 'CREATE_UNKNOWN':
+        case 'CREATE_UNKNOWN': {
           if (!fenceMatches(event.fence, expected)) return undefined;
-          return toUnknown(record, state.target, state.createIntent, event.reason, now);
+          // An unresolved create retains the intent and the startup deadline and
+          // emits no Observe. The allocation stays identity-stable for the
+          // in-flight readiness caller; the observe/resolve ladder runs only at
+          // the retained startup deadline (the `unknown` DEADLINE handler).
+          return {
+            state: unknownRecord(
+              record,
+              state.target,
+              state.createIntent,
+              event.reason,
+              state.deadlineAt
+            ),
+            commands: [],
+            deadlineAt: state.deadlineAt,
+          };
+        }
         case 'DEADLINE':
           if (now < state.deadlineAt) {
             return { state: record, commands: [], deadlineAt: state.deadlineAt };
@@ -616,6 +669,32 @@ export function decideAllocation(
           const decision = decideHealth(state.health, event, now);
           if (decision === undefined) return undefined;
           return applyHealth(record, state, decision.state, decision.commands, now);
+        }
+        case 'LAUNCH_FAILED': {
+          // The wrapper could not start on a confirmed instance. Keep the
+          // provider reference and creation intent and settle via the observe
+          // ladder (no immediate provider effect): the allocation is unproven,
+          // not absent. Only a launch that is still outstanding can fail; a
+          // late failure for a healthy/recovering allocation is rejected.
+          if (state.health.kind !== 'connecting') return undefined;
+          if (
+            !fenceMatches(
+              event.fence,
+              operationId('launch', state.createIntent.intentId),
+              state.target.providerRef,
+              state.health.incarnation
+            )
+          ) {
+            return undefined;
+          }
+          const decision = toUnknown(
+            record,
+            state.target,
+            state.createIntent,
+            'launch_failed',
+            now
+          );
+          return { ...decision, commands: [] };
         }
         default:
           return delegatedHealth(record, state, event, now);
@@ -722,7 +801,9 @@ export function decideAllocation(
             return undefined;
           }
           if (state.attempts + 1 >= POLICY.stopMaxAttempts) {
-            return toCheckRequired(record, state);
+            // The failed attempt that exhausts the budget is itself spent, so
+            // the recorded count reaches `stopMaxAttempts` (not one short).
+            return toCheckRequired(record, { ...state, attempts: state.attempts + 1 });
           }
           const attempts = state.attempts + 1;
           const next: StoppingDestroying = {
@@ -824,7 +905,15 @@ export function decideAllocation(
             'observe',
             target?.providerRef ?? state.createIntent?.intentId ?? 'unknown'
           );
-          if (!fenceMatches(event.fence, expected, target?.providerRef)) return undefined;
+          // A target that never bound a reference is observed by name, and the
+          // provider may discover the reference; adopt it as the allocation
+          // identity so the following stop targets the found sandbox.
+          const discovered = event.fence.providerRef ?? null;
+          if (target?.providerRef === null) {
+            if (!fenceMatches(event.fence, expected)) return undefined;
+          } else if (!fenceMatches(event.fence, expected, target?.providerRef)) {
+            return undefined;
+          }
           if (event.result === 'absent') {
             const next: AllocationRecord = {
               v: 2,
@@ -844,18 +933,21 @@ export function decideAllocation(
             return { state: next, commands: [], deadlineAt: null };
           }
           if (!target || !state.createIntent) return undefined;
-          const incarnation = state.createIntent.intentId;
+          const adopted =
+            target.providerRef === null && discovered !== null
+              ? { ...target, providerRef: discovered }
+              : target;
           const stopping = enterStopping(
-            target,
+            adopted,
             state.createIntent,
             'observed_present',
             now,
-            incarnation
+            state.createIntent.intentId
           );
           return {
             state: { v: 2, resumable: record.resumable, state: stopping },
             commands: effectCommand(
-              target,
+              adopted,
               stopping.stopIntent.reason,
               effectOperationId(stopping),
               stopping.stopIntent.incarnation
@@ -865,6 +957,16 @@ export function decideAllocation(
         }
         case 'DEADLINE': {
           if (!state.target) return undefined;
+          // An unresolved create/launch retains its startup deadline and emits
+          // no Observe, so a caller-side poll or infrastructure alarm must not
+          // start observing inside that window. The observe/resolve ladder runs
+          // only once the retained deadline is due; re-observing after the
+          // observe deadline keeps the ladder advancing. A migrated legacy
+          // tombstone is resolved eagerly by the readiness caller, not deferred.
+          const eager = state.reason === 'legacy_failed' || state.reason === 'legacy_unknown';
+          if (!eager && now < state.deadlineAt) {
+            return { state: record, commands: [], deadlineAt: state.deadlineAt };
+          }
           const deadlineAt = now + POLICY.observeDeadlineMs;
           const next: AllocationRecord = {
             v: 2,
@@ -893,15 +995,14 @@ export function decideAllocation(
   }
 }
 
-function toUnknown(
+function unknownRecord(
   record: AllocationRecord,
   target: AllocationTarget | null,
   createIntent: AllocationCreateIntent | null,
   reason: string,
-  now: number
-): Decision<AllocationRecord> {
-  const deadlineAt = now + POLICY.observeDeadlineMs;
-  const next: AllocationRecord = {
+  deadlineAt: number
+): AllocationRecord {
+  return {
     v: 2,
     resumable: record.resumable,
     state: {
@@ -914,6 +1015,16 @@ function toUnknown(
       deadlineAt,
     },
   };
+}
+
+function toUnknown(
+  record: AllocationRecord,
+  target: AllocationTarget | null,
+  createIntent: AllocationCreateIntent | null,
+  reason: string,
+  now: number
+): Decision<AllocationRecord> {
+  const deadlineAt = now + POLICY.observeDeadlineMs;
   const commands: Command[] =
     target === null
       ? []
@@ -927,7 +1038,11 @@ function toUnknown(
             target,
           },
         ];
-  return { state: next, commands, deadlineAt };
+  return {
+    state: unknownRecord(record, target, createIntent, reason, deadlineAt),
+    commands,
+    deadlineAt,
+  };
 }
 
 /**
@@ -949,7 +1064,8 @@ function enterStoppingFromAllocated(
     state.createIntent,
     reason,
     now,
-    state.health.incarnation
+    state.health.incarnation,
+    recoveryWrapper(state)
   );
   return {
     state: { v: 2, resumable: record.resumable, state: stopping },
@@ -960,7 +1076,11 @@ function enterStoppingFromAllocated(
         effectOperationId(stopping),
         stopping.stopIntent.incarnation
       ),
-      notifyCommand(reason, now),
+      notifyCommand(
+        reason,
+        now,
+        lossProof(state.target, state.health.incarnation, reason, now, recoveryWrapper(state))
+      ),
     ],
     deadlineAt: stopping.deadlineAt,
   };

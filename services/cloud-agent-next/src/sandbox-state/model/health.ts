@@ -88,6 +88,8 @@ export const recoveringHealthSchema = z
     /** Episode identity: minted once at the impure dispatch boundary, stable across attempts. */
     episodeId: z.string().uuid(),
     cause: recoveryCauseSchema,
+    /** Live wrapper identity the recovery attempt must reconcile against, when known. */
+    expectedWrapperInstanceId: z.string().min(1).optional(),
   })
   .strict();
 

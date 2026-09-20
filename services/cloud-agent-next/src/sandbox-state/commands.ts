@@ -11,6 +11,7 @@ export type OperationId = string;
 
 export type CommandKind =
   | 'Create'
+  | 'Launch'
   | 'Stop'
   | 'Destroy'
   | 'Observe'
@@ -23,6 +24,19 @@ export type CreateCommand = {
   operationId: OperationId;
   target: AllocationTarget;
   intentId: string;
+};
+
+/**
+ * Start the wrapper for an already-confirmed allocation. Emitted by
+ * `CREATE_CONFIRMED` so the provider reference is durably visible before the
+ * wrapper can launch; a failure is a distinct `LAUNCH_FAILED` result that keeps
+ * the reference.
+ */
+export type LaunchCommand = {
+  kind: 'Launch';
+  operationId: OperationId;
+  target: AllocationTarget;
+  incarnation: string;
 };
 
 export type StopCommand = {
@@ -85,6 +99,7 @@ export type AcquireCommand = {
 
 export type Command =
   | CreateCommand
+  | LaunchCommand
   | StopCommand
   | DestroyCommand
   | ObserveCommand

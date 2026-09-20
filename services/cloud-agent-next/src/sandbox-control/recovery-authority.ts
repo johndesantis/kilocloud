@@ -189,7 +189,12 @@ export function createRecoveryAuthority(input: {
                   await withTimeout(
                     withDORetry(
                       () => getSandboxSessionStub(input.env, stop.ownerId, stop.sessionId),
-                      stub => stub.interruptExecution(stop.request),
+                      stub =>
+                        (
+                          stub as unknown as {
+                            interruptExecution(input: unknown): Promise<unknown>;
+                          }
+                        ).interruptExecution(stop.request),
                       'reconcileRecoveryStop'
                     ),
                     DEADLINE_MS.stopAttempt,

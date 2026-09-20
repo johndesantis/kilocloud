@@ -52,7 +52,6 @@ export const defaultAgent: AgentSelection = {
 type Control = ReturnType<typeof sandboxControlRpc>;
 export type { Control };
 export type ControlStatus = Awaited<ReturnType<Control['ensureReady']>>;
-export type RuntimeQuarantineResult = Awaited<ReturnType<Control['quarantineRuntime']>>;
 
 export function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
@@ -245,14 +244,6 @@ export function createSessionFixture(
     bindRuntimeCredentialProxyHandle: vi.fn(async () => ({ bound: true as const })),
     detachSession: vi.fn(async () => ({ existed: true })),
     forgetSessionReference: vi.fn(async () => undefined),
-    quarantineRuntime: vi.fn(
-      async (
-        _input: Parameters<Control['quarantineRuntime']>[0]
-      ): Promise<RuntimeQuarantineResult> => ({
-        quarantined: true,
-        disposition: 'physical_stopping',
-      })
-    ),
     validateTerminalAccess: vi.fn(async () => ({ allowed: true })),
     recordTerminalActivity: vi.fn(async () => ({ allowed: true })),
     prepareSessionCredentials: vi.fn(async () => ({})),

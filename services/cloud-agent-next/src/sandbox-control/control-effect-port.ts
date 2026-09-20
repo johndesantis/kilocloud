@@ -1,14 +1,18 @@
 /**
  * Inert implementation of C3a's `ControlEffectPort` over injected dependencies:
- * a provider effect function set (`create`+`launch`, `stop`, `destroy`,
+ * a provider effect function set (`create`, `launch`, `stop`, `destroy`,
  * `observe`), a `NotifySessionPort`, and the C2 `ReconcilePort`. It executes the
  * allocation commands and returns effect results; it makes no state decision and
- * holds no storage. C3b binds the real `ProviderAdapter`, the session stub and
- * `ReconcilePort` and no longer needs new logic there.
+ * holds no storage. `create` only allocates the provider instance; the reducer
+ * emits a separate `Launch` command once the reference is confirmed, so the
+ * wrapper launch never precedes the durable confirmation. C3b binds the real
+ * `ProviderAdapter`, the session stub and `ReconcilePort` and no longer needs new
+ * logic there.
  */
 import type {
   CreateCommand,
   DestroyCommand,
+  LaunchCommand,
   NotifySessionCommand,
   ObserveCommand,
   ReconcileCommand,
@@ -24,6 +28,7 @@ import type { ObserveResult, StopResult } from './provider.js';
 import type {
   ControlEffectPort,
   CreateEffectResult,
+  LaunchEffectResult,
   NotifyEffectResult,
   ObserveEffectResult,
   ReconcileEffectResult,
@@ -125,7 +130,6 @@ export function createControlEffectPort(deps: ControlEffectPortDeps): ControlEff
           intentId: command.intentId,
         });
         if ('unresolved' in created) return { outcome: 'unknown', reason: 'create_unresolved' };
-        await deps.provider.launch({ providerRef: created.providerRef, target: command.target });
         return {
           outcome: 'confirmed',
           providerRef: created.providerRef,
@@ -136,6 +140,19 @@ export function createControlEffectPort(deps: ControlEffectPortDeps): ControlEff
         };
       } catch (error) {
         return { outcome: 'unknown', reason: errorMessage(error) };
+      }
+    },
+
+    async launch(command: LaunchCommand): Promise<LaunchEffectResult> {
+      const providerRef = command.target.providerRef;
+      if (providerRef === null) {
+        return { outcome: 'failed', reason: 'launch_without_provider_ref' };
+      }
+      try {
+        await deps.provider.launch({ providerRef, target: command.target });
+        return { outcome: 'confirmed' };
+      } catch (error) {
+        return { outcome: 'failed', reason: errorMessage(error) };
       }
     },
 

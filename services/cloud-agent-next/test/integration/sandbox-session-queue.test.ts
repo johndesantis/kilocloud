@@ -24,7 +24,10 @@ import {
 } from '../../src/session/session-message-state.js';
 import type { SessionMetadata } from '../../src/persistence/session-metadata.js';
 
-import { readRawSessionMessages, writeSessionMessages } from '../../src/sandbox-state/persist/access.js';
+import {
+  readRawSessionMessages,
+  writeSessionMessages,
+} from '../../src/sandbox-state/persist/access.js';
 const access = vi.hoisted(() => new Map<string, string>());
 vi.mock('@kilocode/db/client', () => ({ getWorkerDb: () => ({}) }));
 vi.mock('@kilocode/worker-utils/cloud-agent-session-access', () => ({
@@ -307,7 +310,8 @@ describe('public control queue capacity and cancellation', () => {
     await send(sessionId, 2);
     await runInDurableObject(session, async (_instance, state) => {
       const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
-      writeSessionMessages(state.storage.kv,
+      writeSessionMessages(
+        state.storage.kv,
         messages.filter(message => message.messageId !== id(0))
       );
       await state.storage.deleteAlarm();
@@ -346,7 +350,8 @@ describe('public control queue capacity and cancellation', () => {
     await send(sessionId, 1);
     await runInDurableObject(session, (_instance, state) => {
       const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
-      writeSessionMessages(state.storage.kv,
+      writeSessionMessages(
+        state.storage.kv,
         messages.map(message => (message.messageId === id(1) ? { ...message, ...patch } : message))
       );
     });
@@ -368,7 +373,8 @@ describe('public control queue capacity and cancellation', () => {
     await send(sessionId, 1);
     await runInDurableObject(session, (_instance, state) => {
       const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
-      writeSessionMessages(state.storage.kv,
+      writeSessionMessages(
+        state.storage.kv,
         messages.map(message => (message.messageId === id(1) ? { ...message, ...patch } : message))
       );
     });
@@ -392,7 +398,8 @@ describe('public control queue capacity and cancellation', () => {
       await send(sessionId, index);
     await runInDurableObject(session, (_instance, state) => {
       const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
-      writeSessionMessages(state.storage.kv,
+      writeSessionMessages(
+        state.storage.kv,
         messages
           .filter(message => message.messageId !== id(0))
           .map(message =>

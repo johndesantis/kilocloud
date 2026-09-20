@@ -14,6 +14,9 @@
 const ALLOCATION_RECORD_KEY = 'physical_record';
 const SESSION_MESSAGES_KEY = 'session_messages';
 
+/** Canonical allocation envelope key (plan §3). Owned here, used by `store.ts`. */
+export const CANONICAL_ALLOCATION_KEY = 'sandbox_allocation_state';
+
 export type AsyncRecordReader = {
   get(key: string): Promise<unknown>;
 };
@@ -53,6 +56,23 @@ export function isSessionMessagesKey(key: string): boolean {
   return key === SESSION_MESSAGES_KEY;
 }
 
+// --- allocation, canonical envelope (async) ---
+
+export function isCanonicalAllocationKey(key: string): boolean {
+  return key === CANONICAL_ALLOCATION_KEY;
+}
+
+export async function readCanonicalAllocationRecord(storage: AsyncRecordReader): Promise<unknown> {
+  return await storage.get(CANONICAL_ALLOCATION_KEY);
+}
+
+export async function writeCanonicalAllocationRecord(
+  storage: AsyncRecordWriter,
+  record: unknown
+): Promise<void> {
+  await storage.put(CANONICAL_ALLOCATION_KEY, record);
+}
+
 // --- allocation, current flat record (async) ---
 
 export async function readAllocationEntry(
@@ -80,7 +100,7 @@ export async function eraseAllocationRecord(
   storage: AsyncRecordEraser,
   additionalKeys: string[]
 ): Promise<void> {
-  await storage.delete([ALLOCATION_RECORD_KEY, ...additionalKeys]);
+  await storage.delete([ALLOCATION_RECORD_KEY, CANONICAL_ALLOCATION_KEY, ...additionalKeys]);
 }
 
 // --- session, current bare array (sync) ---
@@ -149,6 +169,19 @@ function readSeeded(records: SeedRecords, key: string): unknown {
 export function seedAllocationRecord<T extends SeedRecords>(records: T, record: unknown): T {
   seedInto(records, ALLOCATION_RECORD_KEY, record);
   return records;
+}
+
+/** Seeds the canonical envelope; fixtures for the live path use this, not the flat key. */
+export function seedCanonicalAllocationRecord<T extends SeedRecords>(
+  records: T,
+  record: unknown
+): T {
+  seedInto(records, CANONICAL_ALLOCATION_KEY, record);
+  return records;
+}
+
+export function readCanonicalAllocationRecordFrom(records: SeedRecords): unknown {
+  return readSeeded(records, CANONICAL_ALLOCATION_KEY);
 }
 
 export function seedSessionValue<T extends SeedRecords>(records: T, value: unknown): T {

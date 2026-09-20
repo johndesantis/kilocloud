@@ -83,21 +83,27 @@ function flatStopTombstone(
 }
 
 /**
- * Canonical → flat. `stopped` projects the flat terminal shape (`providerRef`,
- * `createIntent` and `stopTombstone` are all null), exactly as the flat machine's
- * `confirmStopped` produced it.
+ * Canonical → flat. For `stopped`, `createIntent` and `stopTombstone` are null
+ * (there is no live intent or tombstone). `providerRef` is carried from the
+ * terminal `summary` when one was retained, so a record that stopped after being
+ * allocated is distinguishable from a blank, never-allocated record — the
+ * distinction `isUnallocatedControlRuntime` depends on.
  *
- * The legacy converter folds flat `failed` into canonical `unknown` with
- * `reason: 'legacy_failed'` (`persist/legacy/allocation.ts`). That marker is the
- * only way to tell the two apart; this is a representation map, not a second
- * transition decision.
+ * The canonical `unknown` kind folds the legacy flat `failed` and `unknown`
+ * states. They are told apart by the legacy markers the converter writes
+ * (`legacy_failed`/`legacy_unknown`) and, for live records, by whether a stop
+ * tombstone is already attached: a failure with no cleanup episode is `failed`
+ * (a replacement is a legal next step), while one under observation/cleanup is
+ * `unknown`. `stopping.check_required` (stop retries exhausted, awaiting an
+ * explicit check) projects to `stopping`, matching the live `stopping` state.
+ * This is a representation map, not a second transition decision.
  */
 export function projectAllocationToFlat(record: AllocationRecord): FlatAllocationRecord {
   const { state } = record;
   if (state.kind === 'stopped') {
     return {
       state: 'stopped',
-      providerRef: null,
+      providerRef: state.summary?.providerRef ?? null,
       createIntent: null,
       stopTombstone: null,
       resumable: record.resumable,
@@ -114,7 +120,9 @@ export function projectAllocationToFlat(record: AllocationRecord): FlatAllocatio
             ? 'stopping'
             : state.reason === 'legacy_failed'
               ? 'failed'
-              : 'unknown',
+              : state.reason === 'legacy_unknown' || state.stopIntent !== null
+                ? 'unknown'
+                : 'failed',
     providerRef: target?.providerRef ?? null,
     createIntent: flatCreateIntent(state, target),
     stopTombstone: flatStopTombstone(state),

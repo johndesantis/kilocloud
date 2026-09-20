@@ -191,7 +191,6 @@ export function helloResult(capabilities?: {
   connectionRecovery?: boolean;
   eventReceipts?: boolean;
   eventBatches?: boolean;
-  scopedCleanupResult?: boolean;
 }): SandboxHelloResult {
   return {
     protocolVersion: SANDBOX_CONTROL_PROTOCOL_VERSION,
@@ -199,12 +198,9 @@ export function helloResult(capabilities?: {
     capabilities: {
       kiloVersionHeartbeat: true,
       sessionOperationResults: true,
-      scopedStopAbort: true,
-      nativeRuntimeRetirement: true,
       ...(capabilities?.connectionRecovery ? { connectionRecovery: true } : {}),
       ...(capabilities?.eventReceipts ? { eventReceipts: true } : {}),
       ...(capabilities?.eventBatches ? { eventBatches: true } : {}),
-      ...(capabilities?.scopedCleanupResult ? { scopedCleanupResult: true } : {}),
     },
   };
 }

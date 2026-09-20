@@ -12,7 +12,10 @@ import type { SandboxSession } from '../../src/sandbox-session/SandboxSession';
 import type { ResponseFrame, SessionSyncResult } from '../../src/shared/sandbox-control-protocol';
 import { events } from '../../src/db/sqlite-schema';
 
-import { readSessionValueSync, writeSessionMessages } from '../../src/sandbox-state/persist/access.js';
+import {
+  readSessionValueSync,
+  writeSessionMessages,
+} from '../../src/sandbox-state/persist/access.js';
 const root = 'ses_00000000000000000000000001';
 const question = {
   id: 'question_repaired',

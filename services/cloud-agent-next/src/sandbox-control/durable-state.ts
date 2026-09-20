@@ -26,6 +26,9 @@ import {
   readAllocationRecord,
   writeAllocationRecord,
 } from '../sandbox-state/persist/access.js';
+import { loadAllocation as loadCanonicalAllocation } from '../sandbox-state/persist/load.js';
+import { storeAllocation as storeCanonicalAllocation } from '../sandbox-state/persist/store.js';
+import type { AllocationRecord } from '../sandbox-state/model/allocation.js';
 
 const ROUTES_KEY = 'session_routes';
 export const SESSION_REFERENCES_KEY = 'session_references';
@@ -188,6 +191,29 @@ export async function savePhysicalRecord(
   record: PhysicalRecord
 ): Promise<void> {
   await writeAllocationRecord(storage, record);
+}
+
+/**
+ * Canonical allocation aggregate under `sandbox_allocation_state`. The live path
+ * reads and writes only this; the flat record accessors above remain
+ * for the dead modules whose last consumer is removed in a later chunk. A
+ * fail-closed load is surfaced as a thrown error, never a silent fallback to the
+ * flat record.
+ */
+export async function loadAllocation(
+  storage: ControlStorage,
+  resumable = false
+): Promise<AllocationRecord> {
+  const result = await loadCanonicalAllocation(storage, resumable);
+  if (!result.ok) throw new Error(`Invalid canonical allocation: ${result.reason}`);
+  return result.value;
+}
+
+export async function storeAllocation(
+  storage: ControlStorage,
+  record: AllocationRecord
+): Promise<void> {
+  await storeCanonicalAllocation(storage, record);
 }
 
 export async function loadRouteTable(storage: ControlStorage): Promise<Map<string, SessionRoute>> {

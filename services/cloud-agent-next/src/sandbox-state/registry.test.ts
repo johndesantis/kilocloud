@@ -141,7 +141,7 @@ function allocationState(key: string): AllocationRecord {
           stopIntent: null,
           attempts: 0,
           reason: 'test',
-          deadlineAt: NOW + POLICY.observeDeadlineMs,
+          deadlineAt: NOW,
         },
       };
     default:
@@ -210,6 +210,17 @@ function allocationEvent(state: AllocationRecord, event: string): AllocationInpu
         type: 'CREATE_UNKNOWN',
         fence: { operationId: createOp, providerRef: 'provider-ref-1', incarnation: null },
         reason: 'lost',
+        at: NOW,
+      };
+    case 'LAUNCH_FAILED':
+      return {
+        type: 'LAUNCH_FAILED',
+        fence: {
+          operationId: operationId('launch', INTENT.intentId),
+          providerRef: 'provider-ref-1',
+          incarnation: INC,
+        },
+        reason: 'wrapper_startup_failed',
         at: NOW,
       };
     case 'HEALTH_UNHEALTHY':

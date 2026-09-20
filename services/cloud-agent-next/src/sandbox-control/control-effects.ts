@@ -13,6 +13,7 @@ import type {
   Command,
   CreateCommand,
   DestroyCommand,
+  LaunchCommand,
   ObserveCommand,
   NotifySessionCommand,
   ReconcileCommand,
@@ -40,6 +41,8 @@ export type StopEffectResult =
   | { outcome: 'terminal'; incarnation: string; wrapper?: string }
   | { outcome: 'retryable'; detail?: string };
 
+export type LaunchEffectResult = { outcome: 'confirmed' } | { outcome: 'failed'; reason: string };
+
 export type ObserveEffectResult = {
   outcome: 'absent' | 'present';
   providerRef: string | null;
@@ -55,6 +58,7 @@ export type NotifyEffectResult = { outcome: 'delivered' } | { outcome: 'failed';
 
 export type ControlEffectPort = {
   create(command: CreateCommand): Promise<CreateEffectResult>;
+  launch(command: LaunchCommand): Promise<LaunchEffectResult>;
   stop(command: StopCommand): Promise<StopEffectResult>;
   destroy(command: DestroyCommand): Promise<StopEffectResult>;
   observe(command: ObserveCommand): Promise<ObserveEffectResult>;
@@ -147,6 +151,26 @@ export async function executeCommand(
         return {
           type: 'CREATE_UNKNOWN',
           fence: fence(command.operationId, command.target.providerRef, null),
+          reason: errorMessage(error),
+          at: now,
+        };
+      }
+    }
+
+    case 'Launch': {
+      try {
+        const result = await port.launch(command);
+        if (result.outcome === 'confirmed') return undefined;
+        return {
+          type: 'LAUNCH_FAILED',
+          fence: fence(command.operationId, command.target.providerRef, command.incarnation),
+          reason: result.reason,
+          at: now,
+        };
+      } catch (error) {
+        return {
+          type: 'LAUNCH_FAILED',
+          fence: fence(command.operationId, command.target.providerRef, command.incarnation),
           reason: errorMessage(error),
           at: now,
         };
@@ -264,11 +288,18 @@ export async function executeCommand(
  * are returned in that order. Notification calls produce no events and are
  * awaited only after the effects finish, so a notification failure can never
  * mask an effect result.
+ *
+ * Recovery deferral: this runner is the single owner of the deferral decision.
+ * While `shouldDeferRecovery()` reports a reconnectable/coming-up wrapper, a
+ * `Reconcile` command is not attempted and feeds no event, so the episode and
+ * its absolute deadline stay intact and the next alarm (or the reconnecting
+ * wrapper) re-drives it. Expiry still stops the allocation.
  */
 export async function runCommands(
   port: ControlEffectPort,
   commands: readonly Command[],
-  now: number
+  now: number,
+  shouldDeferRecovery?: () => boolean
 ): Promise<AllocationInputEvent[]> {
   const notifications = commands
     .filter(command => command.kind === 'NotifySession')
@@ -276,6 +307,7 @@ export async function runCommands(
   const events: AllocationInputEvent[] = [];
   for (const command of commands) {
     if (command.kind === 'NotifySession') continue;
+    if (command.kind === 'Reconcile' && shouldDeferRecovery?.() === true) continue;
     const event = await executeCommand(port, command, now);
     if (event !== undefined) events.push(event);
   }

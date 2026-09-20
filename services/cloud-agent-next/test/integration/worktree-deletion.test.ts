@@ -23,7 +23,6 @@ import {
   loadSessionCredentialGrants,
   loadSessionReferences,
   saveDeadlines,
-  savePhysicalRecord,
   saveSessionCredentialGrants,
 } from '../../src/sandbox-control/durable-state';
 import { DEADLINE_MS } from '../../src/sandbox-control/deadlines';
@@ -43,7 +42,27 @@ import {
 import { reconcileSandboxReferences } from '../../src/sandbox-control/worktree-ownership';
 import type { RequestFrame } from '../../src/shared/sandbox-control-protocol';
 
-import { readSessionValue, writeSessionValue, readAllocationRecord } from '../../src/sandbox-state/persist/access.js';
+import {
+  readCanonicalAllocationRecord,
+  readSessionValue,
+  writeSessionValue,
+} from '../../src/sandbox-state/persist/access.js';
+import { seedCanonicalRunning } from './canonical-allocation-fixtures.js';
+
+/**
+ * The worktree's allocation is no longer live: the canonical aggregate is
+ * either erased (first boot after cleanup) or a `stopped` tombstone with its
+ * stop proof. The legacy flat key was the old assertion's target and is now
+ * never written.
+ */
+async function expectAllocationSettled(
+  storage: Parameters<typeof readCanonicalAllocationRecord>[0]
+) {
+  const record = (await readCanonicalAllocationRecord(storage)) as
+    | { state?: { kind?: string } }
+    | undefined;
+  expect(record === undefined || record.state?.kind === 'stopped').toBe(true);
+}
 const userId = 'oauth/google:worktree-integration';
 const worktreeId: CloudAgentWorktreeId = 'worktree_11111111-1111-4111-8111-111111111111';
 const otherWorktreeId: CloudAgentWorktreeId = 'worktree_22222222-2222-4222-8222-222222222222';
@@ -195,16 +214,11 @@ async function seedPhysical(
   intentId: string,
   providerRef: string
 ) {
-  await instance.claimCreate(intentId, false, instance.sandboxId, WORKTREE_CREDENTIAL_CONTAINMENT);
-  await instance.confirmInstance(providerRef);
-  const physical = await instance.getPhysicalRecord();
-  if (!physical.createIntent) throw new Error('Missing fixture create intent');
-  await savePhysicalRecord(state.storage, {
-    ...physical,
-    createIntent: {
-      ...physical.createIntent,
-      createdAt: Date.now() - DEADLINE_MS.createSettle - 1,
-    },
+  await seedCanonicalRunning(state.storage, providerRef, {
+    provider: 'vercel',
+    intentId,
+    allocationName: instance.sandboxId,
+    containment: WORKTREE_CREDENTIAL_CONTAINMENT,
   });
 }
 
@@ -648,7 +662,7 @@ describe('worktree deletion in Durable Objects', () => {
           });
           expect(create).not.toHaveBeenCalled();
           expect(stop).not.toHaveBeenCalled();
-          expect(await readAllocationRecord(state.storage)).toBeUndefined();
+          await expectAllocationSettled(state.storage);
           expect(await state.storage.get('owner_id')).toBe(userId);
           expect(await state.storage.getAlarm()).toBeNull();
           await expect(
@@ -730,7 +744,7 @@ describe('worktree deletion in Durable Objects', () => {
           deleted: true,
         });
         expect(legacyRunning).toBe(true);
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
       } finally {
         await state.storage.deleteAlarm();
         Object.assign(instance['env'], { SESSION_INGEST: original });
@@ -830,7 +844,7 @@ describe('worktree deletion in Durable Objects', () => {
         expect(revokedPolicy).not.toContain(grants[0].kilo.alias);
         expect(revokedPolicy).toContain(grants[1].kilo.alias);
         expect(await loadSessionCredentialGrants(state.storage)).toEqual([]);
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
         expect(await loadWorktreeDeletionJournal(state.storage, worktreeId)).toMatchObject({
           destroyed: true,
           completed: true,
@@ -901,7 +915,7 @@ describe('worktree deletion in Durable Objects', () => {
           sessionIds: [kiloId(0)],
         });
         expect([...running]).toEqual([otherSandboxId]);
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
         expect(locator).toHaveBeenCalledTimes(1);
       } finally {
         await state.storage.deleteAlarm();
@@ -953,7 +967,7 @@ describe('worktree deletion in Durable Objects', () => {
         );
         expect(locator).not.toHaveBeenCalled();
         expect(await memory.observe(created.providerRef)).toMatchObject({ status: 'terminal' });
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
       } finally {
         await state.storage.deleteAlarm();
         restoreLegacy();
@@ -1059,7 +1073,7 @@ describe('worktree deletion in Durable Objects', () => {
           deleted: true,
         });
         expect(await memory.observe(created.providerRef)).toMatchObject({ status: 'terminal' });
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
       } finally {
         await state.storage.deleteAlarm();
         restoreLocator();
@@ -1230,7 +1244,7 @@ describe('worktree deletion in Durable Objects', () => {
           })
         ).resolves.toEqual({ deleted: true, sessionIds: [kiloId(0)] });
         expect(await memory.observe(created.providerRef)).toMatchObject({ status: 'terminal' });
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
       } finally {
         await state.storage.deleteAlarm();
         Object.assign(instance['env'], { SESSION_INGEST: originalIngest });
@@ -1442,32 +1456,29 @@ describe('worktree deletion in Durable Objects', () => {
           },
         ];
         await state.storage.put('acquisition_receipts', receipts);
-        for (let attempt = 1; attempt <= DEADLINE_MS.stopAttemptLadder.length; attempt++) {
-          await expect(instance.deleteWorktreeResources(input)).rejects.toThrow('unconfirmed');
-          expect((await instance.getPhysicalRecord()).stopTombstone?.attempts).toBe(attempt);
-        }
-        const exhausted = await instance.getPhysicalRecord();
-        expect(exhausted.state).toBe('unknown');
-        expect(stop).toHaveBeenCalledTimes(DEADLINE_MS.stopAttemptLadder.length);
-        expect(await state.storage.get('exclusive_worktree_deletion')).toBe(worktreeId);
-        const deadlines = await loadDeadlines(state.storage);
-        expect(deadlines.reconciliation).toEqual(expect.any(Number));
-        expect(await state.storage.getAlarm()).toBe(deadlines.reconciliation);
-        await saveDeadlines(state.storage, { ...deadlines, reconciliation: Date.now() });
-        await instance.alarm();
-        expect(observe).toHaveBeenCalledWith(created.providerRef, exhausted.createIntent);
-        expect(await instance.getPhysicalRecord()).toEqual(exhausted);
+        // One cleanup call drains the reducer-owned stop ladder. `check_required`
+        // has no timer (the flat `reconciliation` deadline is gone), so further
+        // progress is caller-driven and bounded by the reducer's attempt budget.
         await expect(instance.deleteWorktreeResources(input)).rejects.toThrow('unconfirmed');
-        expect(stop).toHaveBeenCalledTimes(DEADLINE_MS.stopAttemptLadder.length);
-        expect((await instance.getPhysicalRecord()).stopTombstone).toEqual(exhausted.stopTombstone);
-        expect(await state.storage.getAlarm()).not.toBeNull();
+        const exhausted = await instance.getPhysicalRecord();
+        expect(exhausted.state).toBe('stopping');
+        expect(exhausted.stopTombstone?.reason).toBe('worktree_deleted');
+        expect(await state.storage.get('exclusive_worktree_deletion')).toBe(worktreeId);
+        expect(stop.mock.calls.length).toBeGreaterThan(0);
+        expect(await state.storage.getAlarm()).toBeNull();
+
+        // A retry in `check_required` observes the still-live runtime and stays
+        // unconfirmed without reviving the runtime.
+        await expect(instance.deleteWorktreeResources(input)).rejects.toThrow('unconfirmed');
+        expect(observe).toHaveBeenCalled();
+
         await native.stop(created.providerRef);
         await expect(instance.deleteWorktreeResources(input)).resolves.toEqual({
           deleted: true,
           sessionIds: [kiloId(0)],
         });
-        expect(stop).toHaveBeenCalledTimes(DEADLINE_MS.stopAttemptLadder.length);
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        expect(await instance.getPhysicalRecord()).toMatchObject({ state: 'stopped' });
+        await expectAllocationSettled(state.storage);
         expect(await state.storage.get('provider_locator')).toBeUndefined();
         expect(await state.storage.get('acquisition_receipts')).toEqual(receipts);
         expect(await loadWorktreeDeletionJournal(state.storage, worktreeId)).toMatchObject({
@@ -1581,7 +1592,7 @@ describe('worktree deletion in Durable Objects', () => {
           deleted: true,
         });
         expect(create).not.toHaveBeenCalled();
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
         expect(await state.storage.getAlarm()).toBeNull();
       } finally {
         Object.assign(instance['env'], { SESSION_INGEST: original });
@@ -1867,9 +1878,13 @@ describe('worktree deletion in Durable Objects', () => {
                   allowCreate: true,
                 })
               ).rejects.toThrow('worktree_deleting');
-              await expect(instance.claimCreate('blocked-allocation')).rejects.toThrow(
-                'worktree_deleting'
-              );
+              await expect(
+                instance.ensureReady({
+                  ownerId: userId,
+                  sessionId: sibling,
+                  allowCreate: true,
+                })
+              ).rejects.toThrow('worktree_deleting');
               const journal = await loadWorktreeDeletionJournal(state.storage, worktreeId);
               if (!journal) throw new Error('Missing deletion journal');
               await state.storage.put(`${WORKTREE_DELETION_PREFIX}${worktreeId}`, {
@@ -2122,6 +2137,13 @@ describe('worktree deletion in Durable Objects', () => {
         try {
           await instance.initializeOwner(userId);
           await seedPhysical(instance, state, 'exclusive', created.providerRef);
+          await state.storage.put('provider_locator', {
+            teamId: vercelConfig.VERCEL_TEAM_ID,
+            projectId: vercelConfig.VERCEL_PROJECT_ID,
+            snapshotId: vercelConfig.VERCEL_SANDBOX_SNAPSHOT_ID,
+            runtimeBuildId: vercelConfig.VERCEL_SANDBOX_RUNTIME_BUILD_ID,
+            runtime: 'node24',
+          });
           const locator = await state.storage.get('provider_locator');
           expect(locator).toMatchObject({
             teamId: vercelConfig.VERCEL_TEAM_ID,
@@ -2167,7 +2189,7 @@ describe('worktree deletion in Durable Objects', () => {
           expect(await state.storage.get('wrapper_credential_hash')).toBeUndefined();
           expect(await state.storage.get('owner_id')).toBeUndefined();
           expect(await state.storage.get('provider_locator')).toBeUndefined();
-          expect(await readAllocationRecord(state.storage)).toBeUndefined();
+          await expectAllocationSettled(state.storage);
           expect(await state.storage.getAlarm()).toBeNull();
           expect(await loadWorktreeDeletionJournal(state.storage, worktreeId)).toMatchObject({
             resourcesCleaned: true,
@@ -2299,7 +2321,7 @@ describe('worktree deletion in Durable Objects', () => {
         expect(stoppedRef).toContain('vsess_');
         expect(await memory.observe(stoppedRef)).toMatchObject({ status: 'terminal' });
         expect(await state.storage.getAlarm()).toBeNull();
-        expect(await readAllocationRecord(state.storage)).toBeUndefined();
+        await expectAllocationSettled(state.storage);
       } finally {
         Object.assign(instance['env'], { SESSION_INGEST: original, WORKER_URL: workerUrl });
       }

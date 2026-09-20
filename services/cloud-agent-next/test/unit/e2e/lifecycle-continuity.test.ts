@@ -8,10 +8,7 @@ import {
   matchesReconciliationIdentity,
   type ConnectionIdentity,
 } from '../../e2e/lifecycle-continuity.js';
-import {
-  RECOVERY_CLEANUP_REASON,
-  RECOVERY_SETTLED_REAP_REASON,
-} from '../../../src/sandbox-control/recovery-cleanup.js';
+import { healthUnhealthyReason } from '../../../src/sandbox-state/allocation/reduce.js';
 import type { LogRecord } from '../../e2e/idle-stop-evidence.js';
 
 const TARGET: ConnectionIdentity = {
@@ -186,8 +183,8 @@ describe('isSettledReapStopRecord', () => {
       sandboxId,
       fromState: 'running',
       toState: 'stopping',
-      cause: RECOVERY_SETTLED_REAP_REASON,
-      stopCause: RECOVERY_SETTLED_REAP_REASON,
+      cause: healthUnhealthyReason('unresponsive'),
+      stopCause: healthUnhealthyReason('unresponsive'),
       ...overrides,
     });
 
@@ -196,7 +193,7 @@ describe('isSettledReapStopRecord', () => {
     expect(isSettledReapStopRecord(settledStop({ stopCause: undefined }), sandboxId)).toBe(false);
     expect(isSettledReapStopRecord(settledStop({ cause: undefined }), sandboxId)).toBe(false);
     expect(
-      isSettledReapStopRecord(settledStop({ cause: RECOVERY_CLEANUP_REASON }), sandboxId)
+      isSettledReapStopRecord(settledStop({ cause: healthUnhealthyReason('absent') }), sandboxId)
     ).toBe(false);
   });
 
@@ -208,7 +205,7 @@ describe('isSettledReapStopRecord', () => {
         control({
           diagnosticEvent: 'stop_attempt',
           sandboxId,
-          stopCause: RECOVERY_SETTLED_REAP_REASON,
+          stopCause: healthUnhealthyReason('unresponsive'),
         }),
         sandboxId
       )

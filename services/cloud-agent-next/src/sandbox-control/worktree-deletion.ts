@@ -6,8 +6,9 @@ import {
   sessionIdSchema,
 } from '@kilocode/session-ingest-contracts';
 import type { ProviderAdapter } from './provider';
-import { loadPhysicalRecord, loadRouteTable } from './durable-state';
-import { sameAllocation, type PhysicalRecord } from './physical-lifecycle';
+import { loadRouteTable } from './durable-state';
+import { loadAllocation as loadAllocationResult } from '../sandbox-state/persist/load.js';
+import { projectAllocationToFlat, type FlatAllocationRecord } from './allocation-view.js';
 import { DEADLINE_MS } from './deadlines';
 import { logControlDiagnostic } from './diagnostics';
 import type { SandboxControlOutboundRequest } from './socket';
@@ -44,7 +45,7 @@ export async function isUnallocatedControlRuntime(
   storage: DurableObjectStorage,
   hasConnection: () => boolean
 ): Promise<boolean> {
-  const physical = await loadPhysicalRecord(storage);
+  const physical = await loadFlat(storage);
   return (
     physical.state === 'stopped' &&
     physical.providerRef === null &&
@@ -53,6 +54,24 @@ export async function isUnallocatedControlRuntime(
     (await loadRouteTable(storage)).size === 0 &&
     !hasConnection()
   );
+}
+
+/**
+ * Canonical allocation read projected to the flat shape the provider adapters
+ * consume. The live path never reads or writes the flat key.
+ */
+async function loadFlat(storage: DurableObjectStorage): Promise<FlatAllocationRecord> {
+  const loaded = await loadAllocationResult(storage);
+  if (!loaded.ok) throw new Error(`Sandbox allocation is unavailable (${loaded.reason})`);
+  return projectAllocationToFlat(loaded.value);
+}
+
+/** Same canonical allocation: the create intent id, else the provider reference. */
+function sameFlatAllocation(left: FlatAllocationRecord, right: FlatAllocationRecord): boolean {
+  const identity = (record: FlatAllocationRecord) =>
+    record.createIntent?.intentId ?? record.providerRef ?? null;
+  const leftId = identity(left);
+  return leftId !== null && leftId === identity(right);
 }
 
 export async function loadWorktreeDeletionJournal(
@@ -82,7 +101,7 @@ export async function cleanWorktreeRuntime(input: {
   directory: string;
   storage: DurableObjectStorage;
   getProvider: () => Promise<ProviderAdapter>;
-  stopRuntime: () => Promise<PhysicalRecord>;
+  stopRuntime: () => Promise<FlatAllocationRecord>;
   hasConnection: () => boolean;
   sendRequest: (request: SandboxControlOutboundRequest) => Promise<ResponseFrame>;
   exclusive: boolean;
@@ -130,7 +149,7 @@ export async function cleanWorktreeRuntime(input: {
       result = 'resources_cleaned';
       return journal;
     }
-    const physical = await loadPhysicalRecord(input.storage);
+    const physical = await loadFlat(input.storage);
     if (physical.state === 'stopped') {
       cleanupMode = 'already_stopped';
       journal.resourcesCleaned = true;
@@ -193,8 +212,8 @@ export async function cleanWorktreeRuntime(input: {
       }
     }
     stage = 'allocation_fence';
-    const current = await loadPhysicalRecord(input.storage);
-    if (!input.exclusive && current.state !== 'stopped' && !sameAllocation(physical, current)) {
+    const current = await loadFlat(input.storage);
+    if (!input.exclusive && current.state !== 'stopped' && !sameFlatAllocation(physical, current)) {
       throw new Error('Worktree provider allocation changed during cleanup');
     }
     journal.resourcesCleaned = true;

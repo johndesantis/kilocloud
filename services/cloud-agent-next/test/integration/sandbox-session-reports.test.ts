@@ -23,7 +23,10 @@ import {
   readReportAnchor,
 } from '../../src/sandbox-session/report-outbox.js';
 
-import { readRawSessionMessages, writeSessionMessages } from '../../src/sandbox-state/persist/access.js';
+import {
+  readRawSessionMessages,
+  writeSessionMessages,
+} from '../../src/sandbox-state/persist/access.js';
 const ownerId = 'report-owner';
 const kiloSessionId = 'ses_12345678901234567890123456';
 const agent = { mode: 'code' as const, model: 'anthropic/claude-sonnet-4' };

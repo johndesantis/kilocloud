@@ -65,6 +65,7 @@ function helloFrame(
   wrapperInstanceId?: string,
   requestId = 'req_hello',
   capabilities?: {
+    scopedStopAbort?: boolean;
     nativeRuntimeRetirement?: boolean;
     runtimeIsolation?: true;
     runtimeRecovery?: true;
@@ -119,7 +120,7 @@ describe('sandbox control socket handler', () => {
       expect(JSON.stringify(parsed)).not.toContain('private');
     }
   });
-  it('retains runtime isolation and recovery alongside scoped cleanup negotiation', async () => {
+  it('retains runtime isolation and recovery from the wrapper handshake', async () => {
     const incoming = createFakeWebSocket();
     const handler = createSandboxControlSocketHandler(createFakeState([incoming]), 'sbx_test');
 
@@ -128,7 +129,6 @@ describe('sandbox control socket handler', () => {
       helloFrame('inst_1', WRAPPER_INSTANCE_ID, 'req_isolation', {
         runtimeIsolation: true,
         runtimeRecovery: true,
-        scopedCleanupResult: true,
       })
     );
 
@@ -137,10 +137,31 @@ describe('sandbox control socket handler', () => {
       runtimeIsolation: true,
       runtimeRecovery: true,
     });
-    expect(handler.supportsScopedCleanupResult?.()).toBe(true);
-    expect(incoming.send).toHaveBeenCalledWith(
-      expect.stringContaining('"scopedCleanupResult":true')
+  });
+  it('accepts an old-wrapper hello advertising retired capabilities without negotiating them', async () => {
+    const incoming = createFakeWebSocket();
+    const handler = createSandboxControlSocketHandler(createFakeState([incoming]), 'sbx_test');
+
+    await handler.handleMessage(
+      asWs(incoming),
+      helloFrame('inst_legacy', WRAPPER_INSTANCE_ID, 'req_legacy', {
+        scopedStopAbort: true,
+        nativeRuntimeRetirement: true,
+        scopedCleanupResult: true,
+        runtimeIsolation: true,
+      })
     );
+
+    expect(handler.getConnectionIdentity()).toMatchObject({
+      providerInstanceId: 'inst_legacy',
+      runtimeIsolation: true,
+    });
+    const response = JSON.parse(incoming.send.mock.calls[0]?.[0] as string) as {
+      result?: { capabilities?: Record<string, boolean> };
+    };
+    expect(response.result?.capabilities).not.toHaveProperty('scopedStopAbort');
+    expect(response.result?.capabilities).not.toHaveProperty('nativeRuntimeRetirement');
+    expect(response.result?.capabilities).not.toHaveProperty('scopedCleanupResult');
   });
   it.each([
     ['2.4.0', '2.4.0'],
@@ -369,8 +390,6 @@ describe('sandbox control socket handler', () => {
           capabilities: {
             kiloVersionHeartbeat: true,
             sessionOperationResults: true,
-            scopedStopAbort: true,
-            nativeRuntimeRetirement: true,
             eventBatches: true,
           },
         },
@@ -410,20 +429,6 @@ describe('sandbox control socket handler', () => {
     });
   });
 
-  it('reads the native runtime retirement capability from the wrapper handshake', async () => {
-    const incoming = createFakeWebSocket();
-    const handler = createSandboxControlSocketHandler(createFakeState([incoming]), 'sbx_test');
-
-    await handler.handleMessage(
-      asWs(incoming),
-      helloFrame('inst_1', WRAPPER_INSTANCE_ID, 'req_native_retirement', {
-        nativeRuntimeRetirement: true,
-      })
-    );
-
-    expect(handler.supportsNativeRuntimeRetirement()).toBe(true);
-  });
-
   it('reads the working branch capability from the wrapper handshake', async () => {
     const incoming = createFakeWebSocket();
     const handler = createSandboxControlSocketHandler(createFakeState([incoming]), 'sbx_test');
@@ -436,23 +441,6 @@ describe('sandbox control socket handler', () => {
     );
 
     expect(handler.supportsWorkingBranches?.()).toBe(true);
-  });
-
-  it('grants scoped cleanup results only to a reader that offers the capability', async () => {
-    const incoming = createFakeWebSocket();
-    const handler = createSandboxControlSocketHandler(createFakeState([incoming]), 'sbx_test');
-
-    await handler.handleMessage(
-      asWs(incoming),
-      helloFrame('inst_1', WRAPPER_INSTANCE_ID, 'req_scoped_cleanup', {
-        scopedCleanupResult: true,
-      })
-    );
-
-    expect(handler.supportsScopedCleanupResult?.()).toBe(true);
-    expect(incoming.send).toHaveBeenCalledWith(
-      expect.stringContaining('"scopedCleanupResult":true')
-    );
   });
 
   it('rejects duplicate hellos without replacing the current connection', async () => {

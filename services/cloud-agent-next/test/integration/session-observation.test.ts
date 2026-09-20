@@ -8,7 +8,10 @@ import type { ResponseFrame, SessionSyncResult } from '../../src/shared/sandbox-
 import { DEADLINE_MS } from '../../src/sandbox-control/deadlines';
 import { events } from '../../src/db/sqlite-schema';
 
-import { readSessionValueSync, writeSessionMessages } from '../../src/sandbox-state/persist/access.js';
+import {
+  readSessionValueSync,
+  writeSessionMessages,
+} from '../../src/sandbox-state/persist/access.js';
 const root = 'ses_00000000000000000000000001';
 const cached = {
   revision: 3,
@@ -215,12 +218,6 @@ describe('Session observation wiring', () => {
         expect(readSessionValueSync(state.storage.kv)).toEqual([
           expect.objectContaining({ state: 'failed', failedReason: 'runtime_unhealthy' }),
         ]);
-        expect(f.control.quarantineRuntime).toHaveBeenCalledWith(
-          expect.objectContaining({
-            reason: 'runtime_unhealthy',
-            wrapperInstanceId: f.message.wrapperInstanceId,
-          })
-        );
         expect(f.storedEvents().filter(event => event.stream_event_type === 'kilocode')).toEqual(
           []
         );

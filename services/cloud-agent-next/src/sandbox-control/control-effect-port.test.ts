@@ -8,6 +8,7 @@ import {
   operationId,
   type CreateCommand,
   type DestroyCommand,
+  type LaunchCommand,
   type NotifySessionCommand,
   type ObserveCommand,
   type ReconcileCommand,
@@ -53,6 +54,12 @@ const CREATE: CreateCommand = {
   operationId: 'create:intent-1',
   target: TARGET,
   intentId: 'intent-1',
+};
+const LAUNCH: LaunchCommand = {
+  kind: 'Launch',
+  operationId: 'launch:intent-1',
+  target: TARGET,
+  incarnation: INC,
 };
 const STOP: StopCommand = {
   kind: 'Stop',
@@ -141,8 +148,10 @@ function fakeNotify(overrides: Partial<NotifySessionPort> = {}): NotifySessionPo
  * `sandbox-control-client.test.ts:534–638`): a `drain` records the active
  * attempt tuple, every other phase is rejected unless it matches the recorded or
  * committed tuple, and `probeReady` stays false until a `ready` phase for the
- * matching tuple is accepted. The wrapper reads `Date.now()`; the fake takes the
- * clock as a parameter so tests stay deterministic.
+ * matching tuple is accepted. The fence compares the payload's `recovery.*`
+ * (never only the envelope) and rejects a payload whose envelope disagrees with
+ * its own descriptor. The wrapper reads `Date.now()`; the fake takes the clock as
+ * a parameter so tests stay deterministic.
  */
 function wrapperReconcile(clock: () => number = () => NOW): {
   port: ReconcilePort;
@@ -151,30 +160,40 @@ function wrapperReconcile(clock: () => number = () => NOW): {
 } {
   const attempts: string[][] = [];
   const payloads: Array<{ phase: ReconcilePhase; recovery: SandboxRecovery }> = [];
-  let active: { episodeId: string; attempt: number; deadlineAt: number } | undefined;
-  let committed: typeof active;
+  let active: SandboxRecovery | undefined;
+  let committed: SandboxRecovery | undefined;
   let readyAccepted = false;
   return {
     attempts,
     payloads,
     port: {
       async sendPhase({ episodeId, attempt, deadlineAt, phase, recovery }) {
+        // The port must send one descriptor: the payload's `recovery.*` is the
+        // fence, and the envelope tuple must be that same descriptor, never a
+        // second derivation.
+        if (
+          recovery.episodeId !== episodeId ||
+          recovery.attempt !== attempt ||
+          recovery.deadlineAt !== deadlineAt
+        ) {
+          throw new Error('Recovery authority changed');
+        }
         const matchesCommitted =
           phase === 'commit' &&
-          committed?.episodeId === episodeId &&
-          committed.attempt === attempt &&
-          committed.deadlineAt === deadlineAt;
+          committed?.episodeId === recovery.episodeId &&
+          committed.attempt === recovery.attempt &&
+          committed.deadlineAt === recovery.deadlineAt;
         const matchesActive =
-          active?.episodeId === episodeId &&
-          active.attempt === attempt &&
-          active.deadlineAt === deadlineAt;
+          active?.episodeId === recovery.episodeId &&
+          active.attempt === recovery.attempt &&
+          active.deadlineAt === recovery.deadlineAt;
         if (!matchesCommitted && (clock() >= deadlineAt || (phase !== 'drain' && !matchesActive))) {
           throw new Error('Recovery authority changed');
         }
         payloads.push({ phase, recovery });
         if (matchesCommitted) return;
         if (phase === 'drain') {
-          active = { episodeId, attempt, deadlineAt };
+          active = recovery;
           committed = undefined;
           readyAccepted = false;
           attempts.push(['drain']);
@@ -183,7 +202,7 @@ function wrapperReconcile(clock: () => number = () => NOW): {
         attempts.at(-1)?.push(phase);
         if (phase === 'ready') readyAccepted = true;
         if (phase === 'commit') {
-          committed = { episodeId, attempt, deadlineAt };
+          committed = recovery;
           active = undefined;
         }
       },
@@ -252,10 +271,10 @@ function seededController() {
 }
 
 describe('control effect port — create', () => {
-  it('creates and launches, returning the confirmed evidence', async () => {
+  it('creates and returns the confirmed evidence without launching', async () => {
     const provider = fakeProvider();
     const effect = await port({ provider }).create(CREATE);
-    expect(provider.calls).toEqual(['create', 'launch']);
+    expect(provider.calls).toEqual(['create']);
     expect(effect).toEqual({ outcome: 'confirmed', providerRef: 'ref-1', incarnation: INC });
   });
 
@@ -284,7 +303,7 @@ describe('control effect port — create', () => {
     expect(effect).toEqual({ outcome: 'unknown', reason: 'create_unresolved' });
   });
 
-  it('maps a thrown create or launch to unknown', async () => {
+  it('maps a thrown create to unknown', async () => {
     const thrownCreate = await port({
       provider: {
         create: async () => {
@@ -293,15 +312,36 @@ describe('control effect port — create', () => {
       },
     }).create(CREATE);
     expect(thrownCreate).toEqual({ outcome: 'unknown', reason: 'network' });
+  });
+});
 
-    const thrownLaunch = await port({
+describe('control effect port — launch', () => {
+  it('launches the confirmed provider reference', async () => {
+    const provider = fakeProvider();
+    const effect = await port({ provider }).launch(LAUNCH);
+    expect(provider.calls).toEqual(['launch']);
+    expect(effect).toEqual({ outcome: 'confirmed' });
+  });
+
+  it('maps a thrown launch to a failed result', async () => {
+    const effect = await port({
       provider: {
         launch: async () => {
           throw new Error('launch failed');
         },
       },
-    }).create(CREATE);
-    expect(thrownLaunch).toEqual({ outcome: 'unknown', reason: 'launch failed' });
+    }).launch(LAUNCH);
+    expect(effect).toEqual({ outcome: 'failed', reason: 'launch failed' });
+  });
+
+  it('fails without invoking the provider when the target has no reference', async () => {
+    const provider = fakeProvider();
+    const effect = await port({ provider }).launch({
+      ...LAUNCH,
+      target: { ...TARGET, providerRef: null },
+    });
+    expect(effect).toEqual({ outcome: 'failed', reason: 'launch_without_provider_ref' });
+    expect(provider.calls).toEqual([]);
   });
 });
 
