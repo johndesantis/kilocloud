@@ -118,7 +118,7 @@ import {
 import {
   ATTACH_FAILURE_LIMIT,
   createSessionMessageRecord,
-  type SessionMessageRecord,
+  type SessionMessage,
 } from '../../src/sandbox-session/session-message-queue.js';
 import {
   CALLBACK_OUTBOX_PREFIX,
@@ -159,8 +159,6 @@ import {
 import { waitFor } from './wait-for.js';
 
 import {
-  readRawSessionMessages,
-  readSessionValueSync,
   readSessionValue,
   writeSessionMessages,
   writeSessionValue,
@@ -169,6 +167,12 @@ import {
   readCanonicalAllocationRecord,
   writeCanonicalAllocationRecord,
 } from '../../src/sandbox-state/persist/access.js';
+import { readRawSessionMessages } from '../../src/sandbox-state/persist/load.js';
+import {
+  acceptedState,
+  queuedState,
+  terminalState,
+} from '../../src/sandbox-session/session-state.test-helpers.js';
 import {
   canonicalAllocation,
   runningAllocationFixture,
@@ -193,6 +197,14 @@ vi.mock('@kilocode/db/client', () => ({
 vi.mock('../../src/session-access.js', () => ({
   requireCurrentSessionAccess: vi.fn(),
 }));
+
+/** Seed/rewrite canonical session messages. `unresolved` is valid with any state. */
+function seedMessages(
+  storage: Parameters<typeof writeSessionMessages>[0],
+  messages: SessionMessage[]
+): void {
+  writeSessionMessages(storage, { kind: 'unresolved' }, messages);
+}
 
 vi.mock('../../src/db/pg.js', () => ({
   getPgDb: () => {
@@ -7058,13 +7070,14 @@ describe('SandboxControl passive status', () => {
     await completeStatusHello(ws, 'hello-status-busy');
     const runtime = await stub.getStatus();
     await runInDurableObject(session, (_instance, state) => {
-      writeSessionMessages(state.storage.kv, [
+      seedMessages(state.storage.kv, [
         {
-          messageId: 'msg_status_busy',
-          state: 'accepted',
-          acceptedAt: Date.now(),
-          wrapperInstanceId: runtime.wrapperInstanceId,
-        } satisfies SessionMessageRecord,
+      messageId: 'msg_status_busy',
+      state: acceptedState({
+        acceptedAt: Date.now(),
+        wrapperInstanceId: runtime.wrapperInstanceId,
+      }),
+    } satisfies SessionMessage,
       ]);
     });
     const routing = Promise.withResolvers<void>();
@@ -7745,13 +7758,12 @@ describe('SandboxSession operation authorization admission', () => {
         },
       });
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+        const messages = readRawSessionMessages(state.storage.kv);
         expect(messages).toMatchObject([
           {
             messageId,
-            state: 'queued',
-            unresolvedDispatch: true,
-            operations: {
+            state: { kind: 'queued', unresolvedDispatch: true },
+            proofs: {
               attach: {
                 dispatched: true,
                 authorization: {
@@ -7831,13 +7843,12 @@ describe('SandboxSession operation authorization admission', () => {
         },
       });
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
+        const messages = readRawSessionMessages(state.storage.kv);
         expect(messages).toMatchObject([
           {
             messageId,
-            state: 'completed',
-            terminalSource: 'operation_result',
-            operations: { prompt: { resultHash: firstAck.resultHash } },
+            state: { kind: 'completed', source: 'operation_result' },
+            proofs: { prompt: { resultHash: firstAck.resultHash } },
           },
         ]);
       });
@@ -7883,15 +7894,77 @@ describe('SandboxSession operation authorization admission', () => {
         result: { disposition: 'applied' },
       });
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
+        const messages = readRawSessionMessages(state.storage.kv);
         expect(messages).toMatchObject([
-          { messageId, state: 'completed', terminalSource: 'operation_result', gateResult: 'fail' },
+          {
+            messageId,
+            state: { kind: 'completed', source: 'operation_result', gateResult: 'fail' },
+          },
         ]);
         const outbox = state.storage.kv.get<PendingCallbackJob>(
           `${CALLBACK_OUTBOX_PREFIX}${messageId}`
         );
         expect(outbox).toBeDefined();
         expect(outbox?.job.payload.gateResult).toBe('fail');
+      });
+    } finally {
+      fixture.close();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('persists bounded assistant facts from a failed operation result to the message', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => Response.json({ valid: true }));
+    const fixture = await worktreeFixture({
+      sessionOperationResults: true,
+      callbackTarget: { url: 'https://example.com/assistant-facts' },
+    });
+    const messageId = 'msg_operation_result_failed_facts';
+    try {
+      await expect(
+        fixture.session.admitSubmittedMessage({
+          userId: fixture.userId,
+          turn: { type: 'prompt', id: messageId, prompt: 'record bounded assistant facts' },
+        })
+      ).resolves.toMatchObject({ success: true, messageId });
+      await fixture.promptSeen;
+      const prompt = fixture.prompts[0];
+      if (!prompt) throw new Error('Missing prompt operation request');
+      const authorization = sessionOperationAuthorizationSchema.parse(prompt.authorization);
+      const delivery: SessionOperationDelivery = {
+        version: 2,
+        authorization,
+        completedAt: Date.now(),
+        result: { ok: true, result: { messageId, status: 'accepted' } },
+        outcome: {
+          messageId,
+          status: 'failed',
+          assistantReason: 'rate_limited',
+          providerOwnership: 'unknown',
+        },
+        events: [],
+        preparing: [],
+      };
+
+      await expect(fixture.sendOperationResult(delivery)).resolves.toMatchObject({
+        ok: true,
+        result: { disposition: 'applied' },
+      });
+      await runInDurableObject(fixture.session, async (_instance, state) => {
+        const messages = readRawSessionMessages(state.storage.kv);
+        expect(messages).toMatchObject([
+          {
+            messageId,
+            state: {
+              kind: 'failed',
+              source: 'operation_result',
+              assistantReason: 'rate_limited',
+              providerOwnership: 'unknown',
+            },
+          },
+        ]);
       });
     } finally {
       fixture.close();
@@ -7934,10 +8007,10 @@ describe('SandboxSession operation authorization admission', () => {
         result: { disposition: 'applied' },
       });
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        const messages = state.storage.kv.get<SessionMessageRecord[]>('session_messages') ?? [];
+        const messages = readRawSessionMessages(state.storage.kv);
         const message = messages.find(item => item.messageId === messageId);
-        expect(message).toMatchObject({ state: 'completed', terminalSource: 'operation_result' });
-        expect(message).not.toHaveProperty('gateResult');
+        expect(message).toMatchObject({ state: { kind: 'completed', source: 'operation_result' } });
+        expect(message?.state).not.toHaveProperty('gateResult');
         const outbox = state.storage.kv.get<PendingCallbackJob>(
           `${CALLBACK_OUTBOX_PREFIX}${messageId}`
         );
@@ -8735,10 +8808,11 @@ describe('SandboxSession worktree changes persistence', () => {
       fixture.noWake.attachSession.mockClear();
       fixture.noWake.claimCreate.mockClear();
       const before = await runInDurableObject(fixture.session, async (instance, state) => {
-        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv).map(
-          message => ({ ...message, lastActivityAt: 1 })
-        );
-        writeSessionMessages(state.storage.kv, messages);
+        const messages = readRawSessionMessages(state.storage.kv).map(message => ({
+          ...message,
+          state: { ...message.state, lastActivityAt: 1 },
+        }));
+        seedMessages(state.storage.kv, messages);
         const broadcast = vi.fn(instance['broadcastStoredEvent'].bind(instance));
         instance['broadcastStoredEvent'] = broadcast;
         return {
@@ -8776,7 +8850,7 @@ describe('SandboxSession worktree changes persistence', () => {
       });
       expect(fixture.captures).toHaveLength(3);
       await runInDurableObject(fixture.session, async (_instance, state) => {
-        expect(readSessionValueSync(state.storage.kv)).toEqual(before.messages);
+        expect(readRawSessionMessages(state.storage.kv)).toEqual(before.messages);
         expect(
           createEventQueries(drizzle(state.storage), state.storage.sql).findByFilters({})
         ).toEqual([
@@ -8811,16 +8885,18 @@ describe('SandboxSession worktree changes persistence', () => {
     const fixture = await worktreeFixture();
     try {
       await runInDurableObject(fixture.session, async (instance, state) => {
-        const messages: SessionMessageRecord[] = [
+        const messages: SessionMessage[] = [
           {
             messageId: 'msg_worktree_scoped',
-            state: 'accepted',
-            wrapperInstanceId: fixture.wrapperInstanceId,
-            acceptedAt: 1,
-            lastActivityAt: 2,
+            state: acceptedState({
+              wrapperInstanceId: fixture.wrapperInstanceId,
+              acceptedAt: 1,
+              lastActivityAt: 2,
+              executionDeadlineAt: 60_000,
+            }),
           },
         ];
-        writeSessionMessages(state.storage.kv, messages);
+        seedMessages(state.storage.kv, messages);
         const identity = {
           directory: fixture.directory,
           kiloSessionId: fixture.kiloSessionId,
@@ -8854,7 +8930,7 @@ describe('SandboxSession worktree changes persistence', () => {
             identity: { directory: fixture.directory },
           })
         ).resolves.toEqual({ applied: false });
-        expect(readSessionValueSync(state.storage.kv)).toEqual(messages);
+        expect(readRawSessionMessages(state.storage.kv)).toEqual(messages);
         expect(
           createEventQueries(drizzle(state.storage), state.storage.sql).findByFilters({})
         ).toEqual([]);
@@ -8898,17 +8974,23 @@ describe('SandboxSession worktree changes persistence', () => {
       });
 
       await runInDurableObject(fixture.session, (_instance, state) => {
-        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
-        writeSessionMessages(state.storage.kv, [
+        const messages = readRawSessionMessages(state.storage.kv);
+        const stale = createSessionMessageRecord({
+          turn: { type: 'prompt', messageId: staleMessageId, prompt: 'previous wrapper turn' },
+          agent: { mode: 'code', model: 'test' },
+        });
+        seedMessages(state.storage.kv, [
           {
-            ...createSessionMessageRecord({
-              turn: { type: 'prompt', messageId: staleMessageId, prompt: 'previous wrapper turn' },
-              agent: { mode: 'code', model: 'test' },
+            ...stale,
+            state: acceptedState({
+              intent: stale.state.intent,
+              legacyInvalidIntent: undefined,
+              wrapperInstanceId: staleWrapperInstanceId,
+              acceptedAt: Date.now(),
+              lastActivityAt: Date.now(),
+              executionDeadlineAt: Date.now() + 60_000,
             }),
-            state: 'accepted',
-            wrapperInstanceId: staleWrapperInstanceId,
-            acceptedAt: Date.now(),
-          } satisfies SessionMessageRecord,
+          } satisfies SessionMessage,
           ...messages,
         ]);
       });
@@ -9238,12 +9320,14 @@ describe('SandboxSession worktree changes persistence', () => {
     async type => {
       const fixture = await worktreeFixture();
       await runInDurableObject(fixture.session, async (instance, state) => {
-        await writeSessionValue(state.storage, [
+        seedMessages(state.storage.kv, [
           {
             messageId: 'msg_interrupted',
-            state: 'accepted',
-            acceptedAt: Date.now(),
-          } satisfies SessionMessageRecord,
+            state: acceptedState({
+              acceptedAt: Date.now(),
+              executionDeadlineAt: Date.now() + 60_000,
+            }),
+          } satisfies SessionMessage,
         ]);
         await instance.markAsInterrupted();
       });
@@ -9704,9 +9788,14 @@ describe('SandboxSession control-plane regressions', () => {
       agent,
     });
     await runInDurableObject(session, (_instance, state) => {
-      writeSessionMessages(state.storage.kv, [
-        { messageId: 'msg_blocker', state: 'accepted', acceptedAt: Date.now() },
-      ] satisfies SessionMessageRecord[]);
+      seedMessages(state.storage.kv, [
+        {
+      messageId: 'msg_blocker',
+      state: acceptedState({
+        acceptedAt: Date.now(),
+      }),
+    },
+      ] satisfies SessionMessage[]);
     });
     return { fixture, session };
   }
@@ -9714,7 +9803,7 @@ describe('SandboxSession control-plane regressions', () => {
   function admissionState(session: SessionStub) {
     return runInDurableObject(session, (_instance, state) => ({
       metadata: state.storage.kv.get<SessionMetadata>('session_metadata'),
-      messages: readRawSessionMessages<SessionMessageRecord>(state.storage.kv),
+      messages: readRawSessionMessages(state.storage.kv),
     }));
   }
 
@@ -9799,19 +9888,25 @@ describe('SandboxSession control-plane regressions', () => {
         const state = await admissionState(session);
         expect(state.messages[0]).toMatchObject({
           messageId,
-          state: 'queued',
-          preparationAttemptId: expect.any(String),
-          deliveryDeadlineAt: expect.any(Number),
+          state: {
+            kind: 'queued',
+            preparationAttemptId: expect.any(String),
+            deadlineAt: expect.any(Number),
+          },
         });
-        expect(state.messages[0]?.unresolvedDispatch).toBeUndefined();
-        expect(state.messages[0]?.operations).toBeUndefined();
+        expect(state.messages[0]?.state).not.toHaveProperty('unresolvedDispatch');
+        expect(state.messages[0]?.proofs).toBeUndefined();
       });
       const firstState = await admissionState(session);
       const firstMessage = firstState.messages.find(message => message.messageId === messageId);
-      if (!firstMessage?.preparationAttemptId || firstMessage.deliveryDeadlineAt === undefined)
+      if (
+        firstMessage?.state.kind !== 'queued' ||
+        !firstMessage.state.preparationAttemptId ||
+        firstMessage.state.deadlineAt === null
+      )
         throw new Error('Missing first acquisition');
-      const firstAttemptId = firstMessage.preparationAttemptId;
-      const deadlineAt = firstMessage.deliveryDeadlineAt;
+      const firstAttemptId = firstMessage.state.preparationAttemptId;
+      const deadlineAt = firstMessage.state.deadlineAt;
       const physical = await control.getAllocationRecord();
       expect(physical).toMatchObject({
         state: { kind: 'allocated', target: { providerRef: expect.any(String) } },
@@ -9847,10 +9942,9 @@ describe('SandboxSession control-plane regressions', () => {
         const afterLoss = await admissionState(session);
         expect(afterLoss.messages[0]).toMatchObject({
           messageId,
-          state: 'queued',
-          deliveryDeadlineAt: deadlineAt,
+          state: { kind: 'queued', deadlineAt: deadlineAt },
         });
-        expect(afterLoss.messages[0]?.preparationAttemptId).toBeUndefined();
+        expect(afterLoss.messages[0]?.state).not.toHaveProperty('preparationAttemptId');
         const retryAt = await runInDurableObject(session, (_instance, state) =>
           state.storage.getAlarm()
         );
@@ -9898,10 +9992,10 @@ describe('SandboxSession control-plane regressions', () => {
           });
         });
         const completed = await admissionState(session);
+        // The terminal union drops the queued preparation attempt and delivery
+        // deadline; the outcome source records how the turn settled.
         expect(completed.messages[0]).toMatchObject({
-          state: 'completed',
-          preparationAttemptId: secondAcquisition?.id,
-          deliveryDeadlineAt: deadlineAt,
+          state: { kind: 'completed', source: 'wrapper_outcome' },
         });
       } finally {
         clock.mockRestore();
@@ -9956,12 +10050,14 @@ describe('SandboxSession control-plane regressions', () => {
       expect(before.messages).toMatchObject([
         {
           messageId: 'msg_ffffffffffff00000000000003',
-          state: 'queued',
-          deliveryDeadlineAt: expect.any(Number),
-          preparationAttemptId: expect.any(String),
+          state: {
+            kind: 'queued',
+            deadlineAt: expect.any(Number),
+            preparationAttemptId: expect.any(String),
+          },
         },
       ]);
-      expect(before.messages[0]?.deliveryDeadlineAt).toBeGreaterThanOrEqual(
+      expect(before.messages[0]?.state.deadlineAt).toBeGreaterThanOrEqual(
         admittedAt + SESSION_DELIVERY_TIMEOUT_MS
       );
       expect(provider.create).not.toHaveBeenCalled();
@@ -9985,11 +10081,14 @@ describe('SandboxSession control-plane regressions', () => {
       const recovered = await admissionState(session);
       expect(recovered.messages).toMatchObject([
         {
-          ...before.messages[0],
-          state: 'accepted',
-          wrapperInstanceId: fixture.wrapperInstanceId,
+          messageId: before.messages[0].messageId,
+          state: expect.objectContaining({
+            kind: 'accepted',
+            wrapperInstanceId: fixture.wrapperInstanceId,
+            intent: before.messages[0].state.intent,
+          }),
         },
-        { messageId: 'msg_fresh', state: 'queued' },
+        { messageId: 'msg_fresh', state: expect.objectContaining({ kind: 'queued' }) },
       ]);
       expect(requests.filter(request => request.operation === 'session.prompt')).toHaveLength(1);
       sendOutcome(socket, 'msg_ffffffffffff00000000000003');
@@ -10128,7 +10227,11 @@ describe('SandboxSession control-plane regressions', () => {
         },
       });
       await waitForAccepted(session, 'msg_ffffffffffff00000000000005');
-      const attemptId = (await admissionState(session)).messages[0]?.preparationAttemptId;
+      // The accepted union drops the preparation attempt; the materialized
+      // preparation snapshot owns it.
+      const attemptId = (await preparationSnapshots(session)).find(
+        snapshot => snapshot.triggerMessageId === 'msg_ffffffffffff00000000000005'
+      )?.attemptId;
       expect(attemptId).toEqual(expect.any(String));
       await session.admitSubmittedMessage({
         userId: fixture.ownerId,
@@ -10178,11 +10281,13 @@ describe('SandboxSession control-plane regressions', () => {
         });
       });
       expect((await admissionState(session)).messages).toMatchObject([
-        { messageId: 'msg_ffffffffffff00000000000005', state: 'completed' },
+        { messageId: 'msg_ffffffffffff00000000000005', state: expect.objectContaining({ kind: 'completed' }) },
         {
           messageId: 'msg_current_b',
-          state: 'accepted',
-          wrapperInstanceId: fixture.wrapperInstanceId,
+          state: expect.objectContaining({
+            kind: 'accepted',
+            wrapperInstanceId: fixture.wrapperInstanceId,
+          }),
         },
       ]);
       expect(await lifecycleEvents(session)).toEqual(events);
@@ -10263,8 +10368,8 @@ describe('SandboxSession control-plane regressions', () => {
         await session.markAsInterrupted();
         await expect(session.interruptExecution()).resolves.toMatchObject({ success: true });
         expect((await admissionState(session)).messages).toMatchObject([
-          { messageId: 'msg_ffffffffffff00000000000006', state: 'cancelled' },
-          { messageId: 'msg_cancel_follower', state: 'cancelled' },
+          { messageId: 'msg_ffffffffffff00000000000006', state: expect.objectContaining({ kind: 'cancelled' }) },
+          { messageId: 'msg_cancel_follower', state: expect.objectContaining({ kind: 'cancelled' }) },
         ]);
         // A session-scoped interrupt cancels messages only: the allocation machine
         // owns runtime teardown, so no `session.abort` is sent and the provider is
@@ -10408,13 +10513,11 @@ describe('SandboxSession control-plane regressions', () => {
       expect((await admissionState(session)).messages).toMatchObject([
         {
           messageId: 'msg_ffffffffffff00000000000007',
-          state: 'failed',
-          failedReason: 'health_unhealthy_unresponsive',
+          state: { kind: 'failed', reason: 'health_unhealthy_unresponsive' },
         },
         {
           messageId: 'msg_recovered',
-          state: 'accepted',
-          wrapperInstanceId: nextFixture.wrapperInstanceId,
+          state: { kind: 'accepted', wrapperInstanceId: nextFixture.wrapperInstanceId },
         },
       ]);
       expect(provider.create).toHaveBeenCalledTimes(1);
@@ -10632,7 +10735,7 @@ describe('SandboxSession control-plane regressions', () => {
       })
     ).resolves.toMatchObject({ success: true });
     const state = await admissionState(session);
-    expect(state.messages[1]?.intent).toEqual({
+    expect(state.messages[1]?.state.intent).toEqual({
       turn: { type: 'prompt', messageId: INITIAL_MESSAGE_ID, prompt: 'initial' },
       agent: { mode: 'reviewer', model: agentA.model },
     });
@@ -10643,12 +10746,15 @@ describe('SandboxSession control-plane regressions', () => {
   it('permanently fails a legacy prompt without a model while a new command stays model-less after defaults change', async () => {
     const { fixture, session } = messageFixture();
     const { socket } = await initializeTerminalRuntime(fixture);
-    const legacy: SessionMessageRecord = {
+    // Canonical storage keeps legacy content in `state.legacy`; the freeze
+    // resolves it from the pre-update defaults.
+    const legacy: SessionMessage = {
       messageId: 'msg_invalid_model',
-      state: 'queued',
-      prompt: 'never deliver',
-      attachFailures: 1,
-      promptFailures: 2,
+      state: queuedState({
+        legacy: { prompt: 'never deliver' },
+        attachFailures: 1,
+        promptFailures: 2,
+      }),
     };
     try {
       const requests = captureAndAcceptControlRequests(socket);
@@ -10659,7 +10765,7 @@ describe('SandboxSession control-plane regressions', () => {
         workspace: { sandboxId: fixture.sandboxId, workspacePath: '/workspace/terminal' },
       });
       await runInDurableObject(session, (_instance, state) => {
-        writeSessionMessages(state.storage.kv, [legacy]);
+        seedMessages(state.storage.kv, [legacy]);
       });
       await expect(
         session.admitSubmittedMessage({
@@ -10680,19 +10786,22 @@ describe('SandboxSession control-plane regressions', () => {
       await runInDurableObject(session, instance => instance.alarm());
       await waitForAccepted(session, 'msg_model_less');
       const delivered = await admissionState(session);
-      expect(delivered.messages[0]).toEqual({
-        ...legacy,
-        state: 'failed',
-        failedReason: 'invalid_model',
-        legacyIntentInvalid: true,
-        preparationAttemptId: expect.any(String),
-        deliveryDeadlineAt: expect.any(Number),
-        terminalAt: expect.any(Number),
-        terminalSource: 'coordinator',
+      expect(delivered.messages[0]).toMatchObject({
+        messageId: 'msg_invalid_model',
+        state: {
+          kind: 'failed',
+          reason: 'invalid_model',
+          legacyInvalidIntent: true,
+          legacy: { prompt: 'never deliver' },
+          source: 'coordinator',
+        },
       });
       expect(delivered.messages.slice(1)).toMatchObject([
-        { messageId: 'msg_model_less', state: 'accepted' },
-        { messageId: 'msg_selected', state: 'queued', intent: { agent: { model: modelB } } },
+        { messageId: 'msg_model_less', state: expect.objectContaining({ kind: 'accepted' }) },
+        {
+          messageId: 'msg_selected',
+          state: { kind: 'queued', intent: { agent: { model: modelB } } },
+        },
       ]);
       expect(delivered.metadata?.agent).toEqual({ mode: 'code', model: modelB });
       await runInDurableObject(session, instance => instance.alarm());
@@ -10759,11 +10868,14 @@ describe('SandboxSession control-plane regressions', () => {
     async outcome => {
       const { fixture, session } = await seedBlockedAdmission();
       await runInDurableObject(session, (_instance, state) => {
-        const messages = readRawSessionMessages<SessionMessageRecord>(state.storage.kv);
-        writeSessionMessages(state.storage.kv, [
+        const messages = readRawSessionMessages(state.storage.kv);
+        seedMessages(state.storage.kv, [
           ...messages,
-          { messageId: 'msg_legacy', state: 'queued', prompt: 'retain old format on rejection' },
-        ] satisfies SessionMessageRecord[]);
+          {
+      messageId: 'msg_legacy',
+      state: queuedState({ legacy: { prompt: 'retain old format on rejection' } }),
+    },
+        ] satisfies SessionMessage[]);
       });
       const before = await admissionState(session);
       vi.mocked(globalThis.fetch).mockImplementation(async () =>
@@ -10852,7 +10964,7 @@ describe('SandboxSession control-plane regressions', () => {
       validation.release();
       await expect(pending).resolves.toMatchObject({ success: true });
       const state = await admissionState(session);
-      expect(state.messages.slice(1).map(message => message.intent?.agent)).toEqual([
+      expect(state.messages.slice(1).map(message => message.state.intent?.agent)).toEqual([
         { mode: 'reviewer', model: modelB, variant: 'low' },
         agentA,
       ]);
@@ -10900,7 +11012,7 @@ describe('SandboxSession control-plane regressions', () => {
         expect(await admissionState(session)).toEqual(winner);
         expect(
           winner.messages.filter(message => message.messageId === 'msg_concurrent')
-        ).toMatchObject([{ intent: { agent: nextAgent } }]);
+        ).toMatchObject([{ state: { intent: { agent: nextAgent } } }]);
       } finally {
         validation.release();
         await pending;
@@ -10970,9 +11082,7 @@ describe('SandboxSession control-plane regressions', () => {
       validation.release();
       await expect(pending).resolves.toMatchObject({ success: false, code: 'BAD_REQUEST' });
       expect(await admissionState(session)).toEqual(terminal);
-      expect(terminal.messages.find(message => message.messageId === 'msg_terminal')?.state).toBe(
-        'cancelled'
-      );
+      expect(terminal.messages.find(message => message.messageId === 'msg_terminal')?.state.kind).toBe('cancelled');
     } finally {
       validation.release();
       await pending;
@@ -11006,23 +11116,32 @@ describe('SandboxSession control-plane regressions', () => {
 
   it('freezes both legacy queue formats before updating defaults and preserves history and retries', async () => {
     const { fixture, session } = await seedBlockedAdmission();
-    const history: SessionMessageRecord[] = [
+    const history: SessionMessage[] = [
       ...(await admissionState(session)).messages,
-      { messageId: 'msg_old_failed', state: 'failed', prompt: 'failed old content' },
+      {
+        messageId: 'msg_old_failed',
+        state: terminalState('failed', { legacy: { prompt: 'failed old content' } }),
+      },
     ];
-    const legacy: SessionMessageRecord[] = [
+    // Both legacy formats live in canonical `state.legacy` before the freeze.
+    const legacy: SessionMessage[] = [
       {
         messageId: 'msg_old_turn',
-        state: 'queued',
-        turn: { type: 'prompt', messageId: 'msg_old_turn', prompt: 'old turn A' },
-        attachFailures: 1,
-        promptFailures: 2,
-        preparationAttemptId: 'attempt_old_turn',
+        state: queuedState({
+          legacy: { turn: { type: 'prompt', messageId: 'msg_old_turn', prompt: 'old turn A' } },
+          legacyInvalidIntent: undefined,
+          attachFailures: 1,
+          promptFailures: 2,
+          preparationAttemptId: 'attempt_old_turn',
+        }),
       },
-      { messageId: 'msg_old_prompt', state: 'queued', prompt: 'old prompt A' },
+      {
+        messageId: 'msg_old_prompt',
+        state: queuedState({ legacy: { prompt: 'old prompt A' }, legacyInvalidIntent: undefined }),
+      },
     ];
     await runInDurableObject(session, (_instance, state) => {
-      writeSessionMessages(state.storage.kv, [...history, ...legacy]);
+      seedMessages(state.storage.kv, [...history, ...legacy]);
     });
     await expect(
       session.admitSubmittedMessage({
@@ -11033,7 +11152,7 @@ describe('SandboxSession control-plane regressions', () => {
     ).resolves.toMatchObject({ success: true });
     const frozen = await admissionState(session);
     expect(frozen.messages.slice(0, 2)).toEqual(history);
-    expect(frozen.messages.slice(2).map(message => message.intent)).toEqual([
+    expect(frozen.messages.slice(2).map(message => message.state.intent)).toEqual([
       { turn: { type: 'prompt', messageId: 'msg_old_turn', prompt: 'old turn A' }, agent: agentA },
       {
         turn: { type: 'prompt', messageId: 'msg_old_prompt', prompt: 'old prompt A' },
@@ -11045,9 +11164,11 @@ describe('SandboxSession control-plane regressions', () => {
       },
     ]);
     expect(frozen.messages[2]).toMatchObject({
-      attachFailures: 1,
-      promptFailures: 2,
-      preparationAttemptId: 'attempt_old_turn',
+      state: {
+        attachFailures: 1,
+        promptFailures: 2,
+        preparationAttemptId: 'attempt_old_turn',
+      },
     });
     expect(frozen.metadata?.agent).toEqual({ mode: 'code', model: modelB });
   });
@@ -11069,9 +11190,12 @@ describe('SandboxSession control-plane regressions', () => {
         workspace: { sandboxId: fixture.sandboxId, workspacePath: '/workspace/terminal' },
       });
       await runInDurableObject(session, (_instance, state) => {
-        writeSessionMessages(state.storage.kv, [
-          { messageId: 'msg_upgrade_a', state: 'queued', prompt: 'old A' },
-        ] satisfies SessionMessageRecord[]);
+        seedMessages(state.storage.kv, [
+          {
+      messageId: 'msg_upgrade_a',
+      state: queuedState({ legacy: { prompt: 'old A' }, legacyInvalidIntent: undefined }),
+    },
+        ] satisfies SessionMessage[]);
       });
       await runInDurableObject(control, instance => {
         const prototype = Object.getPrototypeOf(instance) as typeof instance;
@@ -11084,7 +11208,7 @@ describe('SandboxSession control-plane regressions', () => {
       });
       dispatch = runInDurableObject(session, instance => instance.alarm());
       await waitFor(() => expect(entered).toBe(true));
-      expect((await admissionState(session)).messages[0]?.intent?.agent).toEqual(agentA);
+      expect((await admissionState(session)).messages[0]?.state.intent?.agent).toEqual(agentA);
       await runInDurableObject(session, async (instance, state) => {
         const metadata = await instance.getMetadata();
         if (!metadata) throw new Error('Expected registered metadata');
@@ -11147,7 +11271,7 @@ describe('SandboxSession control-plane regressions', () => {
         },
       });
       const firstRequest = await entered.promise;
-      const original = (await admissionState(session)).messages[0]?.intent;
+      const original = (await admissionState(session)).messages[0]?.state.intent;
       let alarmStarted = false;
       alarm = runInDurableObject(session, instance => {
         alarmStarted = true;
@@ -11179,9 +11303,7 @@ describe('SandboxSession control-plane regressions', () => {
       held = undefined;
       await alarm;
       expect((await admissionState(session)).messages[0]).toMatchObject({
-        state: 'queued',
-        promptFailures: 1,
-        intent: original,
+        state: { kind: 'queued', promptFailures: 1, intent: original },
       });
       await expect(
         session.admitSubmittedMessage({
@@ -11203,8 +11325,8 @@ describe('SandboxSession control-plane regressions', () => {
       });
       const accepted = await admissionState(session);
       expect(accepted.messages).toMatchObject([
-        { messageId: INITIAL_MESSAGE_ID, state: 'accepted', promptFailures: 1, intent: original },
-        { messageId: 'msg_retry_b', state: 'queued' },
+        { messageId: INITIAL_MESSAGE_ID, state: { kind: 'accepted', intent: original } },
+        { messageId: 'msg_retry_b', state: expect.objectContaining({ kind: 'queued' }) },
       ]);
       expect(accepted.metadata?.agent).toEqual({ mode: 'code', model: modelB });
       expect(globalThis.fetch).toHaveBeenCalledTimes(1);
@@ -11218,7 +11340,7 @@ describe('SandboxSession control-plane regressions', () => {
 
   it('reconnects prompt and model-less command snapshots from nested intent', async () => {
     const { fixture, session } = await seedBlockedAdmission();
-    const records: SessionMessageRecord[] = [
+    const records: SessionMessage[] = [
       createSessionMessageRecord({
         turn: { type: 'prompt', messageId: 'msg_v2_prompt', prompt: 'nested prompt' },
         agent: agentA,
@@ -11234,7 +11356,7 @@ describe('SandboxSession control-plane regressions', () => {
       }),
     ];
     await runInDurableObject(session, (_instance, state) => {
-      writeSessionMessages(state.storage.kv, records);
+      seedMessages(state.storage.kv, records);
     });
     const response = await SELF.fetch(
       `http://worker.test/stream?sessionId=${fixture.sessionId}&userId=${fixture.ownerId}&replay=false`,
@@ -11311,16 +11433,23 @@ describe('SandboxSession control-plane regressions', () => {
           },
         });
         const acceptedAt = messageState === 'accepted_overdue' ? 1 : Date.now();
-        await writeSessionValue(state.storage, [
-          {
-            messageId: 'msg_deleted',
-            state: messageState === 'accepted' ? 'accepted' : 'failed',
-            ...(messageState === 'accepted_overdue' ? { failedReason: 'accepted_overdue' } : {}),
-            wrapperInstanceId,
-            acceptedAt,
-            lastActivityAt: acceptedAt,
-          } satisfies SessionMessageRecord,
-        ]);
+        const record: SessionMessage = {
+          messageId: 'msg_deleted',
+          state:
+            messageState === 'accepted'
+              ? acceptedState({
+                  wrapperInstanceId,
+                  acceptedAt,
+                  lastActivityAt: acceptedAt,
+                  executionDeadlineAt: acceptedAt + 60_000,
+                })
+              : terminalState('failed', {
+                  at: Date.now(),
+                  source: 'coordinator',
+                  reason: messageState,
+                }),
+        };
+        seedMessages(state.storage.kv, [record]);
         if (messageState !== 'accepted') {
           await expect(instance.getCurrentMessageWork()).resolves.toBeNull();
         }
@@ -11416,13 +11545,11 @@ describe('SandboxSession control-plane regressions', () => {
     const sessionId = 'workspace_control_commands';
     const stub = env.SANDBOX_SESSION.getByName(`${userId}:${sessionId}`);
     await runInDurableObject(stub, async (instance, state) => {
-      const blocker = {
+      const blocker: SessionMessage = {
         messageId: 'msg_blocker',
-        state: 'accepted',
-        acceptedAt: 1,
-        lastActivityAt: 1,
-      } satisfies SessionMessageRecord;
-      await writeSessionValue(state.storage, [blocker]);
+        state: acceptedState({ acceptedAt: 1, lastActivityAt: 1 }),
+      } satisfies SessionMessage;
+      seedMessages(state.storage.kv, [blocker]);
 
       const repository = {
         type: 'github',
@@ -11461,27 +11588,32 @@ describe('SandboxSession control-plane regressions', () => {
       await expect(
         instance.admitSubmittedMessage({ userId, turn: followUpTurn })
       ).resolves.toMatchObject({ success: true, messageId: followUpTurn.id });
-      expect(await readSessionValue<SessionMessageRecord[]>(state.storage)).toEqual([
+      const initialRecord = createSessionMessageRecord({
+        turn: initialTurn,
+        agent: { mode: 'code', model: 'test' },
+      });
+      const followUpRecord = createSessionMessageRecord({
+        turn: {
+          type: 'command',
+          messageId: followUpTurn.id,
+          command: followUpTurn.command,
+          arguments: followUpTurn.arguments,
+        },
+        agent: { mode: 'code', model: 'test' },
+      });
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
         blocker,
         {
-          ...createSessionMessageRecord({
-            turn: initialTurn,
-            agent: { mode: 'code', model: 'test' },
-          }),
+          ...initialRecord,
           // Admission now persists a stable queue timestamp for reporting.
-          queuedAt: expect.any(Number),
+          state: { ...initialRecord.state, queuedAt: expect.any(Number) },
         },
         {
-          ...createSessionMessageRecord({
-            turn: {
-              type: 'command',
-              messageId: followUpTurn.id,
-              command: followUpTurn.command,
-              arguments: followUpTurn.arguments,
-            },
-            agent: { mode: 'code', model: 'test' },
-          }),
-          queuedAt: expect.any(Number),
+          ...followUpRecord,
+          state: { ...followUpRecord.state, queuedAt: expect.any(Number) },
         },
       ]);
     });
@@ -11501,20 +11633,24 @@ describe('SandboxSession control-plane regressions', () => {
           agent: { mode: 'code', model: 'test' },
           workspace: { workspacePath: '/workspace/root' },
         });
-        const accepted = {
+        const accepted: SessionMessage = {
           messageId: 'msg_parent',
-          state: 'accepted',
-          wrapperInstanceId,
-          acceptedAt: 1,
-          lastActivityAt: 2,
-          turn: { type: 'prompt', messageId: 'msg_parent', prompt: 'parent turn' },
-        } satisfies SessionMessageRecord;
-        const queued = {
+          state: acceptedState({
+            wrapperInstanceId,
+            acceptedAt: 1,
+            lastActivityAt: 2,
+            legacy: { turn: { type: 'prompt', messageId: 'msg_parent', prompt: 'parent turn' } },
+          }),
+        } satisfies SessionMessage;
+        const queued: SessionMessage = {
           messageId: 'msg_next',
-          state: 'queued',
-          turn: { type: 'command', messageId: 'msg_next', command: 'status', arguments: '' },
-        } satisfies SessionMessageRecord;
-        await writeSessionValue(state.storage, [accepted, queued]);
+          state: queuedState({
+            legacy: {
+              turn: { type: 'command', messageId: 'msg_next', command: 'status', arguments: '' },
+            },
+          }),
+        } satisfies SessionMessage;
+        seedMessages(state.storage.kv, [accepted, queued]);
 
         await expect(
           instance.receiveSandboxControlEvent({
@@ -11528,9 +11664,11 @@ describe('SandboxSession control-plane regressions', () => {
           })
         ).resolves.toEqual({ applied: true });
 
-        const messages = await readSessionValue<SessionMessageRecord[]>(state.storage);
-        expect(messages).toEqual([accepted, queued]);
-        expect(messages?.[0]?.lastActivityAt).toBe(accepted.lastActivityAt);
+        const messages = ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? [];
+      expect(messages).toEqual([accepted, queued]);
+      expect(
+        messages[0]?.state.kind === 'accepted' ? messages[0].state.lastActivityAt : undefined
+      ).toBe(2);
         await expect(instance.getCurrentMessageWork()).resolves.toEqual({
           messageId: accepted.messageId,
           status: 'running',
@@ -13258,17 +13396,20 @@ describe('SandboxSession worktree admission', () => {
           prompt: 'first grouped turn',
           turn: { type: 'prompt', prompt: 'first grouped turn' },
         });
-        expect(await readSessionValue(state.storage)).toEqual([
+        expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
           expect.objectContaining({
             messageId: INITIAL_MESSAGE_ID,
-            intent: expect.objectContaining({
-              turn: {
-                type: 'prompt',
-                messageId: INITIAL_MESSAGE_ID,
-                prompt: 'first grouped turn',
-              },
-              agent: { mode: 'code', model: 'test-model' },
-              finalization: { autoCommit: autoCommit ?? true, condenseOnComplete: true },
+            state: expect.objectContaining({
+              kind: 'queued',
+              intent: expect.objectContaining({
+                turn: {
+                  type: 'prompt',
+                  messageId: INITIAL_MESSAGE_ID,
+                  prompt: 'first grouped turn',
+                },
+                agent: { mode: 'code', model: 'test-model' },
+                finalization: { autoCommit: autoCommit ?? true, condenseOnComplete: true },
+              }),
             }),
           }),
         ]);
@@ -13353,14 +13494,16 @@ describe('SandboxSession worktree admission', () => {
         prompt: '/compact --aggressive',
         turn: { type: 'command', command: 'compact', arguments: '--aggressive' },
       });
-      expect(await readSessionValue(state.storage)).toEqual([
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
         expect.objectContaining({
-          version: 2,
-          intent: {
-            turn: initialTurn,
-            agent: { mode: 'architect', model: 'kilo/command-model', variant: 'thinking' },
-            finalization: { autoCommit: true, condenseOnComplete: true },
-          },
+          state: expect.objectContaining({
+            kind: 'queued',
+            intent: {
+              turn: initialTurn,
+              agent: { mode: 'architect', model: 'kilo/command-model', variant: 'thinking' },
+              finalization: { autoCommit: true, condenseOnComplete: true },
+            },
+          }),
         }),
       ]);
       await expect(instance.createSessionWithInitialAdmission(registration)).resolves.toMatchObject(
@@ -13473,18 +13616,20 @@ describe('SandboxSession worktree admission', () => {
 
     const attach = JSON.parse(await incomingAttach) as WrapperRequest;
     await runInDurableObject(session, async (_instance, state) => {
-      expect(await readSessionValue(state.storage)).toEqual([
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
         expect.objectContaining({
-          intent: {
-            turn: {
-              type: 'prompt',
-              messageId: INITIAL_MESSAGE_ID,
-              prompt: 'review the document',
-              attachments,
+          state: expect.objectContaining({
+            intent: {
+              turn: {
+                type: 'prompt',
+                messageId: INITIAL_MESSAGE_ID,
+                prompt: 'review the document',
+                attachments,
+              },
+              agent: { mode: 'debug', model: 'kilo/override-model', variant: 'focused' },
+              finalization: { autoCommit: true, condenseOnComplete: false },
             },
-            agent: { mode: 'debug', model: 'kilo/override-model', variant: 'focused' },
-            finalization: { autoCommit: true, condenseOnComplete: false },
-          },
+          }),
         }),
       ]);
     });
@@ -13663,12 +13808,11 @@ describe('SandboxSession worktree admission', () => {
           finalization: { autoCommit: persistedAutoCommit, condenseOnComplete: true },
         });
         const metadata = await instance.getMetadata();
-        const blocker: SessionMessageRecord = {
+        const blocker: SessionMessage = {
           messageId: 'msg_blocker',
-          state: 'accepted',
-          acceptedAt: Date.now(),
+          state: acceptedState({ acceptedAt: Date.now() }),
         };
-        writeSessionMessages(state.storage.kv, [blocker]);
+        seedMessages(state.storage.kv, [blocker]);
         const submissions = [
           { finalization: undefined, autoCommit: inheritedAutoCommit, condenseOnComplete: true },
           {
@@ -13684,7 +13828,7 @@ describe('SandboxSession worktree admission', () => {
           { finalization: { autoCommit: true }, autoCommit: true, condenseOnComplete: true },
           { finalization: { autoCommit: false }, autoCommit: false, condenseOnComplete: true },
         ];
-        const expectedMessages: SessionMessageRecord[] = [blocker];
+        const expectedMessages: SessionMessage[] = [blocker];
         for (const [index, submission] of submissions.entries()) {
           const messageId = `msg_grouped_followup_${index}`;
           await expect(
@@ -13694,19 +13838,20 @@ describe('SandboxSession worktree admission', () => {
               finalization: submission.finalization,
             })
           ).resolves.toMatchObject({ success: true, messageId });
-          expectedMessages.push({
-            ...createSessionMessageRecord({
-              turn: { type: 'prompt', messageId, prompt: 'follow-up' },
-              agent: { mode: 'code', model: 'test-model' },
-              finalization: {
-                autoCommit: submission.autoCommit,
-                condenseOnComplete: submission.condenseOnComplete,
-              },
-            }),
-            // Admission now persists a stable queue timestamp for reporting.
-            queuedAt: expect.any(Number),
+          const record = createSessionMessageRecord({
+            turn: { type: 'prompt', messageId, prompt: 'follow-up' },
+            agent: { mode: 'code', model: 'test-model' },
+            finalization: {
+              autoCommit: submission.autoCommit,
+              condenseOnComplete: submission.condenseOnComplete,
+            },
           });
-          expect(readSessionValueSync(state.storage.kv)).toEqual(expectedMessages);
+          expectedMessages.push({
+            ...record,
+            // Admission now persists a stable queue timestamp for reporting.
+            state: { ...record.state, queuedAt: expect.any(Number) },
+          });
+          expect(readRawSessionMessages(state.storage.kv)).toEqual(expectedMessages);
           expect(await instance.getMetadata()).toEqual(metadata);
         }
       });
@@ -13737,21 +13882,39 @@ describe('SandboxSession worktree admission', () => {
         });
         const metadata = await instance.getMetadata();
         const messageId = 'msg_grouped_replay';
-        const messages: SessionMessageRecord[] = [
+        const frozenRecord = createSessionMessageRecord({
+          turn: { type: 'prompt', messageId, prompt: 'frozen turn' },
+          agent: { mode: 'code', model: 'test-model' },
+          finalization: { autoCommit, condenseOnComplete: true },
+        });
+        const replay: SessionMessage =
+          messageState === 'accepted'
+            ? {
+                ...frozenRecord,
+                state: acceptedState({
+                  intent: frozenRecord.state.intent,
+                  legacyInvalidIntent: undefined,
+                  acceptedAt: Date.now(),
+                  lastActivityAt: Date.now(),
+                  executionDeadlineAt: Date.now() + 60_000,
+                }),
+              }
+            : frozenRecord;
+        const messages: SessionMessage[] = [
           ...(messageState === 'queued'
-            ? [{ messageId: 'msg_blocker', state: 'accepted' as const, acceptedAt: Date.now() }]
+            ? [
+                {
+                  messageId: 'msg_blocker',
+                  state: acceptedState({
+                    acceptedAt: Date.now(),
+                    executionDeadlineAt: Date.now() + 60_000,
+                  }),
+                },
+              ]
             : []),
-          {
-            ...createSessionMessageRecord({
-              turn: { type: 'prompt', messageId, prompt: 'frozen turn' },
-              agent: { mode: 'code', model: 'test-model' },
-              finalization: { autoCommit, condenseOnComplete: true },
-            }),
-            state: messageState,
-            ...(messageState === 'accepted' ? { acceptedAt: Date.now() } : {}),
-          },
+          replay,
         ];
-        writeSessionMessages(state.storage.kv, messages);
+        seedMessages(state.storage.kv, messages);
         const request: SubmittedSessionMessageRequest = {
           userId: ownerId,
           turn: { type: 'prompt', id: messageId, prompt: 'frozen turn' },
@@ -13770,7 +13933,7 @@ describe('SandboxSession worktree admission', () => {
             instance.admitSubmittedMessage({ ...request, finalization })
           ).resolves.toMatchObject({ success: false, code: 'BAD_REQUEST' });
         }
-        expect(readSessionValueSync(state.storage.kv)).toEqual(messages);
+        expect(readRawSessionMessages(state.storage.kv)).toEqual(messages);
         expect(await instance.getMetadata()).toEqual(metadata);
         expect(globalThis.fetch).not.toHaveBeenCalled();
       });
@@ -13825,11 +13988,17 @@ describe('SandboxSession worktree admission', () => {
           ...groupedRegistration({ ownerId, sessionId, kiloSessionId, sandboxId: targetSandboxId }),
           finalization: { autoCommit: persisted, condenseOnComplete: true },
         });
-        writeSessionMessages(state.storage.kv, [
+        seedMessages(state.storage.kv, [
           format === 'frozen'
             ? frozen
-            : { messageId, state: 'queued', prompt: 'recover an older prompt', finalization },
-        ] satisfies SessionMessageRecord[]);
+            : {
+                messageId,
+                state: queuedState({
+                  legacy: { prompt: 'recover an older prompt', finalization },
+                  legacyInvalidIntent: undefined,
+                }),
+              },
+        ] satisfies SessionMessage[]);
       });
 
       const incomingAttach = nextMessage(wrapper);
@@ -13839,7 +14008,23 @@ describe('SandboxSession worktree admission', () => {
         const metadata = await instance.getMetadata();
         if (!metadata) throw new Error('Expected grouped session metadata');
         expect(metadata.finalization).toEqual({ autoCommit: persisted, condenseOnComplete: true });
-        expect(readSessionValueSync(state.storage.kv)).toEqual([expect.objectContaining(frozen)]);
+        expect(readRawSessionMessages(state.storage.kv)).toEqual([
+          format === 'frozen'
+            ? expect.objectContaining({
+                messageId: frozen.messageId,
+                state: expect.objectContaining({ intent: frozen.state.intent }),
+              })
+            : expect.objectContaining({
+                messageId,
+                state: expect.objectContaining({
+                  kind: 'queued',
+                  intent: expect.objectContaining({
+                    turn: { type: 'prompt', messageId, prompt: 'recover an older prompt' },
+                    agent: { mode: 'code', model: 'test-model' },
+                  }),
+                }),
+              }),
+        ]);
         state.storage.kv.put('session_metadata', {
           ...metadata,
           finalization: { autoCommit: !expected, condenseOnComplete: true },
@@ -13853,15 +14038,18 @@ describe('SandboxSession worktree admission', () => {
         payload: {
           messageId,
           turn: { type: 'prompt', prompt: 'recover an older prompt' },
-          agent: frozen.intent.agent,
-          finalization: frozen.intent.finalization,
+          agent: frozen.state.intent?.agent,
+          finalization: frozen.state.intent?.finalization,
         },
       });
       respondToWrapperRequest(wrapper, prompt, { messageId, status: 'accepted' });
       await expect(dispatched).resolves.toBeUndefined();
       await runInDurableObject(session, async (instance, state) => {
-        expect(readSessionValueSync(state.storage.kv)).toEqual([
-          expect.objectContaining({ ...frozen, state: 'accepted' }),
+        expect(readRawSessionMessages(state.storage.kv)).toEqual([
+          expect.objectContaining({
+            messageId: frozen.messageId,
+            state: expect.objectContaining({ kind: 'accepted' }),
+          }),
         ]);
         expect((await instance.getMetadata())?.finalization).toEqual({
           autoCommit: !expected,
@@ -14048,9 +14236,19 @@ describe('SandboxSession root-owned terminal events', () => {
       await instance.registerSession(
         groupedRegistration({ ownerId, sessionId, kiloSessionId: root, sandboxId: targetSandboxId })
       );
-      await writeSessionValue(state.storage, [
-        { messageId: 'msg_active', state: 'accepted', acceptedAt: Date.now(), wrapperInstanceId },
-        { messageId: 'msg_next', state: 'queued', prompt: 'next turn' },
+      seedMessages(state.storage.kv, [
+        {
+          messageId: 'msg_active',
+          state: acceptedState({
+            acceptedAt: Date.now(),
+            executionDeadlineAt: Date.now() + 60_000,
+            wrapperInstanceId,
+          }),
+        },
+        {
+          messageId: 'msg_next',
+          state: queuedState({ legacy: { prompt: 'next turn' }, legacyInvalidIntent: undefined }),
+        },
       ]);
     });
 
@@ -14064,12 +14262,14 @@ describe('SandboxSession root-owned terminal events', () => {
           sandboxId: targetSandboxId,
         })
       );
-      await writeSessionValue(state.storage, [
+      seedMessages(state.storage.kv, [
         {
           messageId: 'msg_sibling_active',
-          state: 'accepted',
-          acceptedAt: Date.now(),
-          wrapperInstanceId,
+          state: acceptedState({
+            acceptedAt: Date.now(),
+            executionDeadlineAt: Date.now() + 60_000,
+            wrapperInstanceId,
+          }),
         },
       ]);
     });
@@ -14104,9 +14304,9 @@ describe('SandboxSession root-owned terminal events', () => {
           payload: { type: 'session.turn.close', properties: { sessionID: root } },
         })
       ).resolves.toEqual({ applied: false });
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_active', state: 'accepted' }),
-        expect.objectContaining({ messageId: 'msg_next', state: 'queued' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_active', state: expect.objectContaining({ kind: 'accepted' }) }),
+        expect.objectContaining({ messageId: 'msg_next', state: expect.objectContaining({ kind: 'queued' }) }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14122,8 +14322,8 @@ describe('SandboxSession root-owned terminal events', () => {
           payload: { type: 'session.turn.close', properties: { sessionID: root } },
         })
       ).resolves.toEqual({ applied: false });
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_sibling_active', state: 'accepted' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_sibling_active', state: expect.objectContaining({ kind: 'accepted' }) }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14160,9 +14360,9 @@ describe('SandboxSession root-owned terminal events', () => {
           wrapperInstanceId: crypto.randomUUID(),
         })
       ).resolves.toEqual({ applied: false });
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_active', state: 'accepted' }),
-        expect.objectContaining({ messageId: 'msg_next', state: 'queued' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_active', state: expect.objectContaining({ kind: 'accepted' }) }),
+        expect.objectContaining({ messageId: 'msg_next', state: expect.objectContaining({ kind: 'queued' }) }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14171,9 +14371,9 @@ describe('SandboxSession root-owned terminal events', () => {
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
       });
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_active', state: 'completed' }),
-        expect.objectContaining({ messageId: 'msg_next', state: 'queued' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_active', state: expect.objectContaining({ kind: 'completed' }) }),
+        expect.objectContaining({ messageId: 'msg_next', state: expect.objectContaining({ kind: 'queued' }) }),
       ]);
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
@@ -14199,8 +14399,8 @@ describe('SandboxSession root-owned terminal events', () => {
     expect(terminalEvents.every(event => event.eventId > 0)).toBe(true);
 
     await runInDurableObject(sibling, async (_instance, state) => {
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_sibling_active', state: 'accepted' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_sibling_active', state: expect.objectContaining({ kind: 'accepted' }) }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14229,8 +14429,15 @@ describe('SandboxSession root-owned terminal events', () => {
           sandboxId: 'usr-abcdef123418',
         })
       );
-      await writeSessionValue(state.storage, [
-        { messageId: 'msg_grouped_failed', state: 'accepted', acceptedAt, wrapperInstanceId },
+      seedMessages(state.storage.kv, [
+        {
+          messageId: 'msg_grouped_failed',
+          state: acceptedState({
+            acceptedAt,
+            executionDeadlineAt: acceptedAt + 60_000,
+            wrapperInstanceId,
+          }),
+        },
       ]);
     });
 
@@ -14263,8 +14470,8 @@ describe('SandboxSession root-owned terminal events', () => {
         wrapperInstanceId,
         payload: { type: 'session.error', properties: { sessionID: root } },
       });
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_grouped_failed', state: 'accepted' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_grouped_failed', state: expect.objectContaining({ kind: 'accepted' }) }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
@@ -14273,8 +14480,8 @@ describe('SandboxSession root-owned terminal events', () => {
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
       });
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_grouped_failed', state: 'failed' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_grouped_failed', state: expect.objectContaining({ kind: 'failed' }) }),
       ]);
       expect(
         persistedSessionEvents(state, lifecycleTypes).map(event => ({
@@ -14313,28 +14520,33 @@ describe('SandboxSession running stream state', () => {
           sandboxId: 'usr-abcdef123415',
         })
       );
-      await writeSessionValue(state.storage, [
+      seedMessages(state.storage.kv, [
         {
           messageId: 'msg_running',
-          state: 'accepted',
-          acceptedAt: Date.now(),
-          intent: {
-            turn: { type: 'prompt', messageId: 'msg_running', prompt: 'currently running' },
-            agent: { mode: 'code', model: 'test-model' },
-          },
+          state: acceptedState({
+            acceptedAt: Date.now(),
+            executionDeadlineAt: Date.now() + 60_000,
+            intent: {
+              turn: { type: 'prompt', messageId: 'msg_running', prompt: 'currently running' },
+              agent: { mode: 'code', model: 'test-model' },
+            },
+            legacyInvalidIntent: undefined,
+          }),
         },
         {
           messageId: 'msg_waiting',
-          state: 'queued',
-          intent: {
-            turn: {
-              type: 'command',
-              messageId: 'msg_waiting',
-              command: 'compact',
-              arguments: '--next',
+          state: queuedState({
+            intent: {
+              turn: {
+                type: 'command',
+                messageId: 'msg_waiting',
+                command: 'compact',
+                arguments: '--next',
+              },
+              agent: { mode: 'code', model: 'test-model' },
             },
-            agent: { mode: 'code', model: 'test-model' },
-          },
+            legacyInvalidIntent: undefined,
+          }),
         },
       ]);
     });
@@ -14378,9 +14590,9 @@ describe('SandboxSession running stream state', () => {
       }),
     ]);
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: 'msg_running', state: 'accepted' }),
-        expect.objectContaining({ messageId: 'msg_waiting', state: 'queued' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: 'msg_running', state: expect.objectContaining({ kind: 'accepted' }) }),
+        expect.objectContaining({ messageId: 'msg_waiting', state: expect.objectContaining({ kind: 'queued' }) }),
       ]);
     });
     response.webSocket.close();
@@ -14417,12 +14629,14 @@ describe('SandboxSession root-scoped reconnect sync', () => {
           sandboxId: targetSandboxId,
         })
       );
-      await writeSessionValue(state.storage, [
+      seedMessages(state.storage.kv, [
         {
           messageId: INITIAL_MESSAGE_ID,
-          state: 'accepted',
-          acceptedAt: Date.now(),
-          wrapperInstanceId,
+          state: acceptedState({
+            acceptedAt: Date.now(),
+            executionDeadlineAt: Date.now() + 60_000,
+            wrapperInstanceId,
+          }),
         },
       ]);
     });
@@ -14556,8 +14770,8 @@ describe('SandboxSession root-scoped reconnect sync', () => {
         questions,
         permissions,
       });
-      expect(await readSessionValue(state.storage)).toEqual([
-        expect.objectContaining({ messageId: INITIAL_MESSAGE_ID, state: 'accepted' }),
+      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect.objectContaining({ messageId: INITIAL_MESSAGE_ID, state: expect.objectContaining({ kind: 'accepted' }) }),
       ]);
     });
     await runInDurableObject(control, async instance => {

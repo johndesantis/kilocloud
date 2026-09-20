@@ -10,6 +10,16 @@
  * the immutable intent survive terminalization so no durable metadata is dropped.
  */
 import { z } from 'zod';
+import {
+  CloudAgentAssistantFailureReasonSchema,
+  CloudAgentProviderOwnershipSchema,
+} from '@kilocode/worker-utils/cloud-agent-failure';
+
+export { CloudAgentAssistantFailureReasonSchema, CloudAgentProviderOwnershipSchema };
+export type {
+  CloudAgentAssistantFailureReason,
+  CloudAgentProviderOwnership,
+} from '@kilocode/worker-utils/cloud-agent-failure';
 
 const timestamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
@@ -28,6 +38,9 @@ export const sessionMessageTerminalSourceSchema = z.enum([
   'operation_result',
 ]);
 export type SessionMessageTerminalSource = z.infer<typeof sessionMessageTerminalSourceSchema>;
+
+export const gateResultSchema = z.enum(['pass', 'fail']);
+export type GateResult = z.infer<typeof gateResultSchema>;
 
 export const agentSelectionSchema = z
   .object({
@@ -208,15 +221,35 @@ const intentCarryFields = {
   legacy: legacyFreeformIntentSchema.optional(),
 };
 
-/** An accepted or queued message must carry intent or be explicitly legacy-invalid. */
-function requiresIntent(
-  value: { intent: SessionMessageIntent | null; legacyInvalidIntent?: true },
+/**
+ * The exclusive intent tri-state carried on every lifecycle variant. Each
+ * message is exactly one of: resolved (`intent`), unresolved (`intent: null`
+ * with a legacy payload a later freeze may resolve), or permanently invalid
+ * (`intent: null` with `legacyInvalidIntent`). A failed freeze may retain the
+ * payload alongside the marker, so the marker wins and the payload is allowed.
+ */
+function intentTriState(
+  value: {
+    intent: SessionMessageIntent | null;
+    legacy?: unknown;
+    legacyInvalidIntent?: true;
+  },
   ctx: z.RefinementCtx
 ): void {
-  if (value.intent === null && value.legacyInvalidIntent !== true) {
+  if (value.intent !== null) {
+    if (value.legacy !== undefined || value.legacyInvalidIntent === true) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'a resolved intent must not carry legacy intent data or an invalid marker',
+      });
+    }
+    return;
+  }
+  if (value.legacy === undefined && value.legacyInvalidIntent !== true) {
     ctx.addIssue({
       code: 'custom',
-      message: 'message must carry an immutable intent or be marked legacy-invalid',
+      message:
+        'message must carry an immutable intent, a legacy payload, or be marked legacy-invalid',
     });
   }
 }
@@ -235,9 +268,14 @@ export const queuedMessageStateSchema = z
     preparationWait: preparationWaitSchema.optional(),
     unresolvedDispatch: z.literal(true).optional(),
     wrapperInstanceId: z.string().min(1).optional(),
+    /**
+     * Retry scope of the last delivery failure. `deliveryStep` cannot own this:
+     * it conflates the retry scope with "has a preparation attempt", so the
+     * original scope cannot be recovered from it.
+     */
+    deliveryRetryScope: z.enum(['message', 'runtime']).optional(),
   })
-  .strict()
-  .superRefine(requiresIntent);
+  .strict();
 
 export const acceptedMessageStateSchema = z
   .object({
@@ -250,19 +288,23 @@ export const acceptedMessageStateSchema = z
     executionDeadlineAt: timestamp,
     capAt: timestamp.optional(),
     wrapperInstanceId: z.string().min(1).optional(),
+    preparationAttemptId: z.string().min(1).optional(),
   })
-  .strict()
-  .superRefine(requiresIntent);
+  .strict();
 
 export const completedMessageStateSchema = z
   .object({
     kind: z.literal('completed'),
     ...intentCarryFields,
     queuedAt: timestamp.optional(),
+    acceptedAt: timestamp.optional(),
     at: timestamp,
     source: sessionMessageTerminalSourceSchema,
     result: z.unknown().optional(),
     assistantMessageId: z.string().min(1).optional(),
+    wrapperInstanceId: z.string().min(1).optional(),
+    preparationAttemptId: z.string().min(1).optional(),
+    gateResult: gateResultSchema.optional(),
   })
   .strict();
 
@@ -271,10 +313,15 @@ export const failedMessageStateSchema = z
     kind: z.literal('failed'),
     ...intentCarryFields,
     queuedAt: timestamp.optional(),
+    acceptedAt: timestamp.optional(),
     at: timestamp,
     source: sessionMessageTerminalSourceSchema,
     reason: z.string().optional(),
     detail: z.string().optional(),
+    assistantReason: CloudAgentAssistantFailureReasonSchema.optional(),
+    providerOwnership: CloudAgentProviderOwnershipSchema.optional(),
+    wrapperInstanceId: z.string().min(1).optional(),
+    preparationAttemptId: z.string().min(1).optional(),
   })
   .strict();
 
@@ -283,19 +330,24 @@ export const cancelledMessageStateSchema = z
     kind: z.literal('cancelled'),
     ...intentCarryFields,
     queuedAt: timestamp.optional(),
+    acceptedAt: timestamp.optional(),
     at: timestamp,
     source: sessionMessageTerminalSourceSchema,
     reason: z.string().optional(),
+    wrapperInstanceId: z.string().min(1).optional(),
+    preparationAttemptId: z.string().min(1).optional(),
   })
   .strict();
 
-export const messageStateSchema = z.union([
-  queuedMessageStateSchema,
-  acceptedMessageStateSchema,
-  completedMessageStateSchema,
-  failedMessageStateSchema,
-  cancelledMessageStateSchema,
-]);
+export const messageStateSchema = z
+  .union([
+    queuedMessageStateSchema,
+    acceptedMessageStateSchema,
+    completedMessageStateSchema,
+    failedMessageStateSchema,
+    cancelledMessageStateSchema,
+  ])
+  .superRefine(intentTriState);
 
 export type QueuedMessageState = z.infer<typeof queuedMessageStateSchema>;
 export type AcceptedMessageState = z.infer<typeof acceptedMessageStateSchema>;

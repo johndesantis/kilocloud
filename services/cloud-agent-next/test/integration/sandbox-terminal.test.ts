@@ -1135,9 +1135,13 @@ describe('SandboxSession terminal bridge in the Workers runtime', () => {
     await fixture.dispose();
     const session = getSandboxSessionStub(env, fixture.ownerId, fixture.sessionId);
     await runInDurableObject(session, async (_instance, state) => {
-      const messages = (await readSessionValue(state.storage)) as { state: string }[] | undefined;
+      const envelope = (await readSessionValue(state.storage)) as
+        | { messages?: { state: { kind: string } }[] }
+        | undefined;
       expect(
-        messages?.every(message => message.state !== 'accepted' && message.state !== 'queued')
+        envelope?.messages?.every(
+          message => message.state.kind !== 'accepted' && message.state.kind !== 'queued'
+        )
       ).toBe(true);
       expect(await state.storage.getAlarm()).toBeNull();
     });

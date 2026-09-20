@@ -11,6 +11,13 @@
  * The `seed*`/`read*From` helpers exist for fixtures that hold a plain `Map` or
  * object instead of a storage adapter; they still go through this module.
  */
+import type {
+  Binding,
+  SessionAggregate,
+  SessionEnvelope,
+  SessionMessage,
+} from '../model/session.js';
+
 const ALLOCATION_RECORD_KEY = 'physical_record';
 const SESSION_MESSAGES_KEY = 'session_messages';
 
@@ -103,21 +110,23 @@ export async function eraseAllocationRecord(
   await storage.delete([ALLOCATION_RECORD_KEY, CANONICAL_ALLOCATION_KEY, ...additionalKeys]);
 }
 
-// --- session, current bare array (sync) ---
+// --- session, canonical envelope (sync) ---
 
-export function readRawSessionMessages<T = unknown>(storage: SyncRecordReader): T[] {
-  return (storage.get(SESSION_MESSAGES_KEY) as T[] | undefined) ?? [];
+/**
+ * Pure dry encoder for the session envelope. Defined here, at the byte
+ * boundary, so the writer and any reader that must not import the legacy
+ * decoder share one implementation; `store.ts` re-exports it.
+ */
+export function encodeSessionEnvelope(aggregate: SessionAggregate): SessionEnvelope {
+  return { v: 2, binding: aggregate.binding, messages: aggregate.messages };
 }
 
-export function readActiveSessionMessages<T = unknown>(
-  storage: SyncRecordReader,
-  blocked: boolean
-): T[] {
-  return blocked ? [] : readRawSessionMessages<T>(storage);
-}
-
-export function writeSessionMessages(storage: SyncRecordWriter, messages: unknown[]): void {
-  storage.put(SESSION_MESSAGES_KEY, messages);
+export function writeSessionMessages(
+  storage: SyncRecordWriter,
+  binding: Binding,
+  messages: readonly SessionMessage[]
+): void {
+  storage.put(SESSION_MESSAGES_KEY, encodeSessionEnvelope({ binding, messages: [...messages] }));
 }
 
 export function readSessionValueSync<T = unknown>(storage: SyncRecordReader): T | undefined {
@@ -191,10 +200,6 @@ export function seedSessionValue<T extends SeedRecords>(records: T, value: unkno
 
 export function readAllocationRecordFrom<T = unknown>(records: SeedRecords): T | undefined {
   return readSeeded(records, ALLOCATION_RECORD_KEY) as T | undefined;
-}
-
-export function readSessionMessagesFrom<T = unknown>(records: SeedRecords): T[] | undefined {
-  return readSeeded(records, SESSION_MESSAGES_KEY) as T[] | undefined;
 }
 
 export function readSessionValueFrom(records: SeedRecords): unknown {

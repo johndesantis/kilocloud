@@ -207,21 +207,31 @@ import {
 } from './terminal-lifecycle.js';
 import {
   acceptQueuedMessage,
+  acceptedAtOf,
+  activeWrapperInstanceId,
   applyMessageOutcome,
+  assistantReasonOf,
   assignPreparationAttemptId,
   cancelPendingMessage,
   createSessionMessageRecord,
+  deliveryPreparationAttemptId,
+  deliveryWrapperInstanceId,
   failAcceptedMessage,
+  failedDetailOf,
+  failedReasonOf,
   failQueuedMessage,
   failWaitingMessages as applyFailWaitingMessages,
   failedMessageSnapshot,
   freezeLegacyQueuedMessages,
+  getSessionMessageTurn,
   hasAcceptedMessage,
   hasUnreleasedOperationProof,
   incrementDeliveryFailure,
   markSessionOperationRejection,
   matchesSessionMessageReplay,
   nextQueuedMessageId,
+  providerOwnershipOf,
+  queuedAtOf,
   recordAcceptedMessageActivity,
   releaseCompletedRetryableAttach,
   releaseUnadmittedWaitingMessages,
@@ -230,9 +240,15 @@ import {
   resolveSessionMessageIntent,
   streamCloudStatus,
   streamQueuedSnapshots,
+  terminalAtOf,
+  terminalSourceOf,
   type ControlSessionMessageInput,
-  type SessionMessageRecord,
+  type SessionAggregate,
+  type SessionMessage,
 } from './session-message-queue.js';
+import { bindingForAttachment } from './session-binding.js';
+import { terminalMessageState } from '../sandbox-state/session/reduce.js';
+import type { Binding } from '../sandbox-state/model/session.js';
 import { createMessageCallbacks, type MessageCallbacks } from './message-callbacks.js';
 import {
   createReportOutbox,
@@ -264,8 +280,8 @@ import {
 import {
   readActiveSessionMessages,
   readRawSessionMessages,
-  writeSessionMessages,
-} from '../sandbox-state/persist/access.js';
+} from '../sandbox-state/persist/load.js';
+import { writeSessionMessages } from '../sandbox-state/persist/access.js';
 
 const METADATA_KEY = SANDBOX_SESSION_METADATA_KEY;
 const DELETED_WORKTREE_KEY = SANDBOX_SESSION_DELETED_WORKTREE_KEY;
@@ -289,8 +305,19 @@ const nativeRuntimeFenceSchema = z.object({
   authorization: sessionOperationAuthorizationSchema,
 });
 
-type MessageRecord = SessionMessageRecord;
+type MessageRecord = SessionMessage;
 type DispatchPhase = 'preparing' | 'attach' | 'prompt';
+
+/**
+ * Thrown inside a stop-commit transaction when the envelope write is rejected
+ * after the attachment/fence was cleared. Throwing (rather than returning) makes
+ * the outer `transactionSync` roll the clear and any hydration back.
+ */
+class StopCommitRejectedError extends Error {
+  constructor() {
+    super('stop_commit_rejected');
+  }
+}
 
 const MAX_TERMINAL_DETAIL_LENGTH = 4_096;
 
@@ -337,7 +364,7 @@ type ControlEventEvaluationRequest =
       epoch: number;
       publication:
         | { kind: 'event' }
-        | { kind: 'preparing'; loadTrigger: () => SessionMessageRecord | undefined };
+        | { kind: 'preparing'; loadTrigger: () => SessionMessage | undefined };
     }
   | { contract: 'currency_recheck'; input: ControlEventInput; epoch: number };
 
@@ -642,10 +669,10 @@ export class SandboxSession extends DurableObject<Env> {
       const existing = messages.find(message => message.messageId === outcome.data.messageId);
       const diagnostic = {
         messageId: existing?.messageId,
-        fromState: existing?.state,
+        fromState: existing?.state.kind,
         outcome: outcome.data.status,
       };
-      const proof = existing?.operations?.prompt ?? existing?.operations?.attach;
+      const proof = existing?.proofs?.prompt ?? existing?.proofs?.attach;
       if (proof?.dispatched)
         return result(
           false,
@@ -653,9 +680,13 @@ export class SandboxSession extends DurableObject<Env> {
           diagnostic
         );
       if (
-        existing?.wrapperInstanceId === input.wrapperInstanceId &&
-        existing.state === outcome.data.status
+        existing !== undefined &&
+        deliveryWrapperInstanceId(existing) === input.wrapperInstanceId &&
+        existing.state.kind === outcome.data.status
       ) {
+        // HEAD's duplicate-outcome acknowledgement requires the stored wrapper
+        // identity to match. Ordinary terminalization retains it; allocation loss
+        // clears it, so a replayed outcome for a stopped turn is not acknowledged.
         const receipt = hasReceiptIdentity
           ? this.commitControlEventReceipt(input, epoch)
           : this.terminalLifecycle.isCurrent(epoch)
@@ -672,7 +703,7 @@ export class SandboxSession extends DurableObject<Env> {
         if (currency !== 'apply') return result(false, currency, diagnostic);
       }
       const settled = applyMessageOutcome(
-        messages,
+        this.sessionAggregate(messages),
         outcome.data,
         input.wrapperInstanceId,
         Date.now()
@@ -682,9 +713,9 @@ export class SandboxSession extends DurableObject<Env> {
           false,
           !existing
             ? 'message_missing'
-            : existing.state !== 'queued' && existing.state !== 'accepted'
+            : existing.state.kind !== 'queued' && existing.state.kind !== 'accepted'
               ? 'already_terminal'
-              : existing.wrapperInstanceId !== input.wrapperInstanceId
+              : activeWrapperInstanceId(existing) !== input.wrapperInstanceId
                 ? 'runtime_mismatch'
                 : 'not_queue_head',
           diagnostic
@@ -692,7 +723,7 @@ export class SandboxSession extends DurableObject<Env> {
       }
       const receipt = hasReceiptIdentity
         ? this.saveMessages(
-            settled,
+            settled.messages,
             epoch,
             'wrapper_outcome',
             undefined,
@@ -712,7 +743,7 @@ export class SandboxSession extends DurableObject<Env> {
                   : ('receipt_conflict' as const);
             }
           )
-        : this.saveMessages(settled, epoch, 'wrapper_outcome')
+        : this.saveMessages(settled.messages, epoch, 'wrapper_outcome')
           ? ('apply' as const)
           : ('epoch_changed' as const);
       if (receipt !== 'apply')
@@ -759,7 +790,7 @@ export class SandboxSession extends DurableObject<Env> {
     if (
       (input.payload.type === 'question.asked' || input.payload.type === 'permission.asked') &&
       !this.loadMessages().some(
-        message => message.state === 'accepted' || message.state === 'queued'
+        message => message.state.kind === 'accepted' || message.state.kind === 'queued'
       )
     ) {
       if (!hasReceiptIdentity) return result(false, 'no_pending_work');
@@ -787,7 +818,11 @@ export class SandboxSession extends DurableObject<Env> {
       if (isRealTurnActivity(input.payload.type, input.payload.properties)) {
         const activeMessages = recordAcceptedMessageActivity(this.loadMessages(), Date.now());
         if (activeMessages && this.terminalLifecycle.isCurrent(epoch))
-          writeSessionMessages(this.ctx.storage.kv, activeMessages);
+          writeSessionMessages(
+            this.ctx.storage.kv,
+            this.sessionBinding(activeMessages),
+            activeMessages
+          );
       }
       this.recordControlEventReceipt(input);
       return 'apply' as const;
@@ -1021,9 +1056,12 @@ export class SandboxSession extends DurableObject<Env> {
     );
     if (!this.terminalLifecycle.isCurrent(epoch)) return result(false, 'epoch_changed');
     if (!message) return result(false, 'message_missing');
-    if (message.preparationAttemptId !== input.payload.attemptId)
+    // HEAD's attempt fence runs before the settled branch, against the retained
+    // message identity: a delayed event from an older attempt is rejected, while
+    // a same-attempt replay of a settled turn is acknowledged by receipt.
+    if (deliveryPreparationAttemptId(message) !== input.payload.attemptId)
       return result(false, 'attempt_mismatch');
-    if (message.state !== 'queued') {
+    if (message.state.kind !== 'queued') {
       if (
         this.evaluateControlEvent({
           contract: 'publication_admission',
@@ -1059,10 +1097,12 @@ export class SandboxSession extends DurableObject<Env> {
             const trigger = this.loadMessages().find(
               item => item.messageId === input.payload.triggerMessageId
             );
-            return trigger?.state === 'queued' &&
+            const state = trigger?.state;
+            return trigger !== undefined &&
+              state?.kind === 'queued' &&
               trigger.cancellation === undefined &&
-              trigger.preparationAttemptId === input.payload.attemptId &&
-              trigger.wrapperInstanceId === input.wrapperInstanceId
+              state.preparationAttemptId === input.payload.attemptId &&
+              state.wrapperInstanceId === input.wrapperInstanceId
               ? trigger
               : undefined;
           },
@@ -1145,6 +1185,7 @@ export class SandboxSession extends DurableObject<Env> {
         read: () => this.loadMessages(),
         commit: messages =>
           this.saveMessagesInCurrentTransaction(messages, epoch, 'operation_result', notifications),
+        aggregate: () => this.sessionAggregate(this.loadMessages()),
       },
       eventQueries: this.eventQueries,
       notifications,
@@ -1312,7 +1353,7 @@ export class SandboxSession extends DurableObject<Env> {
       return denied('authorization_state_changed');
     if (
       this.loadMessages().some(
-        message => message.state === 'accepted' || message.state === 'queued'
+        message => message.state.kind === 'accepted' || message.state.kind === 'queued'
       )
     ) {
       return { status: 'busy' };
@@ -1603,20 +1644,21 @@ export class SandboxSession extends DurableObject<Env> {
     if (!(await this.getMetadata())) return { type: 'session-not-found' };
     const record = this.loadMessages().find(message => message.messageId === messageId);
     if (!record) return { type: 'message-not-found' };
+    const kind = record.state.kind;
     const status =
-      record.state === 'queued'
+      kind === 'queued'
         ? 'queued'
-        : record.state === 'accepted'
+        : kind === 'accepted'
           ? 'running'
-          : record.state === 'cancelled'
+          : kind === 'cancelled'
             ? 'interrupted'
-            : record.state;
+            : kind;
     return {
       type: 'found',
       result: {
         messageId: record.messageId,
         status,
-        createdAt: record.acceptedAt ?? 0,
+        createdAt: acceptedAtOf(record) ?? 0,
         cloudAgentSessionId: this.requireSessionId(),
       },
     };
@@ -1666,32 +1708,36 @@ export class SandboxSession extends DurableObject<Env> {
     const metadata = this.terminalLifecycle.getStoredMetadata();
     const sandboxId = metadata?.workspace?.sandboxId;
     if (!metadata || !sandboxId || this.terminalLifecycle.captureEpoch() === null) return null;
-    const targets = this.loadMessages()
-      .filter(
-        message =>
-          (message.state === 'queued' || message.state === 'accepted') &&
+    const messages = this.loadMessages();
+    const targets = messages
+      .filter(message => {
+        const kind = message.state.kind;
+        return (
+          (kind === 'queued' || kind === 'accepted') &&
           message.cancellation === undefined &&
-          (!includeIdle || message.state === 'accepted' || message.wrapperInstanceId !== undefined)
-      )
-      .map(message => ({
-        messageId: message.messageId,
-        ...(message.wrapperInstanceId ? { wrapperInstanceId: message.wrapperInstanceId } : {}),
-        ...(message.executionDeadlineAt
-          ? { executionDeadlineAt: message.executionDeadlineAt }
-          : {}),
-      }));
-    const operations = this.loadMessages().flatMap(message => {
+          (!includeIdle || kind === 'accepted' || activeWrapperInstanceId(message) !== undefined)
+        );
+      })
+      .map(message => {
+        const wrapperInstanceId = activeWrapperInstanceId(message);
+        const executionDeadlineAt = message.proofs?.prompt?.executionDeadlineAt;
+        return {
+          messageId: message.messageId,
+          ...(wrapperInstanceId ? { wrapperInstanceId } : {}),
+          ...(executionDeadlineAt ? { executionDeadlineAt } : {}),
+        };
+      });
+    const operations = messages.flatMap(message => {
       const authorization = sessionOperationAuthorizationSchema.safeParse(
-        message.operations?.prompt?.authorization
+        message.proofs?.prompt?.authorization
       );
-      if (!authorization.success || !message.operations?.prompt?.dispatched) return [];
+      const executionDeadlineAt = message.proofs?.prompt?.executionDeadlineAt;
+      if (!authorization.success || !message.proofs?.prompt?.dispatched) return [];
       return [
         {
           messageId: message.messageId,
           authorization: authorization.data,
-          ...(message.executionDeadlineAt
-            ? { executionDeadlineAt: message.executionDeadlineAt }
-            : {}),
+          ...(executionDeadlineAt ? { executionDeadlineAt } : {}),
         },
       ];
     });
@@ -1720,12 +1766,12 @@ export class SandboxSession extends DurableObject<Env> {
     for (const authorization of requested) {
       const message = this.loadMessages().find(item => item.messageId === authorization.messageId);
       const stored = sessionOperationAuthorizationSchema.safeParse(
-        message?.operations?.prompt?.authorization
+        message?.proofs?.prompt?.authorization
       );
       if (
         !message ||
         !stored.success ||
-        !message.operations?.prompt?.dispatched ||
+        !message.proofs?.prompt?.dispatched ||
         !sameSessionOperation(stored.data, authorization) ||
         !this.terminalLifecycle.isCurrent(epoch)
       )
@@ -1740,7 +1786,7 @@ export class SandboxSession extends DurableObject<Env> {
   async cancelQueuedMessage(messageId: string): Promise<{ dropped: boolean }> {
     const epoch = this.terminalLifecycle.captureEpoch();
     if (epoch === null || this.deletedWorktreeId) return { dropped: false };
-    const result = cancelPendingMessage(this.loadMessages(), messageId);
+    const result = cancelPendingMessage(this.sessionAggregate(this.loadMessages()), messageId);
     if (!result.dropped) return { dropped: false };
     if (result.messages && !this.saveMessages(result.messages, epoch)) return { dropped: false };
     if (nextQueuedMessageId(this.loadMessages())) await this.armQueueRetry();
@@ -1759,14 +1805,20 @@ export class SandboxSession extends DurableObject<Env> {
       return { success: false, message: 'Session not found' };
     }
     const active = before.filter(
-      message => message.state === 'queued' || message.state === 'accepted'
+      message => message.state.kind === 'queued' || message.state.kind === 'accepted'
     );
     if (!active.length) return { success: false, message: 'No session work to interrupt' };
-    const accepted = active.find(message => message.state === 'accepted');
+    const accepted = active.find(message => message.state.kind === 'accepted');
     const metadata = this.terminalLifecycle.getStoredMetadata();
+    const now = Date.now();
     this.saveMessages(
       before.map(message =>
-        message.state === 'queued' ? { ...message, state: 'cancelled' } : message
+        message.state.kind === 'queued'
+          ? {
+              ...message,
+              state: terminalMessageState(message.state, 'cancelled', now, 'coordinator', {}),
+            }
+          : message
       ),
       epoch
     );
@@ -1779,7 +1831,12 @@ export class SandboxSession extends DurableObject<Env> {
     if (!this.isCurrentAcceptedMessage(accepted, epoch)) return { success: true };
     this.saveMessages(
       this.loadMessages().map(message =>
-        message.messageId === accepted.messageId ? { ...message, state: 'cancelled' } : message
+        message.messageId === accepted.messageId
+          ? {
+              ...message,
+              state: terminalMessageState(message.state, 'cancelled', now, 'coordinator', {}),
+            }
+          : message
       ),
       epoch
     );
@@ -1820,77 +1877,84 @@ export class SandboxSession extends DurableObject<Env> {
       return { outcome: 'failed', reason: 'stop_proof_missing' };
     }
 
-    const applied = this.ctx.storage.transactionSync((): boolean => {
-      const current = this.terminalLifecycle.getAttachedBinding();
-      if (!current) return true;
-      // The resolver read above is asynchronous: revalidate its outcome against
-      // the attachment actually bound when this transaction commits. A
-      // concurrent delete or rebind discards the stale resolver result (never the
-      // incoming STOPPED); only the same incarnation-less record may settle.
-      const sameAttachment =
-        current.wrapperInstanceId === initial.wrapperInstanceId &&
-        current.allocationIncarnation === initial.allocationIncarnation;
-      if (!sameAttachment && current.allocationIncarnation === undefined) return true;
-      if (sameAttachment && current.allocationIncarnation === undefined) {
-        if (resolution.kind === 'settle') {
-          const settled = settleStopped({
-            rows: readRawSessionMessages(this.ctx.storage.kv),
-            reason: input.reason,
-            now: Date.now(),
-          });
-          if (settled.outcome !== 'settled') return false;
-          // Clear the binding only after the writer accepts the commit for the
-          // current session epoch; a rejected write must not orphan the binding.
-          if (
-            !this.saveMessagesInCurrentTransaction(
-              [...settled.rows] as unknown as MessageRecord[],
-              epoch,
-              'coordinator'
-            )
-          ) {
-            return false;
+    let applied: boolean;
+    try {
+      applied = this.ctx.storage.transactionSync((): boolean => {
+        const current = this.terminalLifecycle.getAttachedBinding();
+        if (!current) return true;
+        // The resolver read above is asynchronous: revalidate its outcome against
+        // the attachment actually bound when this transaction commits. A
+        // concurrent delete or rebind discards the stale resolver result (never the
+        // incoming STOPPED); only the same incarnation-less record may settle.
+        const sameAttachment =
+          current.wrapperInstanceId === initial.wrapperInstanceId &&
+          current.allocationIncarnation === initial.allocationIncarnation;
+        if (!sameAttachment && current.allocationIncarnation === undefined) return true;
+        if (sameAttachment && current.allocationIncarnation === undefined) {
+          if (resolution.kind === 'settle') {
+            const settled = settleStopped({
+              messages: readRawSessionMessages(this.ctx.storage.kv),
+              reason: input.reason,
+              now: Date.now(),
+            });
+            if (settled.outcome !== 'settled') return false;
+            // Admission is confirmed before any mutation, so a rejected commit
+            // leaves the original attachment and envelope untouched.
+            if (!this.terminalLifecycle.isCurrent(epoch) || this.deletedWorktreeId) {
+              return false;
+            }
+            this.terminalLifecycle.clearAttachmentForStop({
+              wrapperInstanceId: current.wrapperInstanceId,
+            });
+            this.clearNativeRuntimeFenceForStop(sandboxId, current.wrapperInstanceId);
+            if (
+              !this.saveMessagesInCurrentTransaction([...settled.messages], epoch, 'coordinator')
+            ) {
+              throw new StopCommitRejectedError();
+            }
+            return true;
           }
-          this.terminalLifecycle.clearAttachmentForStop({
-            wrapperInstanceId: current.wrapperInstanceId,
-          });
-          this.clearNativeRuntimeFenceForStop(sandboxId, current.wrapperInstanceId);
-          return true;
+          if (resolution.kind !== 'hydrate') return true;
         }
-        if (resolution.kind !== 'hydrate') return true;
-      }
-      const incarnation =
-        current.allocationIncarnation ??
-        (sameAttachment && resolution.kind === 'hydrate' ? resolution.incarnation : undefined);
-      if (incarnation === undefined || input.stopProof === undefined) return false;
-      const decision = decideStopped({
-        rows: readRawSessionMessages(this.ctx.storage.kv),
-        attachment: {
-          allocationIncarnation: incarnation,
+        const incarnation =
+          current.allocationIncarnation ??
+          (sameAttachment && resolution.kind === 'hydrate' ? resolution.incarnation : undefined);
+        if (incarnation === undefined || input.stopProof === undefined) return false;
+        const decision = decideStopped({
+          messages: readRawSessionMessages(this.ctx.storage.kv),
+          attachment: {
+            allocationIncarnation: incarnation,
+            wrapperInstanceId: current.wrapperInstanceId,
+          },
+          event: { type: 'STOPPED', proof: input.stopProof, reason: input.reason },
+          now: Date.now(),
+        });
+        if (decision.outcome !== 'terminalized') return true;
+        // Hydration writes immediately, so write admission is confirmed before
+        // it: there is no "unhydrate", and the rejected path must stay
+        // mutation-free.
+        if (!this.terminalLifecycle.isCurrent(epoch) || this.deletedWorktreeId) {
+          return false;
+        }
+        if (current.allocationIncarnation === undefined) {
+          this.terminalLifecycle.hydrateAttachmentIncarnation(incarnation);
+        }
+        this.terminalLifecycle.clearAttachmentForStop({
           wrapperInstanceId: current.wrapperInstanceId,
-        },
-        event: { type: 'STOPPED', proof: input.stopProof, reason: input.reason },
-        now: Date.now(),
+          allocationIncarnation: incarnation,
+        });
+        this.clearNativeRuntimeFenceForStop(sandboxId, current.wrapperInstanceId);
+        // Encode the envelope from the final messages against the now-cleared
+        // attachment, so the persisted binding is `unbound`.
+        if (!this.saveMessagesInCurrentTransaction([...decision.messages], epoch, 'coordinator')) {
+          throw new StopCommitRejectedError();
+        }
+        return true;
       });
-      if (decision.outcome !== 'terminalized') return true;
-      if (
-        !this.saveMessagesInCurrentTransaction(
-          [...decision.rows] as unknown as MessageRecord[],
-          epoch,
-          'coordinator'
-        )
-      ) {
-        return false;
-      }
-      if (current.allocationIncarnation === undefined) {
-        this.terminalLifecycle.hydrateAttachmentIncarnation(incarnation);
-      }
-      this.terminalLifecycle.clearAttachmentForStop({
-        wrapperInstanceId: current.wrapperInstanceId,
-        allocationIncarnation: incarnation,
-      });
-      this.clearNativeRuntimeFenceForStop(sandboxId, current.wrapperInstanceId);
-      return true;
-    });
+    } catch (error) {
+      if (!(error instanceof StopCommitRejectedError)) throw error;
+      applied = false;
+    }
     // The transaction committed with immediate repair scheduling disabled, so
     // flush any deferred callback/report repair now (as the operation-result
     // commit path does) instead of waiting for unrelated later activity.
@@ -2068,7 +2132,7 @@ export class SandboxSession extends DurableObject<Env> {
     const message = this.loadMessages().find(
       current => current.messageId === authorization.data.messageId
     );
-    const proof = message?.operations?.attach;
+    const proof = message?.proofs?.attach;
     if (
       !proof?.dispatched ||
       !proof.completedAt ||
@@ -2084,7 +2148,7 @@ export class SandboxSession extends DurableObject<Env> {
     }
     const newestAttachmentEpoch = Math.max(
       0,
-      ...this.loadMessages().map(current => current.operations?.attach?.attachmentEpoch ?? 0)
+      ...this.loadMessages().map(current => current.proofs?.attach?.attachmentEpoch ?? 0)
     );
     const current = nativeRuntimeFenceSchema.safeParse(
       this.ctx.storage.kv.get<unknown>(NATIVE_RUNTIME_FENCE_KEY)
@@ -2299,31 +2363,35 @@ export class SandboxSession extends DurableObject<Env> {
   }
 
   private buildMessageReport(
-    message: SessionMessageRecord,
+    message: SessionMessage,
     anchor: ReportAnchor | undefined,
     acceptanceObserved: boolean
   ): CloudAgentQueueReport | undefined {
     const sessionId = this.sessionId;
     if (!sessionId) return undefined;
+    const kind = message.state.kind;
     const status: CloudAgentRunStateReport['run']['status'] =
-      message.state === 'cancelled' ? 'interrupted' : message.state;
+      kind === 'cancelled' ? 'interrupted' : kind;
     // `applyMessageOutcome` fills an inferred `acceptedAt` for a terminal
     // outcome that arrived before the ACK. Only a transition out of the
     // accepted state is observable dispatch acceptance.
+    const acceptedAt = acceptedAtOf(message);
     const dispatchAcceptedAt =
-      acceptanceObserved && message.acceptedAt !== undefined ? message.acceptedAt : undefined;
+      acceptanceObserved && acceptedAt !== undefined ? acceptedAt : undefined;
+    const queuedAt = queuedAtOf(message);
+    const terminalAt = terminalAtOf(message);
+    const terminalSource = terminalSourceOf(message);
+    const failedReason = failedReasonOf(message);
+    const assistantReason = assistantReasonOf(message);
+    const providerOwnership = providerOwnershipOf(message);
     const run: CloudAgentRunStateReport['run'] = {
       messageId: message.messageId,
       status,
-      ...(message.queuedAt === undefined
-        ? {}
-        : { queuedAt: new Date(message.queuedAt).toISOString() }),
+      ...(queuedAt === undefined ? {} : { queuedAt: new Date(queuedAt).toISOString() }),
       ...(dispatchAcceptedAt === undefined
         ? {}
         : { dispatchAcceptedAt: new Date(dispatchAcceptedAt).toISOString() }),
-      ...(message.terminalAt === undefined
-        ? {}
-        : { terminalAt: new Date(message.terminalAt).toISOString() }),
+      ...(terminalAt === undefined ? {} : { terminalAt: new Date(terminalAt).toISOString() }),
     };
     if (status === 'failed' || status === 'interrupted') {
       const dispatchState = acceptanceObserved ? ('accepted' as const) : ('pre_dispatch' as const);
@@ -2331,32 +2399,28 @@ export class SandboxSession extends DurableObject<Env> {
       // operation results copy arbitrary text, so they are not treated as a
       // known coordinator cause.
       const coordinatorOriginated =
-        message.terminalSource === undefined || message.terminalSource === 'coordinator';
+        terminalSource === undefined || terminalSource === 'coordinator';
       const classification = classifyControlPlaneRunFailure({
-        reason: coordinatorOriginated ? message.failedReason : undefined,
+        reason: coordinatorOriginated ? failedReason : undefined,
         dispatchState,
         status,
-        ...(message.assistantReason === undefined
+        ...(assistantReason === undefined ? {} : { assistantReason }),
+        ...(providerOwnership === undefined ? {} : { providerOwnership }),
+        ...(message.state.intent?.agent.model === undefined
           ? {}
-          : { assistantReason: message.assistantReason }),
-        ...(message.providerOwnership === undefined
-          ? {}
-          : { providerOwnership: message.providerOwnership }),
-        ...(message.intent?.agent.model === undefined
-          ? {}
-          : { admittedModel: message.intent.agent.model }),
+          : { admittedModel: message.state.intent.agent.model }),
       });
       run.failureStage = classification.stage;
       run.failureCode = classification.code;
       if (status === 'failed') {
         run.failureResponsibility = classification.responsibility;
         run.failureReason = classification.failureReason;
-        if (message.terminalAt !== undefined) {
+        if (terminalAt !== undefined) {
           run.diagnostic = {
             errorMessageRedacted:
               FAILED_RUN_DIAGNOSTIC_MESSAGES[classification.code] ??
               'Run failed without a classified cause',
-            errorExpiresAt: new Date(message.terminalAt + DIAGNOSTIC_RETENTION_MS).toISOString(),
+            errorExpiresAt: new Date(terminalAt + DIAGNOSTIC_RETENTION_MS).toISOString(),
           };
         }
       }
@@ -2392,7 +2456,7 @@ export class SandboxSession extends DurableObject<Env> {
    * and obligation commit atomically. Transport/downstream failures remain
    * asynchronous and nonfatal in the outbox repair path.
    */
-  private recordMessageReport(message: SessionMessageRecord, acceptanceObserved: boolean): void {
+  private recordMessageReport(message: SessionMessage, acceptanceObserved: boolean): void {
     const report = this.buildMessageReport(
       message,
       readReportAnchor(this.ctx.storage),
@@ -2400,30 +2464,28 @@ export class SandboxSession extends DurableObject<Env> {
     );
     if (!report) {
       throw new Error(
-        `Could not build Cloud Agent report obligation for message ${message.messageId} (${message.state})`
+        `Could not build Cloud Agent report obligation for message ${message.messageId} (${message.state.kind})`
       );
     }
     this.reportOutbox.record(report);
   }
 
   private snapshotDeletedMessages(metadata: SessionMetadata | null): void {
-    const messages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
+    const messages = readRawSessionMessages(this.ctx.storage.kv);
     const now = Date.now();
     const newlyTerminalMessageIds = new Set<string>();
-    const cancelled = messages.map(message => {
-      if (message.state !== 'queued' && message.state !== 'accepted') return message;
-      const acceptanceObserved = message.state === 'accepted';
-      const next = {
+    const cancelled = messages.map((message): SessionMessage => {
+      if (message.state.kind !== 'queued' && message.state.kind !== 'accepted') return message;
+      const acceptanceObserved = message.state.kind === 'accepted';
+      const next: SessionMessage = {
         ...message,
-        state: 'cancelled' as const,
-        terminalAt: now,
-        terminalSource: 'coordinator' as const,
+        state: terminalMessageState(message.state, 'cancelled', now, 'coordinator', {}),
       };
       newlyTerminalMessageIds.add(next.messageId);
       this.recordMessageReport(next, acceptanceObserved);
       return next;
     });
-    writeSessionMessages(this.ctx.storage.kv, cancelled);
+    writeSessionMessages(this.ctx.storage.kv, this.sessionBinding(cancelled), cancelled);
     this.messageCallbacks.persistDrainedBatchCallback(cancelled, newlyTerminalMessageIds, metadata);
   }
 
@@ -2663,9 +2725,9 @@ export class SandboxSession extends DurableObject<Env> {
     health: 'healthy' | 'stale';
   } | null> {
     const messages = this.loadMessages();
-    const accepted = messages.find(message => message.state === 'accepted');
+    const accepted = messages.find(message => message.state.kind === 'accepted');
     if (accepted) return { messageId: accepted.messageId, status: 'running', health: 'healthy' };
-    const queued = messages.find(message => message.state === 'queued');
+    const queued = messages.find(message => message.state.kind === 'queued');
     if (queued) return { messageId: queued.messageId, status: 'pending', health: 'healthy' };
     return null;
   }
@@ -2775,7 +2837,7 @@ export class SandboxSession extends DurableObject<Env> {
     epoch: number,
     kind: 'attach' | 'prompt' = 'prompt'
   ): Promise<'running' | 'completed' | 'rejected' | 'uncertain' | undefined> {
-    const proof = kind === 'attach' ? message.operations?.attach : message.operations?.prompt;
+    const proof = kind === 'attach' ? message.proofs?.attach : message.proofs?.prompt;
     const authorization = sessionOperationAuthorizationSchema.safeParse(proof?.authorization);
     if (!authorization.success || !proof?.dispatched) return undefined;
     const metadata = await this.getMetadata();
@@ -2797,19 +2859,21 @@ export class SandboxSession extends DurableObject<Env> {
           }),
         assertAdmission: () => {
           const current = this.loadMessages().find(item => item.messageId === message.messageId);
+          const wrapper = current ? deliveryWrapperInstanceId(current) : undefined;
           if (
             this.terminalLifecycle.isCurrent(epoch) &&
-            current?.wrapperInstanceId === authorization.data.wrapperInstanceId
+            wrapper === authorization.data.wrapperInstanceId
           )
             return;
           throw new Error('Original operation scope is unavailable');
         },
         assertScope: () => {
           const current = this.loadMessages().find(item => item.messageId === message.messageId);
+          const wrapper = current ? deliveryWrapperInstanceId(current) : undefined;
           if (
             this.terminalLifecycle.isCurrent(epoch) &&
-            current?.wrapperInstanceId === authorization.data.wrapperInstanceId &&
-            current.operations?.[kind]?.dispatched === true
+            wrapper === authorization.data.wrapperInstanceId &&
+            current?.proofs?.[kind]?.dispatched === true
           )
             return;
           throw new Error('Original operation scope is unavailable');
@@ -2841,11 +2905,10 @@ export class SandboxSession extends DurableObject<Env> {
     epoch: number
   ): Promise<void> {
     const messageId = queued.messageId;
-    const prompt = queued.operations?.prompt;
+    const prompt = queued.proofs?.prompt;
     const authorization = prompt?.authorization;
     if (!prompt?.dispatched || !authorization) return;
-    const promptDeadlineAt =
-      prompt.executionDeadlineAt ?? queued.executionDeadlineAt ?? authorization.dispatchDeadlineAt;
+    const promptDeadlineAt = prompt.executionDeadlineAt ?? authorization.dispatchDeadlineAt;
     let observed: 'running' | 'completed' | 'rejected' | 'uncertain' | undefined;
     try {
       observed = await this.observeAcceptedOperation(queued, epoch, 'prompt');
@@ -2857,18 +2920,131 @@ export class SandboxSession extends DurableObject<Env> {
     }
     if (!this.terminalLifecycle.isCurrent(epoch)) return;
     const current = this.loadMessages().find(message => message.messageId === messageId);
-    if (!current || current.state !== 'queued') return;
+    if (!current || current.state.kind !== 'queued') return;
     if (observed === 'running' || observed === 'completed') {
-      const accepted = acceptQueuedMessage(this.loadMessages(), messageId, Date.now());
-      if (accepted && this.saveMessages(accepted, epoch))
-        await this.armQueueRetry(Date.now() + DEADLINE_MS.acceptedAlarmCap);
-      return;
+      // ACCEPT requires a bound aggregate. Recover the authoritative incarnation
+      // from the control's canonical state instead of redispatching the prompt.
+      const sandboxId = this.terminalLifecycle.getStoredMetadata()?.workspace?.sandboxId;
+      const recovered = await this.recoverReconcileBinding(
+        sandboxId,
+        epoch,
+        messageId,
+        authorization
+      );
+      if (recovered === 'settled') return;
+      if (recovered === 'bound' || recovered === 'hydrated') {
+        const accepted = acceptQueuedMessage(
+          this.sessionAggregate(this.loadMessages()),
+          messageId,
+          Date.now()
+        );
+        if (accepted && this.saveMessages(accepted.messages, epoch)) {
+          await this.armQueueRetry(Date.now() + DEADLINE_MS.acceptedAlarmCap);
+          return;
+        }
+      }
+      // `unresolved`/`aborted`, or acceptance is still impossible: fall through
+      // to the execution bound so the bounded reconciliation and its deadline
+      // stay in force and the head cannot stay queued forever.
     }
     if (observed === 'rejected' || Date.now() >= promptDeadlineAt) {
-      await this.failDelivery(messageId, 'prompt_exhausted', current.wrapperInstanceId, 'message');
+      await this.failDelivery(
+        messageId,
+        'prompt_exhausted',
+        activeWrapperInstanceId(current),
+        'message'
+      );
       return;
     }
     await this.armQueueRetry(Math.min(promptDeadlineAt, Date.now() + QUEUE_RETRY_MS));
+  }
+
+  /**
+   * Recover the authoritative allocation incarnation for an incarnation-less
+   * (pre-C3b) attachment so an accepted prompt can be bound without redispatch.
+   * The resolver is asynchronous, so its outcome is revalidated against the
+   * attachment and the message/proof identity before it is applied. Returns
+   * `bound` when a real incarnation is already recorded.
+   */
+  private async recoverReconcileBinding(
+    sandboxId: string | undefined,
+    epoch: number,
+    messageId: string,
+    authorization: SessionOperationAuthorization
+  ): Promise<'bound' | 'hydrated' | 'settled' | 'unresolved' | 'aborted'> {
+    const initial = this.terminalLifecycle.getAttachedBinding();
+    if (initial?.allocationIncarnation !== undefined) return 'bound';
+    if (!initial || sandboxId === undefined) return 'unresolved';
+    let resolution: Awaited<ReturnType<SandboxSession['resolveLegacyStopAttachment']>>;
+    try {
+      resolution = await this.resolveLegacyStopAttachment(sandboxId, initial.wrapperInstanceId);
+    } catch {
+      return 'unresolved';
+    }
+    if (!this.terminalLifecycle.isCurrent(epoch) || this.deletedWorktreeId) return 'aborted';
+    const attachment = this.terminalLifecycle.getAttachedBinding();
+    const sameAttachment =
+      attachment?.wrapperInstanceId === initial.wrapperInstanceId &&
+      attachment.allocationIncarnation === undefined;
+    const messages = this.loadMessages();
+    const current = messages.find(message => message.messageId === messageId);
+    const stored = current?.proofs?.prompt;
+    const sameProof =
+      current?.state.kind === 'queued' &&
+      nextQueuedMessageId(messages) === messageId &&
+      stored?.dispatched === true &&
+      stored.authorization !== undefined &&
+      sameSessionOperation(stored.authorization, authorization);
+    if (!sameAttachment || !sameProof) return 'aborted';
+    if (resolution.kind === 'hydrate') {
+      return this.terminalLifecycle.hydrateAttachmentIncarnation(resolution.incarnation)
+        ? 'hydrated'
+        : 'unresolved';
+    }
+    if (resolution.kind === 'settle') {
+      return this.settleReconciledHead(epoch, sandboxId) ? 'settled' : 'aborted';
+    }
+    return 'unresolved';
+  }
+
+  /**
+   * Proof-independent settlement for a head whose allocation the control no
+   * longer knows about. Clears the incarnation-less attachment and persists an
+   * `unbound` envelope in one transaction; a post-clear write rejection throws
+   * so the clear rolls back.
+   */
+  private settleReconciledHead(epoch: number, sandboxId: string): boolean {
+    let applied: boolean;
+    try {
+      applied = this.ctx.storage.transactionSync((): boolean => {
+        if (!this.terminalLifecycle.isCurrent(epoch) || this.deletedWorktreeId) return false;
+        const attachment = this.terminalLifecycle.getAttachedBinding();
+        const settled = settleStopped({
+          messages: readRawSessionMessages(this.ctx.storage.kv),
+          reason: 'environment_stopped',
+          now: Date.now(),
+        });
+        if (settled.outcome !== 'settled') return false;
+        if (attachment) {
+          this.terminalLifecycle.clearAttachmentForStop({
+            wrapperInstanceId: attachment.wrapperInstanceId,
+          });
+          this.clearNativeRuntimeFenceForStop(sandboxId, attachment.wrapperInstanceId);
+        }
+        if (!this.saveMessagesInCurrentTransaction([...settled.messages], epoch, 'coordinator')) {
+          throw new StopCommitRejectedError();
+        }
+        return true;
+      });
+    } catch (error) {
+      if (error instanceof StopCommitRejectedError) return false;
+      throw error;
+    }
+    // The commit disables immediate repair scheduling, so flush the deferred
+    // callback/report repair after the transaction succeeds (as the STOPPED and
+    // operation-result commit paths do).
+    if (applied) this.scheduleCallbackRepairIfRequired();
+    return applied;
   }
 
   /** True when the current queue head has already dispatched its prompt. */
@@ -2876,7 +3052,7 @@ export class SandboxSession extends DurableObject<Env> {
     const messages = this.loadMessages();
     const headId = nextQueuedMessageId(messages);
     const head = headId ? messages.find(message => message.messageId === headId) : undefined;
-    return head?.operations?.prompt?.dispatched === true;
+    return head?.proofs?.prompt?.dispatched === true;
   }
 
   async alarm(): Promise<void> {
@@ -2894,13 +3070,14 @@ export class SandboxSession extends DurableObject<Env> {
     const messages = this.loadMessages();
     if (!this.terminalLifecycle.isCurrent(epoch)) return;
     const accepted = messages.find(
-      message => message.state === 'accepted' && message.cancellation === undefined
+      message => message.state.kind === 'accepted' && message.cancellation === undefined
     );
-    if (accepted) {
+    const acceptedState = accepted?.state.kind === 'accepted' ? accepted.state : undefined;
+    if (accepted && acceptedState) {
       const decision = acceptedAlarmDecision(
-        accepted.acceptedAt ?? 0,
+        acceptedState.acceptedAt,
         now,
-        accepted.lastActivityAt
+        acceptedState.lastActivityAt
       );
       if (decision.action === 'rearm') {
         await this.armQueueRetry(decision.at);
@@ -2911,10 +3088,10 @@ export class SandboxSession extends DurableObject<Env> {
       const diagnostic: ControlDiagnosticFields = {
         sessionId: this.sessionId,
         messageId: accepted.messageId,
-        expectedWrapperInstanceId: accepted.wrapperInstanceId,
+        expectedWrapperInstanceId: acceptedState.wrapperInstanceId,
         epoch,
-        acceptedAt: accepted.acceptedAt,
-        lastActivityAt: accepted.lastActivityAt,
+        acceptedAt: acceptedState.acceptedAt,
+        lastActivityAt: acceptedState.lastActivityAt,
         stage: 'sync',
       };
       const report = (result: 'healthy' | 'superseded' | 'runtime_unhealthy' | 'inactivity') =>
@@ -2925,7 +3102,7 @@ export class SandboxSession extends DurableObject<Env> {
         );
       logControlDiagnostic('accepted_reconciliation', { ...diagnostic, phase: 'started' });
       try {
-        if (accepted.operations?.prompt?.dispatched) {
+        if (accepted.proofs?.prompt?.dispatched) {
           diagnostic.stage = 'operation_receipt';
           const observed = await this.observeAcceptedOperation(accepted, epoch);
           if (observed === 'running' || observed === 'completed') {
@@ -2983,7 +3160,7 @@ export class SandboxSession extends DurableObject<Env> {
           await this.failDelivery(
             accepted.messageId,
             'runtime_unhealthy',
-            accepted.wrapperInstanceId
+            acceptedState.wrapperInstanceId
           );
         } else {
           diagnostic.reason = 'accepted_message_changed';
@@ -3012,10 +3189,11 @@ export class SandboxSession extends DurableObject<Env> {
     diagnostic: ControlDiagnosticFields
   ): Promise<boolean> {
     const current = this.loadMessages().find(item => item.messageId === accepted.messageId);
-    const activityAt = current?.lastActivityAt ?? current?.acceptedAt;
+    const currentState = current?.state.kind === 'accepted' ? current.state : undefined;
+    const activityAt = currentState?.lastActivityAt ?? currentState?.acceptedAt;
     if (
       !current ||
-      current.state !== 'accepted' ||
+      !currentState ||
       activityAt === undefined ||
       !acceptedInactivityDue(activityAt, Date.now())
     )
@@ -3023,14 +3201,14 @@ export class SandboxSession extends DurableObject<Env> {
     diagnostic.stage = 'inactivity';
     diagnostic.reason = 'inactivity_due';
     diagnostic.lastActivityAt = activityAt;
-    const messages = failAcceptedMessage(
-      this.loadMessages(),
+    const failed = failAcceptedMessage(
+      this.sessionAggregate(this.loadMessages()),
       current.messageId,
       'accepted_overdue',
       'Turn did not complete'
     );
-    if (!messages || !this.saveMessages(messages, epoch)) return false;
-    if (nextQueuedMessageId(messages)) await this.armQueueRetry();
+    if (!failed || !this.saveMessages(failed.messages, epoch)) return false;
+    if (nextQueuedMessageId(failed.messages)) await this.armQueueRetry();
     return true;
   }
 
@@ -3041,8 +3219,9 @@ export class SandboxSession extends DurableObject<Env> {
    */
   private async scheduleAcceptedRecheck(epoch: number, messageId: string): Promise<void> {
     const current = this.loadMessages().find(item => item.messageId === messageId);
-    if (!this.terminalLifecycle.isCurrent(epoch) || current?.state !== 'accepted') return;
-    const activityAt = current.lastActivityAt ?? current.acceptedAt;
+    const currentState = current?.state.kind === 'accepted' ? current.state : undefined;
+    if (!this.terminalLifecycle.isCurrent(epoch) || !currentState) return;
+    const activityAt = currentState.lastActivityAt ?? currentState.acceptedAt;
     if (activityAt === undefined) {
       await this.armQueueRetry(Date.now() + DEADLINE_MS.acceptedAlarmCap);
       return;
@@ -3070,7 +3249,7 @@ export class SandboxSession extends DurableObject<Env> {
       return;
     }
     const current = this.loadMessages().find(
-      message => message.state === 'accepted' && message.cancellation === undefined
+      message => message.state.kind === 'accepted' && message.cancellation === undefined
     );
     if (current) await this.scheduleAcceptedRecheck(epoch, current.messageId);
   }
@@ -3102,7 +3281,7 @@ export class SandboxSession extends DurableObject<Env> {
         }
       : input;
     const messageId = input.turn.messageId;
-    const messages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
+    const messages = readRawSessionMessages(this.ctx.storage.kv);
     const existing = messages.find(message => message.messageId === messageId);
     const intent = existing
       ? undefined
@@ -3190,7 +3369,7 @@ export class SandboxSession extends DurableObject<Env> {
       if (!this.terminalLifecycle.isCurrent(epoch) || !latestMetadata) {
         return { success: false, code: 'NOT_FOUND', error: 'Session not found' };
       }
-      const latestMessages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
+      const latestMessages = readRawSessionMessages(this.ctx.storage.kv);
       const duplicate = latestMessages.find(message => message.messageId === messageId);
       if (duplicate) {
         const [frozen] = freezeLegacyQueuedMessages(
@@ -3198,14 +3377,15 @@ export class SandboxSession extends DurableObject<Env> {
           latestMetadata.agent,
           latestMetadata.workspace?.worktreeId ? latestMetadata.finalization : undefined
         );
+        const frozenIntent = frozen.state.intent;
         if (
           !matchesSessionMessageReplay(frozen, intent ?? input) ||
           (intent &&
-            frozen.intent &&
-            (intent.agent.variant !== frozen.intent.agent.variant ||
-              intent.finalization?.autoCommit !== frozen.intent.finalization?.autoCommit ||
+            frozenIntent &&
+            (intent.agent.variant !== frozenIntent.agent.variant ||
+              intent.finalization?.autoCommit !== frozenIntent.finalization?.autoCommit ||
               intent.finalization?.condenseOnComplete !==
-                frozen.intent.finalization?.condenseOnComplete))
+                frozenIntent.finalization?.condenseOnComplete))
         ) {
           return {
             success: false,
@@ -3217,7 +3397,7 @@ export class SandboxSession extends DurableObject<Env> {
           success: true,
           outcome: 'queued',
           messageId,
-          compatibilityDelivery: duplicate.state === 'accepted' ? 'sent' : 'queued',
+          compatibilityDelivery: duplicate.state.kind === 'accepted' ? 'sent' : 'queued',
         };
       }
       if (validationFailure) return validationFailure;
@@ -3226,11 +3406,11 @@ export class SandboxSession extends DurableObject<Env> {
       const callbackFlow =
         latestMetadata.callback?.target !== undefined || pendingCallbackCount > 0;
       const outstandingMessages = latestMessages.filter(
-        message => message.state === 'queued' || message.state === 'accepted'
+        message => message.state.kind === 'queued' || message.state.kind === 'accepted'
       ).length;
       const pendingCount = callbackFlow
         ? outstandingMessages + pendingCallbackCount
-        : latestMessages.filter(message => message.state === 'queued').length;
+        : latestMessages.filter(message => message.state.kind === 'queued').length;
       if (pendingCount >= PENDING_SESSION_MESSAGE_LIMIT) {
         return {
           success: false,
@@ -3243,9 +3423,10 @@ export class SandboxSession extends DurableObject<Env> {
         latestMetadata.agent,
         latestMetadata.workspace?.worktreeId ? latestMetadata.finalization : undefined
       );
-      const queuedMessage: SessionMessageRecord = {
-        ...createSessionMessageRecord(intent),
-        queuedAt: Date.now(),
+      const created = createSessionMessageRecord(intent);
+      const queuedMessage: SessionMessage = {
+        ...created,
+        state: { ...created.state, queuedAt: Date.now() },
       };
       nextMessages.push(queuedMessage);
       const nextMetadata =
@@ -3255,7 +3436,7 @@ export class SandboxSession extends DurableObject<Env> {
               model: intent.agent.model,
               variant: intent.agent.variant,
             });
-      writeSessionMessages(this.ctx.storage.kv, nextMessages);
+      writeSessionMessages(this.ctx.storage.kv, this.sessionBinding(nextMessages), nextMessages);
       if (nextMetadata) {
         this.ctx.storage.kv.put(METADATA_KEY, serializeSessionMetadata(nextMetadata));
       }
@@ -3311,7 +3492,7 @@ export class SandboxSession extends DurableObject<Env> {
       return;
     }
     const assigned = this.ctx.storage.transactionSync(() => {
-      const messages = readRawSessionMessages<MessageRecord>(this.ctx.storage.kv);
+      const messages = readRawSessionMessages(this.ctx.storage.kv);
       if (!this.terminalLifecycle.isCurrent(epoch) || nextQueuedMessageId(messages) !== messageId) {
         return undefined;
       }
@@ -3319,37 +3500,49 @@ export class SandboxSession extends DurableObject<Env> {
         messages,
         metadata.agent,
         metadata.workspace?.worktreeId ? metadata.finalization : undefined
-      ).map(message =>
-        message.messageId === messageId && message.deliveryDeadlineAt === undefined
-          ? { ...message, deliveryDeadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS }
-          : message
-      );
+      ).map(message => {
+        if (message.messageId !== messageId || message.state.kind !== 'queued') return message;
+        if (message.state.deadlineAt !== null) return message;
+        return {
+          ...message,
+          state: {
+            ...message.state,
+            deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS,
+          },
+        };
+      });
       const prepared = assignPreparationAttemptId(frozen, messageId, () => crypto.randomUUID());
-      if (prepared) writeSessionMessages(this.ctx.storage.kv, prepared.messages);
+      if (prepared)
+        writeSessionMessages(
+          this.ctx.storage.kv,
+          this.sessionBinding(prepared.messages),
+          prepared.messages
+        );
       return prepared;
     });
     if (!assigned) return;
     const queued = assigned.messages.find(message => message.messageId === messageId);
-    const deadlineAt = queued?.deliveryDeadlineAt;
-    if (!queued || deadlineAt === undefined) return;
-    if (Date.now() >= deadlineAt && !queued.operations?.prompt?.dispatched) {
+    const queuedState = queued?.state.kind === 'queued' ? queued.state : undefined;
+    const deadlineAt = queuedState?.deadlineAt ?? undefined;
+    if (!queued || !queuedState || deadlineAt === undefined) return;
+    if (Date.now() >= deadlineAt && !queued.proofs?.prompt?.dispatched) {
       await this.failDelivery(
         messageId,
         'preparation_timeout',
-        queued.wrapperInstanceId,
-        queued.deliveryRetryScope
+        activeWrapperInstanceId(queued),
+        queuedState.deliveryRetryScope
       );
       return;
     }
-    if (queued.retryNotBefore !== undefined && queued.retryNotBefore > Date.now()) {
-      await this.armQueueRetry(Math.min(deadlineAt, queued.retryNotBefore));
+    if (queuedState.retryNotBefore !== undefined && queuedState.retryNotBefore > Date.now()) {
+      await this.armQueueRetry(Math.min(deadlineAt, queuedState.retryNotBefore));
       return;
     }
     // A dispatched queue head is past environment preparation. Reconcile the
     // ORIGINAL prompt authorization against its own execution bound instead of
     // re-running acquisition/preparation, and never schedule it against the
     // (possibly expired) preparation deadline. It must not rotate.
-    if (queued.operations?.prompt?.dispatched === true) {
+    if (queued.proofs?.prompt?.dispatched === true) {
       await this.reconcileQueuedDispatchedPrompt(queued, epoch);
       return;
     }
@@ -3361,7 +3554,7 @@ export class SandboxSession extends DurableObject<Env> {
     const provider = getSandboxProvider(metadata);
     let acquisition = provider === 'cloudflare' ? { id: attemptId, deadlineAt } : undefined;
     const allowCreate = acquisition === undefined && options?.allowCreate === true;
-    let wrapperInstanceId = queued.wrapperInstanceId;
+    let wrapperInstanceId = activeWrapperInstanceId(queued);
     const isCurrent = () => this.queuedMessage(messageId, epoch, wrapperInstanceId) !== undefined;
     const wait = <T>(operation: () => Promise<T>, timeoutMs?: number) =>
       withDeliveryDeadline(operation, deadlineAt, timeoutMs);
@@ -3369,22 +3562,26 @@ export class SandboxSession extends DurableObject<Env> {
       const runtime = wrapperInstanceIdSchema.safeParse(identity);
       if (!runtime.success) return;
       const current = this.loadMessages().find(message => message.messageId === messageId);
+      const currentState = current?.state.kind === 'queued' ? current.state : undefined;
       if (
-        current?.wrapperInstanceId !== undefined &&
-        current.wrapperInstanceId !== runtime.data &&
-        (current.operations?.attach?.dispatched || current.operations?.prompt?.dispatched)
+        currentState?.wrapperInstanceId !== undefined &&
+        currentState.wrapperInstanceId !== runtime.data &&
+        (current?.proofs?.attach?.dispatched || current?.proofs?.prompt?.dispatched)
       )
         return;
       const saved = this.saveMessages(
         this.loadMessages().map(message =>
-          message.messageId === messageId
+          message.messageId === messageId && message.state.kind === 'queued'
             ? {
                 ...message,
-                wrapperInstanceId: runtime.data,
-                unresolvedDispatch:
-                  message.wrapperInstanceId === runtime.data
-                    ? message.unresolvedDispatch
-                    : undefined,
+                state: {
+                  ...message.state,
+                  wrapperInstanceId: runtime.data,
+                  unresolvedDispatch:
+                    message.state.wrapperInstanceId === runtime.data
+                      ? message.state.unresolvedDispatch
+                      : undefined,
+                },
               }
             : message
         ),
@@ -3400,19 +3597,22 @@ export class SandboxSession extends DurableObject<Env> {
       kind: 'attach' | 'prompt',
       operation: () => Promise<T>
     ): Promise<T> => {
-      const unresolved = this.queuedMessage(
-        messageId,
-        epoch,
-        wrapperInstanceId
-      )?.unresolvedDispatch;
+      const dispatchCurrent = this.queuedMessage(messageId, epoch, wrapperInstanceId);
+      const unresolved =
+        dispatchCurrent?.state.kind === 'queued'
+          ? dispatchCurrent.state.unresolvedDispatch
+          : undefined;
       const unresolvedPrompt =
         unresolved && this.terminalLifecycle.getAttachedWrapperInstanceId() === wrapperInstanceId;
       const recordUnresolved = (unresolvedDispatch: true | undefined) => {
         if (!isCurrent()) return;
         this.saveMessages(
           this.loadMessages().map(message =>
-            message.messageId === messageId
-              ? { ...message, unresolvedDispatch, deliveryRetryScope: undefined }
+            message.messageId === messageId && message.state.kind === 'queued'
+              ? {
+                  ...message,
+                  state: { ...message.state, unresolvedDispatch, deliveryRetryScope: undefined },
+                }
               : message
           ),
           epoch
@@ -3466,24 +3666,24 @@ export class SandboxSession extends DurableObject<Env> {
               if (!this.terminalLifecycle.isCurrent(epoch))
                 throw new Error('Session operation scope changed');
               const current = this.loadMessages().find(message => message.messageId === messageId);
-              if (!current || current.wrapperInstanceId !== wrapperInstanceId)
+              if (!current || deliveryWrapperInstanceId(current) !== wrapperInstanceId)
                 throw new Error('Session operation scope changed');
             },
             assertScope: () => {
               if (!this.terminalLifecycle.isCurrent(epoch))
                 throw new Error('Session operation scope changed');
               const current = this.loadMessages().find(message => message.messageId === messageId);
-              if (!current || current.wrapperInstanceId !== wrapperInstanceId)
+              if (!current || deliveryWrapperInstanceId(current) !== wrapperInstanceId)
                 throw new Error('Session operation scope changed');
               if (
-                current.operations?.[operation === 'session.attach' ? 'attach' : 'prompt']
+                current.proofs?.[operation === 'session.attach' ? 'attach' : 'prompt']
                   ?.dispatched === true
               )
                 return;
               if (
                 operation === 'session.attach' &&
-                current.operations?.retiredAttach &&
-                sameSessionOperation(current.operations.retiredAttach.authorization, authorization)
+                current.proofs?.retiredAttach &&
+                sameSessionOperation(current.proofs.retiredAttach.authorization, authorization)
               )
                 return;
               throw new Error('Session operation scope changed');
@@ -3540,16 +3740,16 @@ export class SandboxSession extends DurableObject<Env> {
     };
     await this.armQueueRetry(Math.min(deadlineAt, Date.now() + QUEUE_RETRY_MS));
     if (!isCurrent()) return;
-    if (Date.now() >= deadlineAt && !queued.operations?.prompt?.dispatched) {
+    if (Date.now() >= deadlineAt && !queued.proofs?.prompt?.dispatched) {
       await this.failDelivery(
         messageId,
         'preparation_timeout',
         wrapperInstanceId,
-        queued.deliveryRetryScope
+        queuedState.deliveryRetryScope
       );
       return;
     }
-    const intent = queued.intent;
+    const intent = queuedState.intent;
     const model = dispatchedKilocodeModelId(intent?.agent.model);
     const control = sandboxControlRpc(this.env, sandboxId);
     let recorder = createPreparationProgressRecorder({
@@ -3618,14 +3818,16 @@ export class SandboxSession extends DurableObject<Env> {
       !intent ||
       ((intent.turn.type === 'prompt' || intent.agent.model !== undefined) && !model)
     ) {
-      const failedMessages = failQueuedMessage(this.loadMessages(), messageId);
-      const failed = failedMessages?.find(message => message.messageId === messageId);
-      if (!failedMessages || !failed) return;
-      failed.failedReason = 'invalid_model';
-      if (!this.saveMessages(failedMessages, epoch)) return;
+      const failed = failQueuedMessage(
+        this.sessionAggregate(this.loadMessages()),
+        messageId,
+        'invalid_model'
+      );
+      if (!failed) return;
+      if (!this.saveMessages(failed.messages, epoch)) return;
       if (!this.terminalLifecycle.isCurrent(epoch)) return;
       recorder.finalize({ status: 'failed', safeError: 'Session is missing a valid model' });
-      if (nextQueuedMessageId(failedMessages)) await this.armQueueRetry();
+      if (nextQueuedMessageId(failed.messages)) await this.armQueueRetry();
       return;
     }
     let phase: DispatchPhase = 'preparing';
@@ -3635,14 +3837,15 @@ export class SandboxSession extends DurableObject<Env> {
     try {
       validateControlSessionOptions(metadata);
       const session = { sessionId, kiloSessionId, directory: this.directory(metadata) };
+      const turn = getSessionMessageTurn(queued);
       const attachments =
-        intent.turn.type === 'prompt'
+        turn?.type === 'prompt'
           ? await wait(() =>
               buildSignedPromptAttachments({
                 env: this.env,
                 userId: metadata.identity.userId,
                 sessionId,
-                attachments: intent.turn.type === 'prompt' ? intent.turn.attachments : undefined,
+                attachments: turn.attachments,
                 createdOnPlatform: metadata.identity.createdOnPlatform,
               })
             )
@@ -3739,7 +3942,7 @@ export class SandboxSession extends DurableObject<Env> {
       // After the dispatched-prompt early return above, the only prompt proof
       // that can remain here is an authoritative not-admitted rejection, which
       // needs no receipt capability. Only a still-live attach proof does.
-      const proofBacked = queued.operations?.attach?.dispatched === true;
+      const proofBacked = queued.proofs?.attach?.dispatched === true;
       if (proofBacked && !operationResults)
         throw new ControlRequestError({
           code: 'runtime_unhealthy',
@@ -3947,8 +4150,12 @@ export class SandboxSession extends DurableObject<Env> {
         const dispatched = await dispatchAuthorized('session.prompt', promptPayload);
         if (dispatched.state === 'completed') return;
         if (dispatched.state === 'running') {
-          const accepted = acceptQueuedMessage(this.loadMessages(), messageId, Date.now());
-          if (!accepted || !this.saveMessages(accepted, epoch)) return;
+          const accepted = acceptQueuedMessage(
+            this.sessionAggregate(this.loadMessages()),
+            messageId,
+            Date.now()
+          );
+          if (!accepted || !this.saveMessages(accepted.messages, epoch)) return;
           await this.armQueueRetry(Date.now() + DEADLINE_MS.acceptedAlarmCap);
           return;
         }
@@ -3974,9 +4181,13 @@ export class SandboxSession extends DurableObject<Env> {
           await this.compensateSessionAttachment(metadata);
         return;
       }
-      const accepted = acceptQueuedMessage(this.loadMessages(), messageId, Date.now());
+      const accepted = acceptQueuedMessage(
+        this.sessionAggregate(this.loadMessages()),
+        messageId,
+        Date.now()
+      );
       if (!accepted) return;
-      if (!this.saveMessages(accepted, epoch)) return;
+      if (!this.saveMessages(accepted.messages, epoch)) return;
       await this.armQueueRetry(Date.now() + DEADLINE_MS.acceptedAlarmCap);
     } catch (error) {
       if (!isCurrent()) {
@@ -4028,7 +4239,8 @@ export class SandboxSession extends DurableObject<Env> {
     const messages = this.loadMessages();
     if (nextQueuedMessageId(messages) !== messageId) return undefined;
     const message = messages.find(item => item.messageId === messageId);
-    return wrapperInstanceId === undefined || message?.wrapperInstanceId === wrapperInstanceId
+    return wrapperInstanceId === undefined ||
+      (message !== undefined && activeWrapperInstanceId(message) === wrapperInstanceId)
       ? message
       : undefined;
   }
@@ -4053,7 +4265,7 @@ export class SandboxSession extends DurableObject<Env> {
           messageId,
           'preparation_timeout',
           wrapperInstanceId,
-          message.deliveryRetryScope
+          message.state.kind === 'queued' ? message.state.deliveryRetryScope : undefined
         );
         return;
       }
@@ -4069,22 +4281,23 @@ export class SandboxSession extends DurableObject<Env> {
     const retryableRejection =
       rejection && error instanceof ControlRequestError && error.code !== 'runtime_unhealthy';
     const detail = confirmedControlRejectionDetail(error);
-    const attachProof = message.operations?.attach;
+    const attachProof = message.proofs?.attach;
     const attachRejectionAlreadyCounted = attachProof?.rejectionReceived === true;
     const countAttachRejection = phase === 'attach' && rejection && !attachRejectionAlreadyCounted;
     const completedAttachFailure =
-      message.operations?.attach?.dispatched === true &&
-      message.operations.attach.result?.ok === false;
+      message.proofs?.attach?.dispatched === true && message.proofs.attach.result?.ok === false;
     const retryableCompletedAttach =
       phase !== 'prompt' &&
       retryableRejection &&
       isRetryableDeliveryError(error) &&
       completedAttachFailure;
+    const unresolvedDispatch =
+      message.state.kind === 'queued' ? message.state.unresolvedDispatch : undefined;
     const messageRetryScope =
       phase === 'attach'
-        ? (attachInPreparation && retryableRejection && !message.unresolvedDispatch) ||
+        ? (attachInPreparation && retryableRejection && !unresolvedDispatch) ||
           retryableCompletedAttach
-        : retryableRejection && !message.unresolvedDispatch;
+        : retryableRejection && !unresolvedDispatch;
     const scope: 'message' | 'runtime' = messageRetryScope ? 'message' : 'runtime';
     if (Date.now() >= deadlineAt) {
       await this.failDelivery(messageId, 'preparation_timeout', wrapperInstanceId, scope, detail);
@@ -4106,7 +4319,9 @@ export class SandboxSession extends DurableObject<Env> {
         : incrementDeliveryFailure(nextMessages, messageId, phase);
     const messages = (updated?.messages ?? nextMessages).map(
       (message): MessageRecord =>
-        message.messageId === messageId ? { ...message, deliveryRetryScope: scope } : message
+        message.messageId === messageId && message.state.kind === 'queued'
+          ? { ...message, state: { ...message.state, deliveryRetryScope: scope } }
+          : message
     );
     if (!this.saveMessages(messages, epoch)) return;
     if (retryableCompletedAttach && !updated?.exhausted) {
@@ -4140,18 +4355,24 @@ export class SandboxSession extends DurableObject<Env> {
     const epoch = this.terminalLifecycle.captureEpoch();
     const metadata = this.terminalLifecycle.getStoredMetadata();
     const message = this.loadMessages().find(item => item.messageId === messageId);
+    const kind = message?.state.kind;
     if (
       epoch === null ||
       !metadata ||
       !message ||
-      (message.state !== 'queued' && message.state !== 'accepted') ||
-      message.wrapperInstanceId !== wrapperInstanceId
+      (kind !== 'queued' && kind !== 'accepted') ||
+      activeWrapperInstanceId(message) !== wrapperInstanceId
     )
       return;
     if (scope === 'message') {
-      const messages = failQueuedMessage(this.loadMessages(), messageId, reason, detail);
-      if (!messages || !this.saveMessages(messages, epoch)) return;
-      if (nextQueuedMessageId(messages)) await this.armQueueRetry();
+      const failed = failQueuedMessage(
+        this.sessionAggregate(this.loadMessages()),
+        messageId,
+        reason,
+        detail
+      );
+      if (!failed || !this.saveMessages(failed.messages, epoch)) return;
+      if (nextQueuedMessageId(failed.messages)) await this.armQueueRetry();
       return;
     }
     await this.failDeliveryWaitingMessages(reason, wrapperInstanceId, detail, messageId);
@@ -4248,17 +4469,25 @@ export class SandboxSession extends DurableObject<Env> {
       }
     }
     const failedIds: string[] = [];
-    const messages = before.map(message => {
-      if (message.state !== 'queued' && message.state !== 'accepted') return message;
-      if (wrapperInstanceId !== undefined && message.wrapperInstanceId !== wrapperInstanceId) {
+    const now = Date.now();
+    const messages = before.map((message): SessionMessage => {
+      const kind = message.state.kind;
+      if (kind !== 'queued' && kind !== 'accepted') return message;
+      if (
+        wrapperInstanceId !== undefined &&
+        activeWrapperInstanceId(message) !== wrapperInstanceId
+      ) {
         return message;
       }
-      const prompt = message.operations?.prompt;
+      const prompt = message.proofs?.prompt;
       const confirmed =
-        message.state === 'accepted' || (prompt !== undefined && prompt.dispatched !== false);
+        kind === 'accepted' || (prompt !== undefined && prompt.dispatched !== false);
       if (!confirmed) return message;
       failedIds.push(message.messageId);
-      return { ...message, state: 'failed' as const, failedReason: reason };
+      return {
+        ...message,
+        state: terminalMessageState(message.state, 'failed', now, 'coordinator', { reason }),
+      };
     });
     if (failedIds.length === 0 && !released) return;
     if (!this.saveMessages(messages, epoch)) return;
@@ -4283,11 +4512,15 @@ export class SandboxSession extends DurableObject<Env> {
     );
     const messagesWithDetail =
       detail && detailMessageId
-        ? messages.map(message =>
-            message.messageId === detailMessageId && failedIds.includes(message.messageId)
-              ? { ...message, failedDetail: detail }
-              : message
-          )
+        ? messages.map((message): SessionMessage => {
+            if (
+              message.messageId !== detailMessageId ||
+              message.state.kind !== 'failed' ||
+              !failedIds.includes(message.messageId)
+            )
+              return message;
+            return { ...message, state: { ...message.state, detail } };
+          })
         : messages;
     if (failedIds.length === 0 || !this.saveMessages(messagesWithDetail, epoch)) return;
     if (nextQueuedMessageId(this.loadMessages())) await this.armQueueRetry();
@@ -4357,17 +4590,18 @@ export class SandboxSession extends DurableObject<Env> {
   private nativeAttachmentEventDisposition(
     identity: SessionEventIdentity,
     wrapperInstanceId?: string,
-    triggeringMessage?: SessionMessageRecord
+    triggeringMessage?: SessionMessage
   ): 'pending' | 'rejected' | undefined {
     if (identity.nativeRuntimeId === undefined) return undefined;
     const messages = triggeringMessage ? undefined : this.loadMessages();
     const message =
       triggeringMessage ?? messages?.find(item => item.messageId === nextQueuedMessageId(messages));
-    const proof = message?.operations?.attach;
+    const proof = message?.proofs?.attach;
+    const messageWrapper = message !== undefined ? activeWrapperInstanceId(message) : undefined;
     if (
       !proof?.dispatched ||
       message?.cancellation !== undefined ||
-      message?.wrapperInstanceId !== wrapperInstanceId ||
+      messageWrapper !== wrapperInstanceId ||
       proof.authorization.wrapperInstanceId !== wrapperInstanceId ||
       proof.authorization.session.sessionId !== this.sessionId ||
       proof.authorization.session.directory !== identity.directory ||
@@ -4409,12 +4643,15 @@ export class SandboxSession extends DurableObject<Env> {
     wrapperInstanceId?: string;
   }): ControlDiagnosticFields {
     const messages = this.loadMessages();
-    const current =
-      messages.find(message => message.state === 'accepted') ??
-      messages.find(message => message.state === 'queued');
+    const currentWrapper =
+      messages.find(message => message.state.kind === 'accepted') ??
+      messages.find(message => message.state.kind === 'queued');
+    const lastWithWrapper = messages.findLast(
+      message => deliveryWrapperInstanceId(message) !== undefined
+    );
     const expectedWrapperInstanceId =
-      current?.wrapperInstanceId ??
-      messages.findLast(message => message.wrapperInstanceId)?.wrapperInstanceId;
+      (currentWrapper ? activeWrapperInstanceId(currentWrapper) : undefined) ??
+      (lastWithWrapper ? deliveryWrapperInstanceId(lastWithWrapper) : undefined);
     const fence = nativeRuntimeFenceSchema.safeParse(
       this.ctx.storage.kv.get<unknown>(NATIVE_RUNTIME_FENCE_KEY)
     );
@@ -4501,12 +4738,16 @@ export class SandboxSession extends DurableObject<Env> {
   private isCurrentAcceptedMessage(message: MessageRecord, epoch: number): boolean {
     if (!this.terminalLifecycle.isCurrent(epoch)) return false;
     const current = this.loadMessages().find(item => item.messageId === message.messageId);
-    return current?.state === 'accepted' && current.wrapperInstanceId === message.wrapperInstanceId;
+    const currentState = current?.state.kind === 'accepted' ? current.state : undefined;
+    return (
+      currentState !== undefined &&
+      currentState.wrapperInstanceId === activeWrapperInstanceId(message)
+    );
   }
 
   private captureInteractionScope(): InteractionRefreshScope | undefined {
     const epoch = this.terminalLifecycle.captureEpoch();
-    const message = this.loadMessages().find(item => item.state === 'accepted');
+    const message = this.loadMessages().find(item => item.state.kind === 'accepted');
     if (epoch === null || !message) return undefined;
     const metadata = this.terminalLifecycle.getStoredMetadata();
     return {
@@ -4534,11 +4775,12 @@ export class SandboxSession extends DurableObject<Env> {
       directory,
       interactionRevision: revision,
     } = scope;
+    const messageWrapperInstanceId = activeWrapperInstanceId(message);
     const startedAt = Date.now();
     const diagnostic: ControlDiagnosticFields = {
       sessionId: this.sessionId,
       messageId: message.messageId,
-      expectedWrapperInstanceId: message.wrapperInstanceId,
+      expectedWrapperInstanceId: messageWrapperInstanceId,
       epoch,
       trigger,
       stage: 'runtime_context',
@@ -4551,7 +4793,7 @@ export class SandboxSession extends DurableObject<Env> {
       diagnostic.sandboxId = sandboxId;
       diagnostic.kiloSessionId = kiloSessionId;
       diagnostic.worktreeId = scope.worktreeId;
-      if (!sessionId || !directory || !sandboxId || !kiloSessionId || !message.wrapperInstanceId) {
+      if (!sessionId || !directory || !sandboxId || !kiloSessionId || !messageWrapperInstanceId) {
         diagnostic.reason =
           !sessionId || !directory
             ? 'missing_metadata'
@@ -4600,11 +4842,11 @@ export class SandboxSession extends DurableObject<Env> {
           : observedWrapper.success
             ? observedWrapper.data
             : 'invalid';
-      diagnostic.wrapperMatches = observedWrapperId === message.wrapperInstanceId;
+      diagnostic.wrapperMatches = observedWrapperId === messageWrapperInstanceId;
       if (
         status.connection !== 'ready' ||
         status.physical !== 'running' ||
-        status.wrapperInstanceId !== message.wrapperInstanceId
+        status.wrapperInstanceId !== messageWrapperInstanceId
       ) {
         diagnostic.reason =
           status.connection !== 'ready'
@@ -4619,7 +4861,7 @@ export class SandboxSession extends DurableObject<Env> {
       const response = await withTimeout(
         control.request({
           operation: 'session.sync',
-          expectedWrapperInstanceId: message.wrapperInstanceId,
+          expectedWrapperInstanceId: messageWrapperInstanceId,
           session: { sessionId, kiloSessionId, directory },
           payload: {},
         }),
@@ -4782,7 +5024,8 @@ export class SandboxSession extends DurableObject<Env> {
     if (status?.type !== 'preparing') return status;
     const headId = nextQueuedMessageId(messages);
     const head = headId ? messages.find(message => message.messageId === headId) : undefined;
-    const attemptId = head?.preparationAttemptId;
+    const headState = head?.state.kind === 'queued' ? head.state : undefined;
+    const attemptId = headState?.preparationAttemptId;
     if (attemptId) {
       const attempt = readPreparationAttempt(this.eventQueries, attemptId);
       if (attempt?.status === 'running') {
@@ -4797,7 +5040,7 @@ export class SandboxSession extends DurableObject<Env> {
     // A finalized attempt bound to a retained operation proof cannot carry
     // progress; `reportWait` stores the current reason on the head instead so
     // reconnect still sees it.
-    const wait = head?.preparationWait;
+    const wait = headState?.preparationWait;
     if (wait) return { type: 'preparing' as const, step: wait.step, message: wait.message };
     return status;
   }
@@ -4818,13 +5061,16 @@ export class SandboxSession extends DurableObject<Env> {
   ): void {
     const messages = this.loadMessages();
     const head = messages.find(message => message.messageId === messageId);
-    if (!head) return;
-    const current = head.preparationWait;
+    const headState = head?.state.kind === 'queued' ? head.state : undefined;
+    if (!headState) return;
+    const current = headState.preparationWait;
     if (wait === undefined) {
       if (current === undefined) return;
       const cleared = this.saveMessages(
         messages.map(message =>
-          message.messageId === messageId ? { ...message, preparationWait: undefined } : message
+          message.messageId === messageId && message.state.kind === 'queued'
+            ? { ...message, state: { ...message.state, preparationWait: undefined } }
+            : message
         ),
         epoch
       );
@@ -4836,7 +5082,9 @@ export class SandboxSession extends DurableObject<Env> {
       return;
     const saved = this.saveMessages(
       messages.map(message =>
-        message.messageId === messageId ? { ...message, preparationWait: wait } : message
+        message.messageId === messageId && message.state.kind === 'queued'
+          ? { ...message, state: { ...message.state, preparationWait: wait } }
+          : message
       ),
       epoch
     );
@@ -5039,19 +5287,31 @@ export class SandboxSession extends DurableObject<Env> {
     if (wrapperInstanceId === undefined) return true;
     const messages = this.loadMessages();
     const current =
-      messages.find(message => message.state === 'accepted') ??
-      messages.find(message => message.state === 'queued');
+      messages.find(message => message.state.kind === 'accepted') ??
+      messages.find(message => message.state.kind === 'queued');
+    const lastWithWrapper = messages.findLast(
+      message => deliveryWrapperInstanceId(message) !== undefined
+    );
     const expected =
-      current?.wrapperInstanceId ??
-      messages.findLast(message => message.wrapperInstanceId)?.wrapperInstanceId;
+      (current ? activeWrapperInstanceId(current) : undefined) ??
+      (lastWithWrapper ? deliveryWrapperInstanceId(lastWithWrapper) : undefined);
     return expected === undefined || expected === wrapperInstanceId;
   }
 
   private loadMessages(): MessageRecord[] {
-    return readActiveSessionMessages<MessageRecord>(
+    return readActiveSessionMessages(
       this.ctx.storage.kv,
       this.deletedWorktreeId !== undefined || this.terminalLifecycle.isBlocked()
     );
+  }
+
+  /** The aggregate projection: the attachment record is the only binding owner. */
+  private sessionBinding(messages: readonly SessionMessage[]): Binding {
+    return bindingForAttachment(this.terminalLifecycle.getAttachedBinding(), messages);
+  }
+
+  private sessionAggregate(messages: readonly SessionMessage[]): SessionAggregate {
+    return { binding: this.sessionBinding(messages), messages: [...messages] };
   }
 
   private saveMessages(
@@ -5142,34 +5402,37 @@ export class SandboxSession extends DurableObject<Env> {
       const before = this.loadMessages();
       const previousById = new Map(before.map(message => [message.messageId, message]));
       const queuedHeadId = nextQueuedMessageId(before);
-      const now = Date.now();
-      const next = messages.map(message => {
+      const next = messages.map((message): SessionMessage => {
         const previous = previousById.get(message.messageId);
-        if (previous && previous.state !== 'queued' && previous.state !== 'accepted')
+        const previousState = previous?.state;
+        const state = message.state;
+        // HEAD's terminal-over-active guard runs first: a stale producer's queued
+        // or accepted copy must never resurrect a row the store already settled.
+        if (
+          previous !== undefined &&
+          previous.state.kind !== 'queued' &&
+          previous.state.kind !== 'accepted'
+        ) {
           return previous;
-        if (message.state === 'queued') return message;
-        if (message.state === 'accepted') {
-          if (previous?.state !== 'accepted') {
+        }
+        if (state.kind === 'queued') return message;
+        if (state.kind === 'accepted') {
+          if (previousState?.kind !== 'accepted') {
             const event = this.persistMessageLifecycleEvent(message);
             if (event) events.push(event);
             this.recordMessageReport(message, true);
             reportPersisted = true;
             committed.push({
               messageId: message.messageId,
-              wrapperInstanceId: message.wrapperInstanceId,
-              fromState: previous?.state,
-              toState: message.state,
+              wrapperInstanceId: state.wrapperInstanceId,
+              fromState: previousState?.kind,
+              toState: state.kind,
               lifecycleEventInserted: event !== undefined,
             });
           }
           return message;
         }
-        const terminal = {
-          ...message,
-          terminalAt: message.terminalAt ?? now,
-          terminalSource: message.terminalSource ?? source,
-        };
-        if (previous?.state === 'accepted' || queuedHeadId === message.messageId) {
+        if (previousState?.kind === 'accepted' || queuedHeadId === message.messageId) {
           const interactions = this.readPendingInteractions();
           this.ctx.storage.kv.put(PENDING_INTERACTIONS_KEY, {
             revision: (interactions?.revision ?? 0) + 1,
@@ -5177,42 +5440,48 @@ export class SandboxSession extends DurableObject<Env> {
             permissions: [],
           });
         }
-        const event = this.persistMessageLifecycleEvent(terminal);
+        const event = this.persistMessageLifecycleEvent(message);
         if (event) events.push(event);
-        newlyTerminalMessageIds.add(terminal.messageId);
-        this.recordMessageReport(terminal, previous?.state === 'accepted');
+        newlyTerminalMessageIds.add(message.messageId);
+        this.recordMessageReport(message, previousState?.kind === 'accepted');
         reportPersisted = true;
+        const reason = failedReasonOf(message);
         committed.push({
-          messageId: terminal.messageId,
-          wrapperInstanceId: terminal.wrapperInstanceId,
-          fromState: previous?.state,
-          toState: terminal.state,
-          terminalAt: terminal.terminalAt,
+          messageId: message.messageId,
+          wrapperInstanceId:
+            previousState !== undefined
+              ? activeWrapperInstanceId(previous as SessionMessage)
+              : undefined,
+          fromState: previousState?.kind,
+          toState: state.kind,
+          terminalAt: state.at,
           lifecycleEventInserted: event !== undefined,
-          cause: terminal.failedReason ? diagnosticCause(terminal.failedReason) : undefined,
+          cause: reason !== undefined ? diagnosticCause(reason) : undefined,
         });
-        if (terminal.preparationAttemptId) {
+        // The terminal union drops `preparationAttemptId`; finalize from the
+        // pre-transition message so progress is never left running.
+        if (previousState?.kind === 'queued' && previousState.preparationAttemptId) {
           events.push(
             ...finalizePreparationAttempt(
               this.eventQueries,
-              terminal.preparationAttemptId,
-              terminal.state === 'completed'
-                ? { status: 'completed', timestamp: terminal.terminalAt }
+              previousState.preparationAttemptId,
+              state.kind === 'completed'
+                ? { status: 'completed', timestamp: state.at }
                 : {
                     status: 'failed',
                     safeError:
-                      terminal.state === 'cancelled'
+                      state.kind === 'cancelled'
                         ? 'The message was interrupted'
-                        : (terminal.failedDetail ??
-                          safeErrorFromQueueReason(terminal.failedReason ?? 'environment_failed')),
-                    timestamp: terminal.terminalAt,
+                        : (failedDetailOf(message) ??
+                          safeErrorFromQueueReason(reason ?? 'environment_failed')),
+                    timestamp: state.at,
                   }
             )
           );
         }
-        return terminal;
+        return message;
       });
-      writeSessionMessages(this.ctx.storage.kv, next);
+      writeSessionMessages(this.ctx.storage.kv, this.sessionBinding(next), next);
       callbackPersisted = this.messageCallbacks.persistDrainedBatchCallback(
         next,
         newlyTerminalMessageIds
@@ -5243,15 +5512,16 @@ export class SandboxSession extends DurableObject<Env> {
   }
 
   private persistMessageLifecycleEvent(message: MessageRecord): StoredEvent | undefined {
-    const accepted = message.state === 'accepted';
-    const completed = message.state === 'completed';
+    const state = message.state;
+    const accepted = state.kind === 'accepted';
+    const completed = state.kind === 'completed';
     const streamEventType = accepted
       ? 'cloud.message.sent'
       : completed
         ? 'cloud.message.completed'
         : 'cloud.message.failed';
     const sessionId = this.requireSessionId();
-    const timestamp = (accepted ? message.acceptedAt : message.terminalAt) ?? Date.now();
+    const timestamp = (accepted ? state.acceptedAt : terminalAtOf(message)) ?? Date.now();
     const payload = JSON.stringify(
       accepted
         ? { messageId: message.messageId, delivery: 'sent' }

@@ -70,10 +70,10 @@ describe('SandboxSession prepared initial admission (control plane)', () => {
     const result = await runInDurableObject(stub, async instance => {
       await instance.registerSession(preparedRegistration(sessionId));
       const admission = await instance.admitPreparedInitialMessage({ userId });
-      const messages = (await readSessionValue(instance.ctx.storage)) as
-        | { messageId: string; state: string }[]
+      const envelope = (await readSessionValue(instance.ctx.storage)) as
+        | { messages?: { messageId: string; state: { kind: string } }[] }
         | undefined;
-      return { admission, messages };
+      return { admission, messages: envelope?.messages };
     });
 
     expect(result.admission.success).toBe(true);
@@ -92,10 +92,10 @@ describe('SandboxSession prepared initial admission (control plane)', () => {
       await instance.registerSession(preparedRegistration(sessionId));
       const first = await instance.admitPreparedInitialMessage({ userId });
       const retry = await instance.admitPreparedInitialMessage({ userId });
-      const messages = (await readSessionValue(instance.ctx.storage)) as
-        | { messageId: string }[]
+      const envelope = (await readSessionValue(instance.ctx.storage)) as
+        | { messages?: { messageId: string }[] }
         | undefined;
-      return { first, retry, messages };
+      return { first, retry, messages: envelope?.messages };
     });
 
     expect(result.first.success).toBe(true);

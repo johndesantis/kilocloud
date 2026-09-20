@@ -24,7 +24,12 @@ import {
 } from '../model/session.js';
 import { decodeLegacyAllocation } from './legacy/allocation.js';
 import { decodeLegacySession } from './legacy/session.js';
-import { readAllocationEntry, readSessionEntry } from './access.js';
+import {
+  readAllocationEntry,
+  readSessionEntry,
+  readSessionValueSync,
+  type SyncRecordReader,
+} from './access.js';
 import { ALLOCATION_KEY, type CanonicalStorage } from './store.js';
 
 export type LoadSource = 'canonical' | 'legacy' | 'initial';
@@ -76,39 +81,66 @@ export async function loadSession(
   if (raw === undefined) {
     return { ok: true, source: 'initial', value: emptySessionAggregate() };
   }
-  const value = raw.value;
+  const decoded = decodeSessionValue(raw.value, options);
+  if (!decoded.ok) return { ok: false, reason: decoded.reason, key: raw.key };
+  return decoded;
+}
+
+export type SessionDecodeResult =
+  | { ok: true; source: LoadSource; value: SessionAggregate }
+  | { ok: false; reason: string };
+
+/**
+ * Pure dry decoder for a stored session value: canonical `{v: 2}` envelope,
+ * marker-free legacy bare array, foreign `v` rejected, anything else rejected.
+ * Kept in the quarantine module because the legacy decoder lives here; the
+ * decoded session readers below and the Durable Object both use it.
+ */
+export function decodeSessionValue(
+  value: unknown,
+  options: SessionLoadOptions = {}
+): SessionDecodeResult {
   if (Array.isArray(value)) {
-    if (hasOwn(value, 'v')) {
-      return { ok: false, reason: 'foreign_marker', key: raw.key };
-    }
+    if (hasOwn(value, 'v')) return { ok: false, reason: 'foreign_marker' };
     const converted = decodeLegacySession(value, options.legacyBindingHandle);
-    if (!converted) {
-      return { ok: false, reason: 'invalid_legacy_session', key: raw.key };
-    }
+    if (!converted) return { ok: false, reason: 'invalid_legacy_session' };
     return { ok: true, source: 'legacy', value: converted };
   }
   if (typeof value === 'object' && value !== null) {
     if (hasOwn(value, 'v') && (value as { v?: unknown }).v !== 2) {
-      return { ok: false, reason: 'foreign_marker', key: raw.key };
+      return { ok: false, reason: 'foreign_marker' };
     }
     const parsed = sessionEnvelopeSchema.safeParse(value);
-    if (!parsed.success) {
-      return { ok: false, reason: 'invalid_canonical_session', key: raw.key };
-    }
+    if (!parsed.success) return { ok: false, reason: 'invalid_canonical_session' };
     return {
       ok: true,
       source: 'canonical',
       value: { binding: parsed.data.binding, messages: parsed.data.messages },
     };
   }
-  return { ok: false, reason: 'invalid_session_shape', key: raw.key };
+  return { ok: false, reason: 'invalid_session_shape' };
 }
 
 /**
- * Permitted boundary for the stopped-seam adapter: decode the frozen legacy bare
- * array to canonical messages only. The binding is deliberately ignored — the
- * seam derives it from the authoritative attachment record, not from row states.
+ * Decoded session-message reads for the live DO and its fixtures. Fail closed:
+ * a malformed stored value throws rather than being treated as an empty queue,
+ * so a corrupt aggregate cannot be silently overwritten.
  */
-export function decodeLegacySessionMessages(value: unknown): SessionMessage[] | undefined {
-  return decodeLegacySession(value)?.messages;
+export function readRawSessionMessages(
+  storage: SyncRecordReader,
+  options: SessionLoadOptions = {}
+): SessionMessage[] {
+  const value = readSessionValueSync(storage);
+  if (value === undefined) return [];
+  const decoded = decodeSessionValue(value, options);
+  if (!decoded.ok) throw new Error(`invalid_session_messages:${decoded.reason}`);
+  return decoded.value.messages;
+}
+
+export function readActiveSessionMessages(
+  storage: SyncRecordReader,
+  blocked: boolean,
+  options: SessionLoadOptions = {}
+): SessionMessage[] {
+  return blocked ? [] : readRawSessionMessages(storage, options);
 }

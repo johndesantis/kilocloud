@@ -97,6 +97,58 @@ describe('canonical store', () => {
     expect(loaded).toEqual({ ok: true, source: 'canonical', value: SESSION });
   });
 
+  it('session store→load preserves a terminal acceptedAt and retained identity', async () => {
+    const terminal: SessionAggregate = {
+      binding: { kind: 'unbound' },
+      messages: [
+        {
+          messageId: 'm1',
+          state: {
+            kind: 'completed',
+            intent: null,
+            legacyInvalidIntent: true,
+            acceptedAt: 50,
+            at: 60,
+            source: 'wrapper_outcome',
+            wrapperInstanceId: 'w-1',
+            preparationAttemptId: 'attempt-1',
+            gateResult: 'pass',
+          },
+        },
+      ],
+    };
+    const storage = memoryStorage();
+    await storeSession(storage, terminal);
+    const loaded = await loadSession(storage);
+    expect(loaded).toEqual({ ok: true, source: 'canonical', value: terminal });
+  });
+
+  it('session store→load round-trips a failed state carrying bounded assistant facts', async () => {
+    const terminal: SessionAggregate = {
+      binding: { kind: 'unbound' },
+      messages: [
+        {
+          messageId: 'm1',
+          state: {
+            kind: 'failed',
+            intent: null,
+            legacyInvalidIntent: true,
+            acceptedAt: 50,
+            at: 60,
+            source: 'wrapper_outcome',
+            reason: 'rate limited',
+            assistantReason: 'rate_limited',
+            providerOwnership: 'unknown',
+          },
+        },
+      ],
+    };
+    const storage = memoryStorage();
+    await storeSession(storage, terminal);
+    const loaded = await loadSession(storage);
+    expect(loaded).toEqual({ ok: true, source: 'canonical', value: terminal });
+  });
+
   it('eraseAllocation deletes both allocation keys and leaves the session alone', async () => {
     const storage = memoryStorage();
     await storage.put(ALLOCATION_KEY, initialAllocationRecord(true));

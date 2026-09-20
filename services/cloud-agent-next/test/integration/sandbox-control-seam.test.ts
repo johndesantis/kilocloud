@@ -9,9 +9,12 @@ import { getSandboxSessionStub } from '../../src/sandbox-session/session-stub.js
 import type { StopProof } from '../../src/sandbox-state/model/allocation.js';
 import {
   readCanonicalAllocationRecord,
-  readRawSessionMessages,
+  readSessionValueSync,
   writeSessionMessages,
+  writeSessionValueSync,
 } from '../../src/sandbox-state/persist/access.js';
+import { readRawSessionMessages } from '../../src/sandbox-state/persist/load.js';
+import { acceptedState, queuedState } from '../../src/sandbox-session/session-state.test-helpers.js';
 import { seedCanonicalRunning } from './canonical-allocation-fixtures.js';
 
 const ownerId = 'user_control_seam';
@@ -61,11 +64,13 @@ async function registerSeamSession(
 function acceptedRow(ids: SeamIds, messageId: string) {
   return {
     messageId,
-    state: 'accepted',
-    prompt: 'held turn',
-    wrapperInstanceId: ids.wrapperInstanceId,
-    acceptedAt: Date.now(),
-    lastActivityAt: Date.now(),
+    state: acceptedState({
+      legacy: { prompt: 'held turn' },
+      wrapperInstanceId: ids.wrapperInstanceId,
+      acceptedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      executionDeadlineAt: Date.now() + 60_000,
+    }),
   };
 }
 
@@ -96,7 +101,7 @@ async function seedLegacyAttachment(
   overrides: AttachmentOverrides = {}
 ): Promise<void> {
   await runInDurableObject(session, async (_instance, state) => {
-    writeSessionMessages(state.storage, [acceptedRow(ids, messageId)]);
+    writeSessionMessages(state.storage, { kind: 'unresolved' }, [acceptedRow(ids, messageId)]);
     await state.storage.put(ATTACHED_SESSION_KEY, {
       ownerId,
       sessionId: ids.sessionId,
@@ -109,6 +114,120 @@ async function seedLegacyAttachment(
         : {}),
     });
   });
+}
+
+type LegacyPromptAuthorization = {
+  operation: 'session.prompt';
+  operationId: string;
+  messageId: string;
+  session: { sessionId: string; kiloSessionId: string; directory: string };
+  wrapperInstanceId: string;
+  dispatchDeadlineAt: number;
+};
+
+function legacyPromptAuthorization(ids: SeamIds, messageId: string): LegacyPromptAuthorization {
+  return {
+    operation: 'session.prompt',
+    operationId: messageId,
+    messageId,
+    session: {
+      sessionId: ids.sessionId,
+      kiloSessionId: ids.kiloSessionId,
+      directory: ids.directory,
+    },
+    wrapperInstanceId: ids.wrapperInstanceId,
+    dispatchDeadlineAt: Date.now() + 60_000,
+  };
+}
+
+/**
+ * Seed a raw legacy bare-array session value with a queued prompt whose prompt
+ * proof was already dispatched, plus the incarnation-less pre-C3b attachment.
+ * The upgrade path must decode this through the frozen legacy decoder.
+ */
+async function seedLegacyDispatchedPrompt(
+  session: Awaited<ReturnType<typeof registerSeamSession>>,
+  ids: SeamIds,
+  messageId: string,
+  options: {
+    authorization: LegacyPromptAuthorization;
+    executionDeadlineAt: number;
+    preparationAttemptId?: string;
+  }
+): Promise<void> {
+  await runInDurableObject(session, async (_instance, state) => {
+    writeSessionValueSync(state.storage.kv, [
+      {
+        messageId,
+        state: 'queued',
+        version: 2,
+        intent: {
+          turn: { type: 'prompt', messageId, prompt: 'legacy dispatched prompt' },
+          agent: { mode: 'code', model: 'test-model' },
+        },
+        queuedAt: Date.now() - 1_000,
+        deliveryDeadlineAt: Date.now() + 60_000,
+        preparationAttemptId: options.preparationAttemptId ?? 'legacy-attempt',
+        wrapperInstanceId: ids.wrapperInstanceId,
+        operations: {
+          prompt: {
+            authorization: options.authorization,
+            dispatched: true,
+            executionDeadlineAt: options.executionDeadlineAt,
+          },
+        },
+      },
+    ]);
+    await state.storage.put(ATTACHED_SESSION_KEY, {
+      ownerId,
+      sessionId: ids.sessionId,
+      kiloSessionId: ids.kiloSessionId,
+      directory: ids.directory,
+      sandboxId: ids.sandboxId,
+      wrapperInstanceId: ids.wrapperInstanceId,
+    });
+  });
+}
+
+type ReconcileControlOptions = {
+  status: Record<string, unknown>;
+  operationState: 'running' | 'missing';
+  authorization: LegacyPromptAuthorization;
+  executionDeadlineAt: number;
+};
+
+/** A session-facing control stub for the reconciliation alarm path. */
+function reconcileSessionControl(ids: SeamIds, options: ReconcileControlOptions) {
+  const operations: string[] = [];
+  const control = {
+    getStatus: async () => options.status,
+    getRuntimeCredentialProxyFence: async () => null,
+    ensureReady: async () => ({
+      physical: 'running' as const,
+      connection: 'ready' as const,
+      ...options.status,
+    }),
+    attachSession: async () => ({}),
+    request: async (request: { operation: string }) => {
+      operations.push(request.operation);
+      if (request.operation !== 'session.operation.get')
+        throw new Error(`Unexpected control request: ${request.operation}`);
+      return {
+        type: 'response' as const,
+        requestId: 'lookup',
+        ok: true as const,
+        result:
+          options.operationState === 'running'
+            ? {
+                state: 'running',
+                authorization: options.authorization,
+                executionDeadlineAt: options.executionDeadlineAt,
+              }
+            : { state: 'missing' },
+      };
+    },
+  };
+  return { control, operations };
 }
 
 type SessionStopSeam = {
@@ -146,7 +265,7 @@ describe('sandbox control seam (live wiring)', () => {
     const session = await registerSeamSession(ids);
     const incarnation = 'incarnation-seam-1';
     await runInDurableObject(session, async (_instance, state) => {
-      writeSessionMessages(state.storage, [acceptedRow(ids, messageId)]);
+      writeSessionMessages(state.storage, { kind: 'unresolved' }, [acceptedRow(ids, messageId)]);
       await state.storage.put(ATTACHED_SESSION_KEY, {
         ownerId,
         sessionId: ids.sessionId,
@@ -168,10 +287,460 @@ describe('sandbox control seam (live wiring)', () => {
     });
 
     await runInDurableObject(session, async (_instance, state) => {
-      const messages = readRawSessionMessages<Record<string, unknown>>(state.storage.kv);
+      const messages = readRawSessionMessages(state.storage.kv);
       expect(messages).toHaveLength(1);
-      expect(messages[0]).toMatchObject({ state: 'failed', failedReason: 'idle' });
+      expect(messages[0]).toMatchObject({ state: { kind: 'failed', reason: 'idle' } });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
+    });
+  });
+
+  it.each(['queued', 'accepted'] as const)(
+    'persists an unbound envelope and deletes the attachment for stopped %s work',
+    async kind => {
+      const ids = makeIds();
+      const messageId = `msg_seam_unbound_${kind}`;
+      const session = await registerSeamSession(ids);
+      const incarnation = `incarnation-seam-unbound-${kind}`;
+      await runInDurableObject(session, async (_instance, state) => {
+        writeSessionMessages(state.storage, { kind: 'unresolved' }, [
+          kind === 'accepted'
+            ? acceptedRow(ids, messageId)
+            : {
+                messageId,
+                state: queuedState({
+                  intent: {
+                    turn: { type: 'prompt', messageId, prompt: 'held' },
+                    agent: { mode: 'code' },
+                  },
+                  legacyInvalidIntent: undefined,
+                  wrapperInstanceId: ids.wrapperInstanceId,
+                }),
+              },
+        ]);
+        await state.storage.put(ATTACHED_SESSION_KEY, {
+          ownerId,
+          sessionId: ids.sessionId,
+          kiloSessionId: ids.kiloSessionId,
+          directory: ids.directory,
+          sandboxId: ids.sandboxId,
+          wrapperInstanceId: ids.wrapperInstanceId,
+          allocationIncarnation: incarnation,
+        });
+      });
+
+      await runInDurableObject(session, async instance => {
+        await expect(
+          instance.notifyStopped({ reason: 'idle', stopProof: stopProof(ids, incarnation) })
+        ).resolves.toEqual({ outcome: 'delivered' });
+      });
+
+      await runInDurableObject(session, async (_instance, state) => {
+        const stored = readSessionValueSync(state.storage.kv) as
+          | {
+              v?: number;
+              binding?: unknown;
+              messages?: { messageId: string; state: { kind: string; reason?: string } }[];
+            }
+          | undefined;
+        // The persisted envelope binding and the attachment must agree: both are
+        // unbound/absent after allocation loss.
+        expect(stored?.v).toBe(2);
+        expect(stored?.binding).toEqual({ kind: 'unbound' });
+        expect(stored?.messages?.[0]?.state).toMatchObject({ kind: 'failed', reason: 'idle' });
+        expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
+      });
+    }
+  );
+
+  it('binds fresh demand to a new allocation incarnation after a STOPPED', async () => {
+    // Admission validates the model against the catalog; keep that reachable.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ valid: true }));
+    const ids = makeIds();
+    const stoppedMessageId = 'msg_seam_stop_old';
+    const freshMessageId = 'msg_seam_fresh_new';
+    const session = await registerSeamSession(ids);
+    const stoppedIncarnation = 'incarnation-seam-stopped-old';
+    await runInDurableObject(session, async (_instance, state) => {
+      writeSessionMessages(state.storage, { kind: 'unresolved' }, [
+        acceptedRow(ids, stoppedMessageId),
+      ]);
+      await state.storage.put(ATTACHED_SESSION_KEY, {
+        ownerId,
+        sessionId: ids.sessionId,
+        kiloSessionId: ids.kiloSessionId,
+        directory: ids.directory,
+        sandboxId: ids.sandboxId,
+        wrapperInstanceId: ids.wrapperInstanceId,
+        allocationIncarnation: stoppedIncarnation,
+      });
+    });
+
+    // STOPPED for the bound incarnation terminalizes the old turn and clears it.
+    await runInDurableObject(session, async instance => {
+      await expect(
+        instance.notifyStopped({
+          reason: 'idle',
+          stopProof: stopProof(ids, stoppedIncarnation),
+        })
+      ).resolves.toEqual({ outcome: 'delivered' });
+    });
+    await runInDurableObject(session, async (_instance, state) => {
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
+        state: { kind: 'failed', reason: 'idle' },
+      });
+      expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
+    });
+
+    // Fresh demand must allocate a distinct incarnation and bind the new message
+    // to it instead of reusing the stopped one.
+    const freshIncarnation = 'incarnation-seam-fresh-new';
+    const freshWrapper = '33333333-3333-4333-8333-333333333333';
+    const operations: string[] = [];
+    const ensureReady = vi.fn(async () => ({
+      allocationIncarnation: freshIncarnation,
+      physical: 'running' as const,
+      connection: 'ready' as const,
+      wrapperInstanceId: freshWrapper,
+      operationResults: true as const,
+      attachment: {
+        directory: ids.directory,
+        env: { KILOCODE_TOKEN: 'control-token' },
+        kilo: {
+          scopeId: ids.sessionId,
+          token: 'control-token',
+          targets: {
+            backendBaseUrl: 'https://backend.example.test',
+            providerBaseUrl: 'https://provider.example.test',
+            sessionIngestBaseUrl: 'https://ingest.example.test',
+          },
+        },
+      },
+    }));
+    const control = {
+      ensureReady,
+      getStatus: async () => ({
+        allocationIncarnation: freshIncarnation,
+        physical: 'running' as const,
+        connection: 'ready' as const,
+        wrapperInstanceId: freshWrapper,
+        operationResults: true as const,
+      }),
+      getRuntimeCredentialProxyFence: async () => null,
+      attachSession: async () => ({}),
+      request: async (request: { operation: string }) => {
+        operations.push(request.operation);
+        if (request.operation === 'session.attach')
+          return {
+            type: 'response' as const,
+            requestId: 'attach',
+            ok: true as const,
+            result: { attached: true },
+          };
+        if (request.operation === 'session.prompt')
+          return {
+            type: 'response' as const,
+            requestId: 'prompt',
+            ok: true as const,
+            result: { messageId: freshMessageId, status: 'accepted' },
+          };
+        return {
+          type: 'response' as const,
+          requestId: 'lookup',
+          ok: true as const,
+          result: { state: 'missing' },
+        };
+      },
+    };
+
+    await runInDurableObject(session, async instance => {
+      const original = instance['env'].SANDBOX_CONTROL;
+      instance['env'].SANDBOX_CONTROL = { getByName: () => control } as never;
+      try {
+        const admitted = await instance.admitSubmittedMessage({
+          userId: ownerId,
+          turn: { type: 'prompt', id: freshMessageId, prompt: 'fresh demand' },
+        });
+        expect(admitted.success).toBe(true);
+        await instance['dispatchQueued'](freshMessageId, { allowCreate: true });
+      } finally {
+        instance['env'].SANDBOX_CONTROL = original;
+      }
+    });
+
+    // The demand reached the allocation path (a fresh acquisition) rather than
+    // reusing the stopped allocation, and the prompt was delivered on it.
+    expect(ensureReady).toHaveBeenCalledTimes(1);
+    expect(ensureReady).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerId, sessionId: ids.sessionId, provider: 'cloudflare' })
+    );
+    expect(operations).toContain('session.prompt');
+
+    await runInDurableObject(session, async (_instance, state) => {
+      const attachment = (await state.storage.get(ATTACHED_SESSION_KEY)) as
+        | { wrapperInstanceId?: string; allocationIncarnation?: string }
+        | undefined;
+      expect(attachment).toMatchObject({
+        wrapperInstanceId: freshWrapper,
+        allocationIncarnation: freshIncarnation,
+      });
+      expect(attachment?.allocationIncarnation).not.toBe(stoppedIncarnation);
+      const fresh = readRawSessionMessages(state.storage.kv).find(
+        message => message.messageId === freshMessageId
+      );
+      expect(fresh).toMatchObject({
+        state: { kind: 'accepted', wrapperInstanceId: freshWrapper },
+      });
+      // The persisted envelope binding names the new incarnation and wrapper.
+      expect((readSessionValueSync(state.storage.kv) as { binding?: unknown }).binding).toEqual({
+        kind: 'bound',
+        handle: { incarnation: freshIncarnation, wrapper: freshWrapper, epoch: 0 },
+      });
+    });
+  });
+
+  it('recovers the incarnation for a persisted legacy dispatched prompt and accepts it without redispatch', async () => {
+    const ids = makeIds();
+    const messageId = 'msg_seam_upgrade_accept';
+    const session = await registerSeamSession(ids);
+    const authorization = legacyPromptAuthorization(ids, messageId);
+    const executionDeadlineAt = Date.now() + 60_000;
+    await seedLegacyDispatchedPrompt(session, ids, messageId, { authorization, executionDeadlineAt });
+
+    const { control, operations } = reconcileSessionControl(ids, {
+      status: {
+        allocationIncarnation: 'recovered-incarnation',
+        physical: 'running',
+        connection: 'ready',
+        wrapperInstanceId: ids.wrapperInstanceId,
+      },
+      operationState: 'running',
+      authorization,
+      executionDeadlineAt,
+    });
+    await runInDurableObject(session, async instance => {
+      const original = instance['env'].SANDBOX_CONTROL;
+      instance['env'].SANDBOX_CONTROL = { getByName: () => control } as never;
+      try {
+        await instance.alarm();
+      } finally {
+        instance['env'].SANDBOX_CONTROL = original;
+      }
+    });
+
+    // The persisted legacy prompt is reconciled, never re-dispatched.
+    expect(operations).toEqual(['session.operation.get']);
+    await runInDurableObject(session, async (_instance, state) => {
+      const [row] = readRawSessionMessages(state.storage.kv);
+      expect(row).toMatchObject({
+        state: { kind: 'accepted', wrapperInstanceId: ids.wrapperInstanceId },
+      });
+      const attachment = (await state.storage.get(ATTACHED_SESSION_KEY)) as
+        | { allocationIncarnation?: string }
+        | undefined;
+      expect(attachment?.allocationIncarnation).toBe('recovered-incarnation');
+      expect((readSessionValueSync(state.storage.kv) as { binding?: unknown }).binding).toEqual({
+        kind: 'bound',
+        handle: {
+          incarnation: 'recovered-incarnation',
+          wrapper: ids.wrapperInstanceId,
+          epoch: 0,
+        },
+      });
+    });
+  });
+
+  it('expires a persisted legacy dispatched prompt at its bound with an unbound envelope', async () => {
+    const ids = makeIds();
+    const messageId = 'msg_seam_upgrade_expiry';
+    const session = await registerSeamSession(ids);
+    const authorization = legacyPromptAuthorization(ids, messageId);
+    const executionDeadlineAt = Date.now() + 1_000;
+    await seedLegacyDispatchedPrompt(session, ids, messageId, { authorization, executionDeadlineAt });
+
+    // No wrapper is exposed, so the incarnation-less binding stays unresolved.
+    const { control, operations } = reconcileSessionControl(ids, {
+      status: { allocationIncarnation: 'live-incarnation' },
+      operationState: 'running',
+      authorization,
+      executionDeadlineAt,
+    });
+    await runInDurableObject(session, async instance => {
+      const original = instance['env'].SANDBOX_CONTROL;
+      instance['env'].SANDBOX_CONTROL = { getByName: () => control } as never;
+      try {
+        await instance.alarm();
+      } finally {
+        instance['env'].SANDBOX_CONTROL = original;
+      }
+    });
+
+    // The unresolved condition stays visible while the bound is still ahead.
+    await runInDurableObject(session, async (_instance, state) => {
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'queued' } });
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 1_100));
+    await runInDurableObject(session, async instance => {
+      await instance.alarm();
+    });
+
+    expect(operations).not.toContain('session.prompt');
+    await runInDurableObject(session, async (_instance, state) => {
+      const [row] = readRawSessionMessages(state.storage.kv);
+      expect(row).toMatchObject({ state: { kind: 'failed', reason: 'prompt_exhausted' } });
+      // It never failed before the execution bound; the alarm after the bound is
+      // the one that terminalized it.
+      expect(
+        row?.state.kind === 'failed' ? row.state.at : undefined
+      ).toBeGreaterThanOrEqual(executionDeadlineAt);
+      expect((readSessionValueSync(state.storage.kv) as { binding?: unknown }).binding).toEqual({
+        kind: 'unbound',
+      });
+    });
+  });
+
+  it('settles a reconcilable legacy head with an unbound envelope and no redispatch', async () => {
+    const ids = makeIds();
+    const messageId = 'msg_seam_upgrade_settle';
+    const session = await registerSeamSession(ids);
+    const authorization = legacyPromptAuthorization(ids, messageId);
+    const executionDeadlineAt = Date.now() + 60_000;
+    await seedLegacyDispatchedPrompt(session, ids, messageId, { authorization, executionDeadlineAt });
+
+    // A live allocation exposing a different wrapper cannot adopt the legacy
+    // head; the head settles instead of being re-dispatched.
+    const { control, operations } = reconcileSessionControl(ids, {
+      status: {
+        allocationIncarnation: 'live-incarnation',
+        physical: 'running',
+        connection: 'ready',
+        wrapperInstanceId: 'different-wrapper',
+      },
+      operationState: 'running',
+      authorization,
+      executionDeadlineAt,
+    });
+    await runInDurableObject(session, async instance => {
+      const original = instance['env'].SANDBOX_CONTROL;
+      instance['env'].SANDBOX_CONTROL = { getByName: () => control } as never;
+      try {
+        await instance.alarm();
+      } finally {
+        instance['env'].SANDBOX_CONTROL = original;
+      }
+    });
+
+    expect(operations).toEqual(['session.operation.get']);
+    await runInDurableObject(session, async (_instance, state) => {
+      const [row] = readRawSessionMessages(state.storage.kv);
+      expect(row).toMatchObject({ state: { kind: 'failed', reason: 'environment_stopped' } });
+      expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
+      expect((readSessionValueSync(state.storage.kv) as { binding?: unknown }).binding).toEqual({
+        kind: 'unbound',
+      });
+    });
+  });
+
+  it('rolls back an attempted hydration when the commit lands on a stale epoch', async () => {
+    const ids = makeIds();
+    const session = await registerSeamSession(ids);
+    const controlStub = env.SANDBOX_CONTROL.getByName(ids.sandboxId);
+    await seedLegacyAttachment(session, ids, 'msg_seam_hydrate_epoch');
+    const before = await runInDurableObject(session, async (_instance, state) => ({
+      envelope: readSessionValueSync(state.storage.kv),
+      attachment: await state.storage.get(ATTACHED_SESSION_KEY),
+    }));
+
+    await runInDurableObject(controlStub, instance => {
+      const prototype = Object.getPrototypeOf(instance) as { getStatus: () => Promise<unknown> };
+      // The resolver exposes the matching wrapper and a live incarnation, so the
+      // incarnation is written into the attachment inside the transaction.
+      vi.spyOn(prototype, 'getStatus').mockResolvedValueOnce({
+        allocationIncarnation: 'resolved-incarnation',
+        physical: 'running',
+        connection: 'ready',
+        wrapperInstanceId: ids.wrapperInstanceId,
+      } as never);
+    });
+
+    await runInDurableObject(session, async instance => {
+      const prototype = Object.getPrototypeOf(instance) as {
+        saveMessagesInCurrentTransaction: (...args: unknown[]) => boolean;
+      };
+      const original = prototype.saveMessagesInCurrentTransaction.bind(instance);
+      // A real epoch mismatch between decision and commit: the commit's own
+      // `isCurrent` check rejects instead of a forced writer refusal.
+      vi.spyOn(prototype, 'saveMessagesInCurrentTransaction').mockImplementationOnce(
+        (messages, epoch, source, deferred) =>
+          original(messages, typeof epoch === 'number' ? epoch + 1 : epoch, source, deferred)
+      );
+      await expect(
+        instance.notifyStopped({
+          reason: 'idle',
+          stopProof: stopProof(ids, 'resolved-incarnation'),
+        })
+      ).resolves.toEqual({ outcome: 'failed', reason: 'stop_commit_rejected' });
+    });
+
+    await runInDurableObject(session, async (_instance, state) => {
+      const [row] = readRawSessionMessages(state.storage.kv);
+      expect(row).toMatchObject({ state: { kind: 'accepted' } });
+      expect(readSessionValueSync(state.storage.kv)).toEqual(before.envelope);
+      const attachment = (await state.storage.get(ATTACHED_SESSION_KEY)) as
+        | { wrapperInstanceId?: string; allocationIncarnation?: string }
+        | undefined;
+      expect(attachment).toEqual(before.attachment);
+      // The attempted hydration rolled back with the rejected commit.
+      expect(attachment?.allocationIncarnation).toBeUndefined();
+    });
+  });
+
+  it('clears the delivery identity and sibling cancellation on a stopped bound session', async () => {
+    const ids = makeIds();
+    const messageId = 'msg_seam_stop_clear';
+    const session = await registerSeamSession(ids);
+    const incarnation = 'incarnation-seam-clear';
+    await runInDurableObject(session, async (_instance, state) => {
+      writeSessionMessages(state.storage, { kind: 'unresolved' }, [
+        {
+          ...acceptedRow(ids, messageId),
+          state: {
+            ...acceptedState({
+              wrapperInstanceId: ids.wrapperInstanceId,
+              preparationAttemptId: 'attempt-seam-clear',
+              acceptedAt: Date.now(),
+              lastActivityAt: Date.now(),
+              executionDeadlineAt: Date.now() + 60_000,
+            }),
+          },
+          cancellation: { operationId: 'cancel-seam-clear', deadlineAt: Date.now() + 10 },
+        },
+      ]);
+      await state.storage.put(ATTACHED_SESSION_KEY, {
+        ownerId,
+        sessionId: ids.sessionId,
+        kiloSessionId: ids.kiloSessionId,
+        directory: ids.directory,
+        sandboxId: ids.sandboxId,
+        wrapperInstanceId: ids.wrapperInstanceId,
+        allocationIncarnation: incarnation,
+      });
+    });
+
+    await runInDurableObject(session, async instance => {
+      await expect(
+        instance.notifyStopped({ reason: 'idle', stopProof: stopProof(ids, incarnation) })
+      ).resolves.toEqual({ outcome: 'delivered' });
+    });
+
+    await runInDurableObject(session, async (_instance, state) => {
+      const [row] = readRawSessionMessages(state.storage.kv);
+      expect(row?.state).toMatchObject({ kind: 'failed', reason: 'idle' });
+      expect(row?.state).not.toHaveProperty('wrapperInstanceId');
+      expect(row?.state).not.toHaveProperty('preparationAttemptId');
+      expect(row).not.toHaveProperty('cancellation');
+      // The already-terminal sibling timestamp is preserved, not re-derived.
+      expect(row?.state).toHaveProperty('at');
     });
   });
 
@@ -229,7 +798,7 @@ describe('sandbox control seam (live wiring)', () => {
     const session = await registerSeamSession(ids);
     const incarnation = 'incarnation-seam-2';
     await runInDurableObject(session, async (_instance, state) => {
-      writeSessionMessages(state.storage, [acceptedRow(ids, messageId)]);
+      writeSessionMessages(state.storage, { kind: 'unresolved' }, [acceptedRow(ids, messageId)]);
       await state.storage.put(ATTACHED_SESSION_KEY, {
         ownerId,
         sessionId: ids.sessionId,
@@ -249,7 +818,7 @@ describe('sandbox control seam (live wiring)', () => {
     });
 
     await runInDurableObject(session, async (_instance, state) => {
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: 'accepted' });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeDefined();
     });
   });
@@ -300,7 +869,7 @@ describe('sandbox control seam (live wiring)', () => {
       });
 
       await runInDurableObject(session, async (_instance, state) => {
-        writeSessionMessages(state.storage, [acceptedRow(ids, messageId)]);
+    writeSessionMessages(state.storage, { kind: 'unresolved' }, [acceptedRow(ids, messageId)]);
         await state.storage.put(ATTACHED_SESSION_KEY, {
           ownerId,
           sessionId: ids.sessionId,
@@ -346,9 +915,9 @@ describe('sandbox control seam (live wiring)', () => {
       // The notification reaches the session before the provider stop resolves.
       await vi.waitFor(async () => {
         const messages = await runInDurableObject(session, async (_instance, sessionState) =>
-          readRawSessionMessages<Record<string, unknown>>(sessionState.storage.kv)
+          readRawSessionMessages(sessionState.storage.kv)
         );
-        expect(messages[0]).toMatchObject({ state: 'failed', failedReason: reason });
+        expect(messages[0]).toMatchObject({ state: { kind: 'failed', reason: reason } });
       });
 
       releaseStop();
@@ -360,9 +929,9 @@ describe('sandbox control seam (live wiring)', () => {
       // The confirmation replays the notification; terminalization and its
       // callback/report repair happen exactly once.
       await runInDurableObject(session, async (_instance, state) => {
-        const messages = readRawSessionMessages<Record<string, unknown>>(state.storage.kv);
+        const messages = readRawSessionMessages(state.storage.kv);
         expect(messages).toHaveLength(1);
-        expect(messages[0]).toMatchObject({ state: 'failed', failedReason: reason });
+        expect(messages[0]).toMatchObject({ state: { kind: 'failed', reason: reason } });
         expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
       });
       // One terminal report repair; the confirmation replay adds none.
@@ -410,7 +979,7 @@ describe('sandbox control seam (live wiring)', () => {
 
       // The stale resolver result is discarded: the new binding is intact and
       // the accepted row was not terminalized.
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: 'accepted' });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toMatchObject({
         wrapperInstanceId: 'rebound-wrapper',
       });
@@ -438,7 +1007,7 @@ describe('sandbox control seam (live wiring)', () => {
     );
     expect(first).toEqual({ outcome: 'failed', reason: 'stop_attachment_unresolved' });
     await runInDurableObject(session, async (_instance, state) => {
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: 'accepted' });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeDefined();
     });
 
@@ -449,8 +1018,7 @@ describe('sandbox control seam (live wiring)', () => {
     expect(second).toEqual({ outcome: 'delivered' });
     await runInDurableObject(session, async (_instance, state) => {
       expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
-        state: 'failed',
-        failedReason: 'idle',
+        state: { kind: 'failed', reason: 'idle' },
       });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
     });
@@ -497,7 +1065,7 @@ describe('sandbox control seam (live wiring)', () => {
 
       // The proof is fenced by the current incarnation, so the fresh binding and
       // its accepted row are untouched.
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: 'accepted' });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toMatchObject({
         allocationIncarnation: 'new-incarnation',
       });
@@ -509,6 +1077,10 @@ describe('sandbox control seam (live wiring)', () => {
     const session = await registerSeamSession(ids);
     const controlStub = env.SANDBOX_CONTROL.getByName(ids.sandboxId);
     await seedLegacyAttachment(session, ids, 'msg_seam_epoch_reject');
+    const before = await runInDurableObject(session, async (_instance, state) => ({
+      envelope: readSessionValueSync(state.storage.kv),
+      attachment: await state.storage.get(ATTACHED_SESSION_KEY),
+    }));
 
     await runInDurableObject(controlStub, instance => {
       const prototype = Object.getPrototypeOf(instance) as { getStatus: () => Promise<unknown> };
@@ -530,9 +1102,17 @@ describe('sandbox control seam (live wiring)', () => {
     });
 
     await runInDurableObject(session, async (_instance, state) => {
-      // A rejected write must not orphan the binding or terminalize the row.
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: 'accepted' });
-      expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeDefined();
+      // A rejected write must not orphan the binding or terminalize the row: the
+      // original envelope and the incarnation-less attachment both survive, and
+      // no incarnation was hydrated onto the record.
+      const [row] = readRawSessionMessages(state.storage.kv);
+      expect(row).toMatchObject({ state: { kind: 'accepted' } });
+      expect(readSessionValueSync(state.storage.kv)).toEqual(before.envelope);
+      const attachment = (await state.storage.get(ATTACHED_SESSION_KEY)) as
+        | { wrapperInstanceId?: string; allocationIncarnation?: string }
+        | undefined;
+      expect(attachment).toEqual(before.attachment);
+      expect(attachment?.allocationIncarnation).toBeUndefined();
     });
   });
 
@@ -563,7 +1143,7 @@ describe('sandbox control seam (live wiring)', () => {
       gate.resolve();
       await notified;
 
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: 'accepted' });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
     });
   });

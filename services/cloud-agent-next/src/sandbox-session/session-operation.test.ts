@@ -16,7 +16,7 @@ import {
   createSessionMessageRecord,
   recordSessionOperationDispatch,
   recordSessionOperationExecutionDeadline,
-  type SessionMessageRecord,
+  type SessionMessage,
 } from './session-message-queue.js';
 import {
   commitSessionOperationResult,
@@ -48,22 +48,36 @@ function response(result: unknown): ResponseFrame {
   return { type: 'response', requestId: crypto.randomUUID(), ok: true, result };
 }
 
-function messages(): SessionMessageRecord[] {
+function messages(): SessionMessage[] {
+  const record = createSessionMessageRecord({
+    turn: { type: 'prompt', messageId: authorization.messageId, prompt: payload.turn.prompt },
+    agent: payload.agent,
+  });
+  if (record.state.kind !== 'queued') throw new Error('expected a queued fixture');
   return [
     {
-      ...createSessionMessageRecord({
-        turn: { type: 'prompt', messageId: authorization.messageId, prompt: payload.turn.prompt },
-        agent: payload.agent,
-      }),
-      wrapperInstanceId: authorization.wrapperInstanceId,
+      ...record,
+      state: { ...record.state, wrapperInstanceId: authorization.wrapperInstanceId },
     },
   ];
 }
 
 const RUNTIME_A = '11111111-1111-4111-8111-111111111111';
 
-function queuedMessage(messageId: string, wrapperInstanceId: string): SessionMessageRecord {
-  return { messageId, state: 'queued', wrapperInstanceId };
+function queuedMessage(messageId: string, wrapperInstanceId: string): SessionMessage {
+  return {
+    messageId,
+    state: {
+      kind: 'queued',
+      intent: null,
+      legacyInvalidIntent: true,
+      deliveryStep: 'waiting',
+      deadlineAt: null,
+      attachFailures: 0,
+      promptFailures: 0,
+      wrapperInstanceId,
+    },
+  };
 }
 
 describe('dispatchSessionOperation', () => {
@@ -73,8 +87,8 @@ describe('dispatchSessionOperation', () => {
       expect(input).toMatchObject({ operation: 'session.prompt', authorization, payload });
       expect(stored).toMatchObject([
         {
-          unresolvedDispatch: true,
-          operations: { prompt: { dispatched: true, authorization } },
+          state: { kind: 'queued', unresolvedDispatch: true },
+          proofs: { prompt: { dispatched: true, authorization } },
         },
       ]);
       return response({ messageId: authorization.messageId, status: 'accepted' });
@@ -202,7 +216,7 @@ describe('dispatchSessionOperation', () => {
     const dispatched = recordSessionOperationDispatch(messages(), attachAuthorization);
     if (!dispatched) throw new Error('Failed to create attach dispatch proof');
     let stored = dispatched;
-    const commit = vi.fn((next: SessionMessageRecord[]) => {
+    const commit = vi.fn((next: SessionMessage[]) => {
       stored = next;
       return true;
     });
@@ -275,13 +289,7 @@ describe('dispatchSessionOperation', () => {
       nativeRuntimeId: '33333333-3333-4333-8333-333333333333',
     };
     const seeded = recordSessionOperationDispatch(
-      [
-        {
-          ...messages()[0]!,
-          messageId: attach.messageId,
-          wrapperInstanceId: attach.wrapperInstanceId,
-        },
-      ],
+      [queuedMessage(attach.messageId, attach.wrapperInstanceId)],
       attach
     );
     if (!seeded) throw new Error('Failed to create attach dispatch proof');
@@ -310,8 +318,8 @@ describe('dispatchSessionOperation', () => {
       'session.operation.get',
       'session.attach',
     ]);
-    expect(stored[0]?.operations?.attach?.dispatched).toBe(true);
-    expect(stored[0]?.operations?.retiredAttach).toMatchObject({ authorization: attach });
+    expect(stored[0]?.proofs?.attach?.dispatched).toBe(true);
+    expect(stored[0]?.proofs?.retiredAttach).toMatchObject({ authorization: attach });
   });
 
   it('keeps a dispatched prompt when the runtime has no record of it', async () => {
@@ -338,8 +346,8 @@ describe('dispatchSessionOperation', () => {
       )
     ).resolves.toEqual({ state: 'uncertain', reason: 'missing' });
     expect(request.mock.calls.map(([input]) => input.operation)).toEqual(['session.operation.get']);
-    expect(stored[0]?.operations?.prompt?.dispatched).toBe(true);
-    expect(stored[0]?.operations?.retiredAttach).toBeUndefined();
+    expect(stored[0]?.proofs?.prompt?.dispatched).toBe(true);
+    expect(stored[0]?.proofs?.retiredAttach).toBeUndefined();
   });
 
   it('does not replay a prompt after its admission response is lost before application', async () => {
@@ -404,7 +412,7 @@ describe('dispatchSessionOperation', () => {
         }
       )
     ).resolves.toMatchObject({ state: 'rejected', error: { code: 'session_busy' } });
-    expect(stored[0]?.operations?.prompt?.dispatched).toBe(true);
+    expect(stored[0]?.proofs?.prompt?.dispatched).toBe(true);
   });
 
   it('clears dispatch proof only after an explicit before-admission rejection', async () => {
@@ -438,9 +446,9 @@ describe('dispatchSessionOperation', () => {
       )
     ).resolves.toMatchObject({ state: 'rejected', error: { code: 'session_busy' } });
     expect(stored[0]).toMatchObject({
-      unresolvedDispatch: undefined,
-      operations: { prompt: { authorization, dispatched: false } },
+      proofs: { prompt: { authorization, dispatched: false } },
     });
+    expect(stored[0]?.state).not.toHaveProperty('unresolvedDispatch');
   });
 
   it('persists a recovered result before its acknowledgement can be retried', async () => {
@@ -479,7 +487,7 @@ describe('dispatchSessionOperation', () => {
           request,
           persistResult: async receipt => {
             const applied = applySessionOperationResult(
-              stored,
+              { binding: { kind: 'unbound' }, messages: stored },
               receipt,
               await sessionOperationResultHash(receipt),
               Date.now()
@@ -496,7 +504,7 @@ describe('dispatchSessionOperation', () => {
       )
     ).resolves.toMatchObject({ state: 'completed' });
     await Promise.resolve();
-    expect(stored).toMatchObject([{ state: 'completed', terminalSource: 'operation_result' }]);
+    expect(stored).toMatchObject([{ state: { kind: 'completed', source: 'operation_result' } }]);
     expect(request.mock.calls.map(([input]) => input.operation)).toEqual([
       'session.operation.get',
       'session.operation.ack',
@@ -516,28 +524,36 @@ describe('dispatchSessionOperation', () => {
       preparing: [],
     };
     const resultHash = await sessionOperationResultHash(delivery);
-    const applied = applySessionOperationResult(dispatched, delivery, resultHash, Date.now());
+    const applied = applySessionOperationResult(
+      { binding: { kind: 'unbound' }, messages: dispatched },
+      delivery,
+      resultHash,
+      Date.now()
+    );
     if (!applied) throw new Error('Failed to apply operation result');
     expect(applied).toMatchObject({
       disposition: 'applied',
       messages: [
         {
-          state: 'completed',
-          unresolvedDispatch: undefined,
-          terminalSource: 'operation_result',
-          operations: { prompt: { resultHash } },
+          state: { kind: 'completed', source: 'operation_result' },
+          proofs: { prompt: { resultHash } },
         },
       ],
     });
 
     expect(
-      applySessionOperationResult(applied.messages, delivery, resultHash, Date.now())
+      applySessionOperationResult(
+        { binding: { kind: 'unbound' }, messages: applied.messages },
+        delivery,
+        resultHash,
+        Date.now()
+      )
     ).toMatchObject({
       disposition: 'identical',
     });
     expect(
       applySessionOperationResult(
-        applied.messages,
+        { binding: { kind: 'unbound' }, messages: applied.messages },
         {
           ...delivery,
           result: {
@@ -549,7 +565,7 @@ describe('dispatchSessionOperation', () => {
         Date.now()
       )
     ).toMatchObject({ disposition: 'already_final' });
-    expect(applied.messages[0]?.operations?.prompt?.resultHash).toBe(resultHash);
+    expect(applied.messages[0]?.proofs?.prompt?.resultHash).toBe(resultHash);
   });
 
   it.each(['event', 'message'] as const)(
@@ -575,7 +591,7 @@ describe('dispatchSessionOperation', () => {
       };
       const hash = await sessionOperationResultHash(delivery);
       const notifications: StoredEvent[] = [];
-      const commit = vi.fn((next: SessionMessageRecord[]) => {
+      const commit = vi.fn((next: SessionMessage[]) => {
         if (failure === 'message') return false;
         stored = next;
         return true;
@@ -595,7 +611,11 @@ describe('dispatchSessionOperation', () => {
           hash,
           deadlineAt: Date.now() + 1_000,
           isCurrent: () => true,
-          messages: { read: () => stored, commit },
+          messages: {
+            read: () => stored,
+            commit,
+            aggregate: () => ({ binding: { kind: 'unbound' }, messages: stored }),
+          },
           eventQueries,
           notifications,
         })
@@ -615,12 +635,13 @@ describe('dispatchSessionOperation', () => {
             stored = next;
             return true;
           },
+          aggregate: () => ({ binding: { kind: 'unbound' }, messages: stored }),
         },
         eventQueries: { upsert: () => 1, insert: () => 1 } as unknown as EventQueries,
         notifications,
       });
       expect(acknowledgement).toMatchObject({ disposition: 'applied', resultHash: hash });
-      expect(stored[0]?.operations?.prompt?.resultHash).toBe(hash);
+      expect(stored[0]?.proofs?.prompt?.resultHash).toBe(hash);
       expect(notifications).toHaveLength(1);
     }
   );
@@ -664,6 +685,7 @@ describe('dispatchSessionOperation', () => {
           stored = next;
           return true;
         },
+        aggregate: () => ({ binding: { kind: 'unbound' }, messages: stored }),
       },
       notifications: [],
     });
@@ -694,8 +716,7 @@ describe('execution deadline persistence', () => {
       dispatchAuthorization()
     );
 
-    expect(replayed?.[0]).toMatchObject({ executionDeadlineAt: 3_631_000 });
-    expect(replayed?.[0]?.operations?.prompt).toMatchObject({ executionDeadlineAt: 3_631_000 });
+    expect(replayed?.[0]?.proofs?.prompt).toMatchObject({ executionDeadlineAt: 3_631_000 });
   });
 
   it('replaces the dispatch ceiling once with the original wrapper execution boundary', () => {
@@ -722,8 +743,7 @@ describe('execution deadline persistence', () => {
       dispatchAuthorization()
     );
 
-    expect(recovered).toMatchObject([{ executionDeadlineAt: 3_600_500 }]);
-    expect(recovered?.[0]?.operations?.prompt).toMatchObject({ executionDeadlineAt: 3_600_500 });
+    expect(recovered?.[0]?.proofs?.prompt).toMatchObject({ executionDeadlineAt: 3_600_500 });
   });
 });
 

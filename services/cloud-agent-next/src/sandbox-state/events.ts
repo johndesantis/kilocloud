@@ -20,6 +20,9 @@ import type {
 } from './model/allocation.js';
 import type { HealthRecoveryStep, HealthVerdict } from './model/health.js';
 import type {
+  CloudAgentAssistantFailureReason,
+  CloudAgentProviderOwnership,
+  GateResult,
   MessageProofs,
   RuntimeHandle,
   SessionMessage,
@@ -213,6 +216,9 @@ export type OutcomeEvent = {
   detail?: string;
   result?: unknown;
   assistantMessageId?: string;
+  gateResult?: GateResult;
+  assistantReason?: CloudAgentAssistantFailureReason;
+  providerOwnership?: CloudAgentProviderOwnership;
 };
 
 /** Allocation → session seam. Delivered by the allocation command runner. */

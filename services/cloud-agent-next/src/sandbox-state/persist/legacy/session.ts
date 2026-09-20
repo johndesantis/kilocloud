@@ -23,7 +23,10 @@ import type {
   TurnFinalization,
 } from '../../model/session.js';
 import {
+  CloudAgentAssistantFailureReasonSchema,
+  CloudAgentProviderOwnershipSchema,
   acceptedTurnSchema,
+  gateResultSchema,
   messageProofsSchema,
   preparationWaitSchema,
   sessionMessageIntentSchema,
@@ -67,6 +70,9 @@ export const legacySessionRowSchema = z
       .strict()
       .optional(),
     operations: messageProofsSchema.optional(),
+    gateResult: gateResultSchema.optional(),
+    assistantReason: CloudAgentAssistantFailureReasonSchema.optional(),
+    providerOwnership: CloudAgentProviderOwnershipSchema.optional(),
   })
   .passthrough();
 
@@ -92,13 +98,20 @@ function resolveIntent(row: LegacySessionRow): IntentCarry {
     ...(row.finalization !== undefined ? { finalization: row.finalization } : {}),
   };
   const hasLegacy = Object.keys(legacy).length > 0;
-  // A row without an immutable intent is explicitly legacy-invalid so the
-  // canonical intent invariant holds.
-  return {
-    intent: null,
-    legacyInvalidIntent: true,
-    ...(hasLegacy ? { legacy } : {}),
-  };
+  // A row a previous freeze already failed on carries the permanent marker; the
+  // marker wins even when the failed freeze retained its legacy payload, so a
+  // later freeze with a valid model can never promote a permanently invalid row.
+  if (row.legacyIntentInvalid === true) {
+    return {
+      intent: null,
+      legacyInvalidIntent: true,
+      ...(hasLegacy ? { legacy } : {}),
+    };
+  }
+  // A row with legacy intent data and no marker is *unresolved*: a later freeze
+  // may resolve it. Only a row with no payload at all is permanently invalid.
+  if (hasLegacy) return { intent: null, legacy };
+  return { intent: null, legacyInvalidIntent: true };
 }
 
 function queuedAtOf(row: LegacySessionRow): { queuedAt?: number } {
@@ -125,6 +138,19 @@ function cancellationOf(row: LegacySessionRow): { cancellation?: Cancellation } 
   return row.cancellation !== undefined ? { cancellation: row.cancellation } : {};
 }
 
+/** The retained delivery/settlement identity, when the legacy row carried it. */
+function identityOf(row: LegacySessionRow): {
+  wrapperInstanceId?: string;
+  preparationAttemptId?: string;
+} {
+  return {
+    ...(row.wrapperInstanceId !== undefined ? { wrapperInstanceId: row.wrapperInstanceId } : {}),
+    ...(row.preparationAttemptId !== undefined
+      ? { preparationAttemptId: row.preparationAttemptId }
+      : {}),
+  };
+}
+
 function toQueued(row: LegacySessionRow): SessionMessage {
   const resolved = resolveIntent(row);
   return {
@@ -140,6 +166,11 @@ function toQueued(row: LegacySessionRow): SessionMessage {
       deadlineAt: row.deliveryDeadlineAt ?? null,
       attachFailures: row.attachFailures ?? 0,
       promptFailures: row.promptFailures ?? 0,
+      // Preserve the original retry scope: `deliveryStep` conflates it with
+      // "has a preparation attempt", so it cannot reconstruct it.
+      ...(row.deliveryRetryScope !== undefined
+        ? { deliveryRetryScope: row.deliveryRetryScope }
+        : {}),
       ...(row.retryNotBefore !== undefined ? { retryNotBefore: row.retryNotBefore } : {}),
       ...(row.preparationAttemptId !== undefined
         ? { preparationAttemptId: row.preparationAttemptId }
@@ -169,7 +200,7 @@ function toAccepted(row: LegacySessionRow): SessionMessage {
       acceptedAt,
       ...(row.lastActivityAt !== undefined ? { lastActivityAt: row.lastActivityAt } : {}),
       executionDeadlineAt,
-      ...(row.wrapperInstanceId !== undefined ? { wrapperInstanceId: row.wrapperInstanceId } : {}),
+      ...identityOf(row),
     },
     ...(row.operations !== undefined ? { proofs: row.operations } : {}),
     ...cancellationOf(row),
@@ -181,14 +212,29 @@ function toTerminal(row: LegacySessionRow): SessionMessage {
   const at = terminalAt(row);
   const source = terminalSource(row);
   const carry = carryOf(resolved);
+  // `acceptedAt` is preserved verbatim when the legacy row carried it; it must
+  // not reuse `terminalAt`, which collapses the two timestamps.
+  const acceptedAt = row.acceptedAt === undefined ? {} : { acceptedAt: row.acceptedAt };
+  const identity = identityOf(row);
   const state =
     row.state === 'completed'
-      ? { kind: 'completed' as const, ...carry, ...queuedAtOf(row), at, source }
+      ? {
+          kind: 'completed' as const,
+          ...carry,
+          ...queuedAtOf(row),
+          ...acceptedAt,
+          ...identity,
+          at,
+          source,
+          ...(row.gateResult !== undefined ? { gateResult: row.gateResult } : {}),
+        }
       : row.state === 'cancelled'
         ? {
             kind: 'cancelled' as const,
             ...carry,
             ...queuedAtOf(row),
+            ...acceptedAt,
+            ...identity,
             at,
             source,
             ...(row.failedReason !== undefined ? { reason: row.failedReason } : {}),
@@ -197,10 +243,16 @@ function toTerminal(row: LegacySessionRow): SessionMessage {
             kind: 'failed' as const,
             ...carry,
             ...queuedAtOf(row),
+            ...acceptedAt,
+            ...identity,
             at,
             source,
             ...(row.failedReason !== undefined ? { reason: row.failedReason } : {}),
             ...(row.failedDetail !== undefined ? { detail: row.failedDetail } : {}),
+            ...(row.assistantReason !== undefined ? { assistantReason: row.assistantReason } : {}),
+            ...(row.providerOwnership !== undefined
+              ? { providerOwnership: row.providerOwnership }
+              : {}),
           };
   return {
     messageId: row.messageId,

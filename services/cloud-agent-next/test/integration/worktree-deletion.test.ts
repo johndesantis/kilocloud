@@ -456,7 +456,10 @@ describe('worktree deletion in Durable Objects', () => {
           { sessionId: kiloId(1), parentSessionId: kiloId(0) },
           { sessionId: kiloId(2), parentSessionId: kiloId(1) },
         ]);
-        expect((await readSessionValue(state.storage)) ?? []).toEqual([]);
+        expect(
+          ((await readSessionValue(state.storage)) as { messages?: unknown[] } | undefined)
+            ?.messages ?? []
+        ).toEqual([]);
         await instance.finishWorktreeDeletion(worktreeId);
         await expect(instance.getWorktreeChildSessions(worktreeId)).resolves.toEqual([]);
       } finally {
@@ -1534,7 +1537,9 @@ describe('worktree deletion in Durable Objects', () => {
     });
     await expect(closed).resolves.toBe(1001);
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(await readSessionValue(state.storage)).toMatchObject([{ state: 'cancelled' }]);
+      expect(await readSessionValue(state.storage)).toMatchObject({
+        messages: [{ state: { kind: 'cancelled' } }],
+      });
       // Deletion preserves the interrupted report obligation, so its delivery
       // alarm is intentionally armed instead of removed.
       expect(await state.storage.getAlarm()).not.toBeNull();
@@ -1917,6 +1922,8 @@ describe('worktree deletion in Durable Objects', () => {
             const allocation = await readCanonicalAllocationRecord(state.storage);
             await runInDurableObject(siblingSession, async (siblingInstance, siblingState) => {
               await siblingInstance.alarm();
+              // This sibling is deliberately seeded as a pre-cutover legacy
+              // array, so the raw value stays in the legacy flat shape.
               expect(await readSessionValue(siblingState.storage)).toMatchObject([
                 { messageId: 'msg_waiting_for_answer', state: 'accepted', wrapperInstanceId },
               ]);

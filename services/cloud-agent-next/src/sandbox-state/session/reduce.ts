@@ -14,6 +14,9 @@ import type { StateMeta, TransitionMeta } from '../registry.js';
 import type { SessionEvent } from '../events.js';
 import type {
   Binding,
+  CloudAgentAssistantFailureReason,
+  CloudAgentProviderOwnership,
+  GateResult,
   MessageProofs,
   MessageState,
   SessionAggregate,
@@ -185,9 +188,18 @@ function isTerminal(state: MessageState): boolean {
   return state.kind === 'completed' || state.kind === 'failed' || state.kind === 'cancelled';
 }
 
+/**
+ * The single queue-head rule: no accepted message is a head, otherwise the first
+ * queued message is. Exported so the session-message queue helpers reuse it
+ * instead of re-deriving the rule.
+ */
+export function headQueuedMessageId(messages: readonly SessionMessage[]): string | undefined {
+  if (messages.some(message => message.state.kind === 'accepted')) return undefined;
+  return messages.find(message => message.state.kind === 'queued')?.messageId;
+}
+
 function headMessageId(aggregate: SessionAggregate): string | undefined {
-  if (aggregate.messages.some(message => message.state.kind === 'accepted')) return undefined;
-  return aggregate.messages.find(message => message.state.kind === 'queued')?.messageId;
+  return headQueuedMessageId(aggregate.messages);
 }
 
 function find(aggregate: SessionAggregate, messageId: string): SessionMessage | undefined {
@@ -213,48 +225,85 @@ function carryFields(state: MessageState): {
   legacyInvalidIntent?: true;
   legacy?: NonNullable<MessageState['legacy']>;
   queuedAt?: number;
+  wrapperInstanceId?: string;
+  preparationAttemptId?: string;
 } {
   return {
     intent: state.intent,
     ...(state.legacyInvalidIntent ? { legacyInvalidIntent: true as const } : {}),
     ...(state.legacy !== undefined ? { legacy: state.legacy } : {}),
     ...(state.queuedAt !== undefined ? { queuedAt: state.queuedAt } : {}),
+    // The message owns its delivery/settlement identity: ordinary terminalization
+    // preserves it so a same-wrapper/same-attempt replay or deferred scope check
+    // continues to fence. Allocation-loss terminalization clears it explicitly.
+    ...(state.wrapperInstanceId !== undefined
+      ? { wrapperInstanceId: state.wrapperInstanceId }
+      : {}),
+    ...(state.preparationAttemptId !== undefined
+      ? { preparationAttemptId: state.preparationAttemptId }
+      : {}),
   };
 }
 
-function terminal(
+/** Any accepted timestamp carried by the previous state (accepted or terminal). */
+function carriedAcceptedAt(state: MessageState): number | undefined {
+  return state.kind === 'queued' ? undefined : state.acceptedAt;
+}
+
+export function terminalMessageState(
   previous: MessageState,
   status: 'completed' | 'failed' | 'cancelled',
   at: number,
   source: SessionMessageTerminalSource,
-  extra: { reason?: string; detail?: string; result?: unknown; assistantMessageId?: string }
+  extra: {
+    reason?: string;
+    detail?: string;
+    result?: unknown;
+    assistantMessageId?: string;
+    gateResult?: GateResult;
+    assistantReason?: CloudAgentAssistantFailureReason;
+    providerOwnership?: CloudAgentProviderOwnership;
+  }
 ): MessageState {
   const carry = carryFields(previous);
+  // An already-accepted turn keeps its acceptance time through terminalization;
+  // a queued turn settled by a wrapper/operation outcome infers `at`, but a
+  // coordinator failure is not an observable dispatch acceptance.
+  const acceptedAt = carriedAcceptedAt(previous) ?? (source === 'coordinator' ? undefined : at);
+  const acceptance = acceptedAt === undefined ? {} : { acceptedAt };
   if (status === 'completed') {
     return {
       kind: 'completed',
       ...carry,
+      ...acceptance,
       at,
       source,
       ...(extra.result !== undefined ? { result: extra.result } : {}),
       ...(extra.assistantMessageId !== undefined
         ? { assistantMessageId: extra.assistantMessageId }
         : {}),
+      ...(extra.gateResult !== undefined ? { gateResult: extra.gateResult } : {}),
     };
   }
   if (status === 'failed') {
     return {
       kind: 'failed',
       ...carry,
+      ...acceptance,
       at,
       source,
       ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
       ...(extra.detail !== undefined ? { detail: extra.detail } : {}),
+      ...(extra.assistantReason !== undefined ? { assistantReason: extra.assistantReason } : {}),
+      ...(extra.providerOwnership !== undefined
+        ? { providerOwnership: extra.providerOwnership }
+        : {}),
     };
   }
   return {
     kind: 'cancelled',
     ...carry,
+    ...acceptance,
     at,
     source,
     ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
@@ -279,11 +328,18 @@ export function terminalizeOnStop(
 ): SessionAggregate {
   return {
     binding: { kind: 'unbound' },
-    messages: aggregate.messages.map(message =>
-      message.state.kind === 'queued' || message.state.kind === 'accepted'
-        ? { ...message, state: terminal(message.state, 'failed', now, 'coordinator', { reason }) }
-        : message
-    ),
+    messages: aggregate.messages.map(message => {
+      if (message.state.kind !== 'queued' && message.state.kind !== 'accepted') return message;
+      const state = terminalMessageState(message.state, 'failed', now, 'coordinator', { reason });
+      // Allocation loss is the single owner that clears the message's delivery
+      // identity (deleting the spread's retained values), matching HEAD's
+      // stop projection. The sibling cancellation marker is cleared too;
+      // already-terminal messages are left untouched.
+      delete state.wrapperInstanceId;
+      delete state.preparationAttemptId;
+      const { cancellation: _cancellation, ...rest } = message;
+      return { ...rest, state };
+    }),
   };
 }
 
@@ -412,11 +468,14 @@ export function decideSession(
       }
       const next = replace(aggregate, event.messageId, current => ({
         ...current,
-        state: terminal(current.state, event.status, event.at, event.source, {
+        state: terminalMessageState(current.state, event.status, event.at, event.source, {
           reason: event.reason,
           detail: event.detail,
           result: event.result,
           assistantMessageId: event.assistantMessageId,
+          gateResult: event.gateResult,
+          assistantReason: event.assistantReason,
+          providerOwnership: event.providerOwnership,
         }),
       }));
       return deadlined(next);
@@ -444,7 +503,7 @@ export function decideSession(
       }
       const next = replace(aggregate, event.messageId, current => ({
         ...current,
-        state: terminal(current.state, 'cancelled', event.at, 'coordinator', {
+        state: terminalMessageState(current.state, 'cancelled', event.at, 'coordinator', {
           reason: event.reason ?? 'queued_message_cancelled',
         }),
       }));
@@ -474,7 +533,7 @@ export function decideSession(
             // The dispatch stayed ambiguous, so do not claim execution stopped.
             return {
               ...message,
-              state: terminal(message.state, 'failed', now, 'coordinator', {
+              state: terminalMessageState(message.state, 'failed', now, 'coordinator', {
                 reason: 'cancellation_unconfirmed',
               }),
             };
@@ -484,7 +543,7 @@ export function decideSession(
             changed = true;
             return {
               ...message,
-              state: terminal(message.state, 'failed', now, 'coordinator', {
+              state: terminalMessageState(message.state, 'failed', now, 'coordinator', {
                 reason: 'delivery_deadline',
               }),
             };
@@ -501,7 +560,7 @@ export function decideSession(
             changed = true;
             return {
               ...message,
-              state: terminal(message.state, 'failed', now, 'coordinator', {
+              state: terminalMessageState(message.state, 'failed', now, 'coordinator', {
                 reason: 'cancellation_unconfirmed',
               }),
             };
@@ -510,7 +569,7 @@ export function decideSession(
             changed = true;
             return {
               ...message,
-              state: terminal(message.state, 'failed', now, 'coordinator', {
+              state: terminalMessageState(message.state, 'failed', now, 'coordinator', {
                 reason: 'execution_deadline',
               }),
             };

@@ -252,11 +252,99 @@ describe('canonical load — session dispatch', () => {
     expect(second.state.kind).toBe('failed');
     expect(second.state.kind === 'failed' && second.state.reason).toBe('boom');
     expect(second.state.kind === 'failed' && second.state.at).toBe(222);
-    // Immutable intent survives terminalization.
+    // A legacy payload with no marker is *unresolved* (a later freeze may still
+    // resolve it), not permanently invalid.
     expect(second.state.intent).toBeNull();
-    expect(second.state.legacyInvalidIntent).toBe(true);
+    expect(second.state.legacyInvalidIntent).toBeUndefined();
     const legacyTurn = second.state.legacy?.turn;
     expect(legacyTurn?.type === 'prompt' && legacyTurn.prompt).toBe('legacy');
+  });
+
+  it('maps a legacy completed root gate result into the nested state', async () => {
+    const rows = [
+      {
+        messageId: 'm1',
+        state: 'completed',
+        turn: { type: 'prompt', messageId: 'm1', prompt: 'review' },
+        terminalAt: 222,
+        gateResult: 'fail',
+      },
+      {
+        messageId: 'm2',
+        state: 'completed',
+        turn: { type: 'prompt', messageId: 'm2', prompt: 'review' },
+        terminalAt: 223,
+      },
+    ];
+    const result = await loadSession(storageWith(seedSessionValue({}, rows)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.source).toBe('legacy');
+    const withGate = result.value.messages[0]?.state;
+    expect(withGate?.kind === 'completed' && withGate.gateResult).toBe('fail');
+    const withoutGate = result.value.messages[1]?.state;
+    expect(withoutGate).toBeDefined();
+    expect(withoutGate).not.toHaveProperty('gateResult');
+  });
+
+  it('maps legacy failed root assistant facts into the nested state', async () => {
+    const rows = [
+      {
+        messageId: 'm1',
+        state: 'failed',
+        turn: { type: 'prompt', messageId: 'm1', prompt: 'boom' },
+        terminalAt: 222,
+        assistantReason: 'rate_limited',
+        providerOwnership: 'unknown',
+      },
+      {
+        messageId: 'm2',
+        state: 'failed',
+        turn: { type: 'prompt', messageId: 'm2', prompt: 'boom' },
+        terminalAt: 223,
+      },
+    ];
+    const result = await loadSession(storageWith(seedSessionValue({}, rows)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.source).toBe('legacy');
+    const withFacts = result.value.messages[0]?.state;
+    expect(withFacts?.kind === 'failed' && withFacts.assistantReason).toBe('rate_limited');
+    expect(withFacts?.kind === 'failed' && withFacts.providerOwnership).toBe('unknown');
+    const withoutFacts = result.value.messages[1]?.state;
+    expect(withoutFacts).toBeDefined();
+    expect(withoutFacts).not.toHaveProperty('assistantReason');
+    expect(withoutFacts).not.toHaveProperty('providerOwnership');
+  });
+
+  it('preserves a legacy terminal acceptedAt and its retained delivery identity', async () => {
+    const rows = [
+      {
+        messageId: 'm1',
+        state: 'failed',
+        turn: { type: 'prompt', messageId: 'm1', prompt: 'boom' },
+        queuedAt: 95,
+        acceptedAt: 100,
+        failedReason: 'boom',
+        terminalAt: 222,
+        wrapperInstanceId: 'w-1',
+        preparationAttemptId: 'attempt-1',
+      },
+    ];
+    const result = await loadSession(storageWith(seedSessionValue({}, rows)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const state = result.value.messages[0]?.state;
+    if (state?.kind !== 'failed') throw new Error('Expected a failed terminal state');
+    // `acceptedAt` must not collapse into the terminal timestamp.
+    expect(state).toMatchObject({
+      kind: 'failed',
+      at: 222,
+      acceptedAt: 100,
+      wrapperInstanceId: 'w-1',
+      preparationAttemptId: 'attempt-1',
+    });
+    expect(state.acceptedAt).not.toBe(state.at);
   });
 
   it('legacy accepted rows resolve against the decoded allocation and accept its real loss proof', async () => {
