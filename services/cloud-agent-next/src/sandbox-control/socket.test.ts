@@ -395,6 +395,7 @@ describe('sandbox control socket handler', () => {
             kiloVersionHeartbeat: true,
             sessionOperationResults: true,
             eventBatches: true,
+            kiloLocalPhase: true,
           },
         },
       })

@@ -1,9 +1,10 @@
 /**
  * Compatibility projection from the canonical allocation/health aggregate into
  * the public `SandboxStatusSnapshot`. The route schema is unchanged; the public
- * label/detail pair is the canonical `projectStatus` output, with the
- * `check_needed` detail mapped to today's `connection_unavailable` until C5 adds
- * it to the shared schema.
+ * label/detail pair is the canonical `projectStatus` output. The shared schema
+ * already accepts `check_needed`; the worker still maps it to today's
+ * `connection_unavailable` until a compatible web deployment is verified live
+ * (C5 stage 2).
  *
  * Runtime metadata, routes and the connection observation are folded in here so
  * `getSandboxStatus` no longer reads the stored flat/deadline state.
@@ -32,7 +33,10 @@ export type StatusSnapshotInput = {
 
 type PublicPair = Pick<SandboxStatusSnapshot, 'status' | 'detailCode'>;
 
-/** `check_needed` is not yet a public detail code; keep today's wire value. */
+/**
+ * `check_needed` is a public detail code now; keep today's wire value until a
+ * compatible web deployment is verified live (C5 stage 2).
+ */
 function publicPair(projection: { status: string; detailCode: string }): PublicPair {
   if (projection.detailCode === 'check_needed') {
     return { status: 'unreachable', detailCode: 'connection_unavailable' };

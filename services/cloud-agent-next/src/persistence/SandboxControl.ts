@@ -100,12 +100,8 @@ import {
   type AttachRouteInput,
   type SessionRoute,
 } from '../sandbox-control/session-routes.js';
-import {
-  projectReportedStatus,
-  type ReportedSandboxStatus,
-  type WorkState,
-} from '../sandbox-control/status-projection.js';
 import { projectStatusSnapshot } from '../sandbox-control/status-snapshot.js';
+import { projectStatus, type StatusProjection } from '../sandbox-state/project/status.js';
 import {
   type AllocationController,
   isLiveAllocation,
@@ -466,8 +462,15 @@ function batchOutcomes(
 
 export type AttachSessionInput = AttachRouteInput;
 
-export type SandboxControlStatus = {
-  reported: ReportedSandboxStatus;
+/** Aggregate work observed across the attached session routes. */
+export type WorkState = 'idle' | 'active' | 'finalizing';
+
+/**
+ * Derived control read model. The status label and detail code are the
+ * canonical projection of the allocation, health and `now`; the observation
+ * fields remain for the session dispatch decisions that read them.
+ */
+export type SandboxControlStatus = StatusProjection & {
   physical: PhysicalState;
   connection: ConnectionState;
   work: WorkState;
@@ -2795,8 +2798,9 @@ export class SandboxControl extends DurableObject<Env> {
     const work = await this.workState();
     const runtime = this.readyWrapperRuntime();
     const physical = legacyPhysicalState(record);
+    const projection = projectStatus({ allocation: record, ownerPresent: true, now: Date.now() });
     return {
-      reported: projectReportedStatus({ physical, connection, work }),
+      ...projection,
       physical,
       connection,
       work,
@@ -2823,13 +2827,8 @@ export class SandboxControl extends DurableObject<Env> {
   private async waitingAcquisitionStatus(record: AllocationRecord): Promise<SandboxControlStatus> {
     const status = await this.statusForAllocation(record);
     if (status.connection !== 'ready') return status;
-    const connection = 'connected' as const;
     const { wrapperInstanceId: _withheld, ...rest } = status;
-    return {
-      ...rest,
-      connection,
-      reported: projectReportedStatus({ physical: status.physical, connection, work: status.work }),
-    };
+    return { ...rest, connection: 'connected' };
   }
 
   async getSandboxStatus(input: {

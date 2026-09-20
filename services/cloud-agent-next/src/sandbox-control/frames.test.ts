@@ -69,6 +69,17 @@ describe('sandbox control frames', () => {
     ).toBe(false);
   });
 
+  it('advertises the local-phase capability only when the handler sets it', () => {
+    expect(
+      sandboxHelloResultSchema.parse(helloResult({ kiloLocalPhase: true })).capabilities
+    ).toEqual({
+      kiloVersionHeartbeat: true,
+      sessionOperationResults: true,
+      kiloLocalPhase: true,
+    });
+    expect(helloResult().capabilities).not.toHaveProperty('kiloLocalPhase');
+  });
+
   it('accepts a valid request envelope', () => {
     const parsed = parseControlFrame(
       JSON.stringify({

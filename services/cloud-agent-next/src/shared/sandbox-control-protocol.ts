@@ -271,6 +271,7 @@ export const sandboxHelloResultSchema = z.object({
       runtimeIsolation: z.literal(true).optional(),
       runtimeRecovery: z.literal(true).optional(),
       eventBatches: z.boolean().optional(),
+      kiloLocalPhase: z.literal(true).optional(),
     })
     .optional(),
 });

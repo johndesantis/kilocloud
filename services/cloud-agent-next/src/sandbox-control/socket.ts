@@ -628,6 +628,7 @@ export function createSandboxControlSocketHandler(
               connectionRecovery: payload.capabilities?.connectionRecovery === true,
               eventReceipts: payload.capabilities?.eventReceipts === true,
               eventBatches: true,
+              kiloLocalPhase: true,
             })
           )
         );

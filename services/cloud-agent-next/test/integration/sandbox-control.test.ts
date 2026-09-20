@@ -538,6 +538,7 @@ async function completeHello(
           sessionOperationResults: true,
           ...(identity.connectionRecovery ? { connectionRecovery: true } : {}),
           eventBatches: true,
+          kiloLocalPhase: true,
         },
       },
     })
@@ -6206,7 +6207,8 @@ describe('SandboxControl durable remainder', () => {
       expect(canonicalProviderRef(record)).toBeNull();
       await expect(instance.getAllocationRecord()).resolves.toEqual(record);
       await expect(instance.getStatus()).resolves.toMatchObject({
-        reported: 'booting',
+        status: 'starting',
+        detailCode: 'sandbox_starting',
         physical: 'creating',
       });
     });
@@ -6285,7 +6287,7 @@ describe('SandboxControl durable remainder', () => {
     });
   });
 
-  it('projects shutting-down for a stopping allocation that never bound a ref', async () => {
+  it('projects stopping for a stopping allocation that never bound a ref', async () => {
     const stub = env.SANDBOX_CONTROL.getByName('sbx__control_stop_tombstone');
     await runInDurableObject(stub, async (instance, state) => {
       await seedCanonicalAllocation(state.storage, {
@@ -6301,7 +6303,8 @@ describe('SandboxControl durable remainder', () => {
       expect(canonicalCreateIntentId(stopping)).toBe('intent_stop');
       expect(canonicalStopIntent(stopping)?.reason).toBe('idle');
       await expect(instance.getStatus()).resolves.toMatchObject({
-        reported: 'shutting-down',
+        status: 'stopping',
+        detailCode: 'sandbox_stopping',
         physical: 'stopping',
       });
     });

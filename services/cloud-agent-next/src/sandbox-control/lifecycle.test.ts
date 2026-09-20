@@ -891,7 +891,11 @@ describe('SandboxControl lifecycle boundaries', () => {
             expectedWrapperInstanceId: identity.wrapperInstanceId,
           })
         ).resolves.toMatchObject({ ok: true });
-        await expect(h.control.getStatus()).resolves.toMatchObject({ reported: 'ready' });
+        await expect(h.control.getStatus()).resolves.toMatchObject({
+          status: 'active',
+          connection: 'ready',
+          work: 'idle',
+        });
         if (!contained) {
           expect(h.issueKiloSessionCapability).not.toHaveBeenCalled();
           expect(await loadSessionCredentialGrants(h.storage)).toEqual([
@@ -1032,7 +1036,11 @@ describe('SandboxControl lifecycle boundaries', () => {
     const grants = await loadSessionCredentialGrants(h.storage);
     h.env.CREDENTIAL_CONTAINMENT_ENABLED = 'true';
     await h.evict();
-    await expect(h.create()).resolves.toMatchObject({ reported: 'ready' });
+    await expect(h.create()).resolves.toMatchObject({
+      status: 'active',
+      connection: 'ready',
+      work: 'idle',
+    });
     await expect(
       h.control.prepareSessionCredentials({ ownerId: OWNER, sessionId: ROUTE.sessionId })
     ).resolves.toMatchObject({ kilo: { token: 'test-token' } });
@@ -2099,7 +2107,11 @@ describe('SandboxControl lifecycle boundaries', () => {
     expect(protectedState.kind === 'allocated' && protectedState.idleAt).toBeNull();
     await h.control.alarm();
     expect(h.runtime(identity.providerInstanceId)?.destroy).not.toHaveBeenCalled();
-    await expect(h.control.getStatus()).resolves.toMatchObject({ reported: 'working' });
+    await expect(h.control.getStatus()).resolves.toMatchObject({
+      status: 'active',
+      connection: 'ready',
+      work: 'active',
+    });
   });
 
   it.each(['session.attach', 'session.prompt'] as const)(
@@ -2244,7 +2256,11 @@ describe('SandboxControl lifecycle boundaries', () => {
       { state: 'idle', kilo: { ready: true }, sessions: [] },
       replacement
     );
-    await expect(h.control.getStatus()).resolves.toMatchObject({ reported: 'ready' });
+    await expect(h.control.getStatus()).resolves.toMatchObject({
+      status: 'active',
+      connection: 'ready',
+      work: 'idle',
+    });
   });
 
   it('keeps credential seeding of an unallocated sandbox idle', async () => {
@@ -2322,7 +2338,11 @@ describe('SandboxControl lifecycle boundaries', () => {
       })
     );
     await h.ready();
-    await expect(h.control.getStatus()).resolves.toMatchObject({ reported: 'ready' });
+    await expect(h.control.getStatus()).resolves.toMatchObject({
+      status: 'active',
+      connection: 'ready',
+      work: 'idle',
+    });
   });
 
   it.each([true, false])(
@@ -2366,7 +2386,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     });
     await expect(
       h.control.ensureReady({ ownerId: OWNER, sessionId: ROUTE.sessionId, billing: BILLING })
-    ).resolves.toMatchObject({ reported: 'ready' });
+    ).resolves.toMatchObject({ status: 'active', connection: 'ready', work: 'idle' });
     expect(metered).toBe(true);
     expect(runtime.configureBilling).toHaveBeenCalledWith({
       ...BILLING,
@@ -2590,7 +2610,9 @@ describe('SandboxControl lifecycle boundaries', () => {
     expect(messages).toEqual({ B: 'accepted', follower: 'queued' });
     expect(h.session.failWaitingMessages).not.toHaveBeenCalled();
     await expect(h.control.getStatus()).resolves.toMatchObject({
-      reported: 'working',
+      status: 'active',
+      connection: 'ready',
+      work: 'active',
       wrapperInstanceId: replacement.wrapperInstanceId,
     });
   });
@@ -2753,7 +2775,11 @@ describe('SandboxControl lifecycle boundaries', () => {
         'build_2'
       );
       expect(mocks.getSandbox).not.toHaveBeenCalled();
-      await expect(h.control.getStatus()).resolves.toMatchObject({ reported: 'ready' });
+      await expect(h.control.getStatus()).resolves.toMatchObject({
+        status: 'active',
+        connection: 'ready',
+        work: 'idle',
+      });
       if (!containmentEnabled) {
         await expect(
           h.control.prepareSessionCredentials({ ownerId: OWNER, sessionId: ROUTE.sessionId })
@@ -2793,7 +2819,9 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.hooks.onSessionEvent?.(identity, outcomeA, connection);
     await h.flush();
     await expect(h.control.getStatus()).resolves.toMatchObject({
-      reported: 'working',
+      status: 'active',
+      connection: 'ready',
+      work: 'active',
       wrapperInstanceId: connection.wrapperInstanceId,
     });
     expect(h.runtime(connection.providerInstanceId)?.destroy).not.toHaveBeenCalled();
@@ -2827,7 +2855,9 @@ describe('SandboxControl lifecycle boundaries', () => {
     );
     await h.flush();
     await expect(h.control.getStatus()).resolves.toMatchObject({
-      reported: 'working',
+      status: 'active',
+      connection: 'ready',
+      work: 'active',
       wrapperInstanceId: connection.wrapperInstanceId,
     });
     expect(h.runtime(connection.providerInstanceId)?.destroy).not.toHaveBeenCalled();
@@ -3546,7 +3576,9 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.flush();
     expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
     await expect(h.control.getStatus()).resolves.toMatchObject({
-      reported: 'ready',
+      status: 'active',
+      connection: 'ready',
+      work: 'idle',
       wrapperInstanceId: replacement.wrapperInstanceId,
     });
     expect(h.session.failWaitingMessages).not.toHaveBeenCalledWith(
