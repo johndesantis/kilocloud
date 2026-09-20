@@ -6,7 +6,11 @@ import {
   sandboxHeartbeatPayloadSchema,
   type SandboxHeartbeatPayload,
 } from '../shared/sandbox-control-protocol.js';
-import { createSandboxControlSocketHandler, readSandboxControlConnection } from './socket.js';
+import {
+  createSandboxControlSocketHandler,
+  readSandboxControlConnection,
+  summarizeHeartbeatIdle,
+} from './socket.js';
 import { createControlRequestWaiters, type ControlRequestWaiters } from './waiters.js';
 
 vi.mock('../logger.js', () => {
@@ -2289,5 +2293,39 @@ describe('connection-local sandbox observations', () => {
     expect(readTestConnection(state, 'inst_1')).toEqual({ state: 'unknown' });
     await handler.handleMessage(asWs(ws), readyFrame);
     expect(attachmentOf(ws).observation?.ready).toBe(true);
+  });
+});
+
+describe('bounded heartbeat idle summaries', () => {
+  const idleHeartbeat: SandboxHeartbeatPayload = {
+    state: 'idle',
+    pendingMessages: 0,
+    kilo: { ready: true },
+    sessions: [{ kiloSessionId: 'kilo_1', state: 'idle', idleForMs: 0 }],
+  };
+
+  it.each([
+    { state: 'active' },
+    { state: 'finalizing' },
+    { pendingMessages: undefined },
+    { pendingMessages: 1 },
+    { activeKiloSessions: 1 },
+    { kilo: { ready: false } },
+    { sessions: [{ kiloSessionId: 'kilo_1', state: 'active', idleForMs: 180_000 }] },
+    { sessions: [{ kiloSessionId: 'kilo_1', state: 'finalizing', idleForMs: 0 }] },
+    { sessions: [{ kiloSessionId: 'kilo_1', state: 'idle', idleForMs: 0, waitingOn: 'tool' }] },
+    { sessions: [...idleHeartbeat.sessions, ...idleHeartbeat.sessions] },
+  ] satisfies Partial<SandboxHeartbeatPayload>[])(
+    'rejects busy or incomplete sandbox-wide evidence: %j',
+    async patch => {
+      expect(await summarizeHeartbeatIdle({ ...idleHeartbeat, ...patch })).toBeNull();
+    }
+  );
+
+  it('summarizes a fully idle sandbox-wide heartbeat', async () => {
+    await expect(summarizeHeartbeatIdle(idleHeartbeat)).resolves.toEqual({
+      sessionCount: 1,
+      sessionIdsHash: expect.any(String),
+    });
   });
 });

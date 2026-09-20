@@ -1,11 +1,10 @@
-import type { FlatAllocationState } from '../sandbox-control/allocation-view.js';
-import type { ConnectionState } from '../sandbox-control/status-projection.js';
+import type { ConnectionState, PhysicalState } from '../shared/sandbox-status.js';
 import type { PreparingStep } from '../shared/protocol.js';
 
 export type PreparingHint = { step: PreparingStep; message: string };
 
 export function provisionPreparingStep(
-  physical: FlatAllocationState,
+  physical: PhysicalState,
   allowCreate: boolean
 ): PreparingHint | null {
   if (physical === 'stopped' && allowCreate) {
@@ -15,7 +14,7 @@ export function provisionPreparingStep(
 }
 
 export function bootPreparingStep(
-  physical: FlatAllocationState,
+  physical: PhysicalState,
   connection: ConnectionState
 ): PreparingHint | null {
   if (physical === 'creating' || (physical === 'running' && connection !== 'ready')) {

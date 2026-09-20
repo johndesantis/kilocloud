@@ -12,8 +12,11 @@ import {
   hashSandboxCredential,
 } from '../../src/sandbox-control/credential.js';
 import { createControlPlaneCredential } from '../../src/sandbox-control/managed-credential.js';
-import type { PhysicalRecord } from '../../src/sandbox-control/physical-lifecycle.js';
-import { WORKTREE_CREDENTIAL_CONTAINMENT } from '../../src/sandbox-state/model/allocation.js';
+import {
+  WORKTREE_CREDENTIAL_CONTAINMENT,
+  type AllocationContainment,
+  type AllocationRecord,
+} from '../../src/sandbox-state/model/allocation.js';
 import {
   sessionCredentialGrantSchema,
   type SessionCredentialGrant,
@@ -34,6 +37,17 @@ import { getSessionWorkspacePath } from '../../src/workspace.js';
 
 import { readSessionValue } from '../../src/sandbox-state/persist/access.js';
 import { seedCanonicalAllocation, seedCanonicalRunning } from './canonical-allocation-fixtures.js';
+
+function canonicalProviderRef(record: AllocationRecord): string | null {
+  const state = record.state;
+  if (state.kind === 'stopped') return state.summary?.providerRef ?? null;
+  return state.target?.providerRef ?? null;
+}
+
+function canonicalCreateIntent(record: AllocationRecord) {
+  return record.state.kind === 'stopped' ? null : record.state.createIntent;
+}
+
 type SocketFrame = string | ArrayBuffer;
 
 type SocketInbox = {
@@ -316,8 +330,8 @@ async function createFixture(ownerId?: string, organizationId?: string): Promise
         if (connection.socket.readyState === 1) connection.socket.close(1000, 'test cleanup');
       }
       await runInDurableObject(controlStub, async instance => {
-        const physical = await instance.getPhysicalRecord();
-        if (physical.state === 'running') {
+        const physical = await instance.getAllocationRecord();
+        if (physical.state.kind === 'allocated') {
           await instance.beginStop('test cleanup');
           await instance.confirmStopped();
         }
@@ -519,7 +533,7 @@ afterEach(async () => {
 describe('SandboxSession terminal bridge in the Workers runtime', () => {
   it.each<{
     name: string;
-    marker: (providerRef: string) => PhysicalRecord['containment'];
+    marker: (providerRef: string) => AllocationContainment | undefined;
   }>([
     { name: 'missing', marker: () => undefined },
     {
@@ -549,20 +563,22 @@ describe('SandboxSession terminal bridge in the Workers runtime', () => {
     const fixture = await createFixture();
     const control = env.SANDBOX_CONTROL.getByName(fixture.sandboxId);
     await runInDurableObject(control, async (instance, state) => {
-      const physical = await instance.getPhysicalRecord();
-      if (!physical.providerRef) throw new Error('Missing terminal fixture provider reference');
-      if (!physical.createIntent) throw new Error('Missing terminal fixture create intent');
+      const physical = await instance.getAllocationRecord();
+      const providerRef = canonicalProviderRef(physical);
+      const createIntent = canonicalCreateIntent(physical);
+      if (!providerRef) throw new Error('Missing terminal fixture provider reference');
+      if (!createIntent) throw new Error('Missing terminal fixture create intent');
       await seedCanonicalAllocation(state.storage, {
         state: 'running',
         provider: 'cloudflare',
-        providerRef: physical.providerRef,
+        providerRef,
         createIntent: {
-          intentId: physical.createIntent.intentId,
+          intentId: createIntent.intentId,
           createdAt: Date.now(),
           allocationName: fixture.sandboxId,
           containment: WORKTREE_CREDENTIAL_CONTAINMENT,
         },
-        containment: marker(physical.providerRef),
+        containment: marker(providerRef),
       });
     });
 
@@ -585,14 +601,15 @@ describe('SandboxSession terminal bridge in the Workers runtime', () => {
     const fixture = await createFixture();
     const control = env.SANDBOX_CONTROL.getByName(fixture.sandboxId);
     await runInDurableObject(control, async (instance, state) => {
-      const physical = await instance.getPhysicalRecord();
-      if (!physical.createIntent) throw new Error('Missing terminal fixture create intent');
+      const physical = await instance.getAllocationRecord();
+      const createIntent = canonicalCreateIntent(physical);
+      if (!createIntent) throw new Error('Missing terminal fixture create intent');
       await seedCanonicalAllocation(state.storage, {
         state: 'running',
         provider: 'cloudflare',
         providerRef: fixture.sandboxId,
         createIntent: {
-          intentId: physical.createIntent.intentId,
+          intentId: createIntent.intentId,
           createdAt: Date.now(),
           allocationName: fixture.sandboxId,
           containment: WORKTREE_CREDENTIAL_CONTAINMENT,

@@ -11,8 +11,11 @@ import { MANAGED_SCM_OUTBOUND_HANDLER } from '../sandbox-id.js';
 import type { SandboxInstance } from '../types.js';
 import { DEADLINE_MS } from './deadlines.js';
 import { logControlDiagnostic } from './diagnostics.js';
-import type { FlatCreateIntent } from './allocation-view.js';
-import type { ProviderAdapter, ProviderCreateIntent } from './provider.js';
+import type {
+  ProviderAdapter,
+  ProviderAllocationIntent,
+  ProviderCreateIntent,
+} from './provider.js';
 
 const CONTROL_WRAPPER_PATH = '/usr/local/bin/kilocode-control-wrapper.js';
 const CONTROL_WRAPPER_LOG_PATH = '/tmp/kilocode-control-wrapper.log';
@@ -59,7 +62,7 @@ export function createCloudflareProviderAdapter(deps: {
   };
   const resolveProviderRef = (
     ref: string | null,
-    intent?: FlatCreateIntent | null
+    intent?: ProviderAllocationIntent | null
   ): string | null => {
     if (ref !== null || !intent) return ref;
     const sandboxId = intent.allocationName ?? deps.sandboxId;

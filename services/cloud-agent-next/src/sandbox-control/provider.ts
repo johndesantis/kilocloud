@@ -1,6 +1,20 @@
 import type { SandboxBillingInput } from '../container-usage-context.js';
 import type { VercelSandboxNetworkPolicy } from '../agent-sandbox/vercel/vercel-sandbox-rest-client.js';
-import type { FlatCreateIntent } from './allocation-view.js';
+import { vercelSandboxResourcesSchema } from '@kilocode/worker-utils/sandbox-allocation';
+import { z } from 'zod';
+import type {
+  CredentialContainmentRequirements,
+  VercelAllocationConfig,
+} from '../sandbox-state/model/allocation.js';
+
+export const sandboxProviderConfigurationSchema = z.discriminatedUnion('provider', [
+  z.object({ provider: z.literal('cloudflare') }).strict(),
+  z
+    .object({ provider: z.literal('vercel'), resources: vercelSandboxResourcesSchema.optional() })
+    .strict(),
+]);
+
+export type SandboxProviderConfiguration = z.infer<typeof sandboxProviderConfigurationSchema>;
 
 export type ObserveResult = 'active' | 'terminal' | 'unknown';
 
@@ -14,7 +28,16 @@ export function observeFromWrapperObservation(status: WrapperObservationStatus):
   return 'active';
 }
 
-export type ProviderCreateIntent = FlatCreateIntent & {
+/** The canonical create intent plus the target identity fields a provider needs. */
+export type ProviderAllocationIntent = {
+  intentId: string;
+  createdAt: number;
+  allocationName?: string;
+  vercel?: VercelAllocationConfig;
+  containment?: CredentialContainmentRequirements;
+};
+
+export type ProviderCreateIntent = ProviderAllocationIntent & {
   billing?: SandboxBillingInput;
   networkPolicy?: VercelSandboxNetworkPolicy;
 };
@@ -33,8 +56,11 @@ export type ProviderAdapter = {
   ensureBillingAdmission(ref: string, billing?: SandboxBillingInput): Promise<void>;
   create(intent: ProviderCreateIntent): Promise<{ providerRef: string } | { unresolved: true }>;
   launch(ref: string, env: Record<string, string>): Promise<void>;
-  observe(ref: string | null, intent?: FlatCreateIntent | null): Promise<ProviderObservation>;
-  stop(ref: string | null, intent?: FlatCreateIntent | null): Promise<StopResult>;
+  observe(
+    ref: string | null,
+    intent?: ProviderAllocationIntent | null
+  ): Promise<ProviderObservation>;
+  stop(ref: string | null, intent?: ProviderAllocationIntent | null): Promise<StopResult>;
   ensureLeaseAtLeast(ref: string, ms: number): Promise<void>;
   logs(ref: string): Promise<string>;
   updateNetworkPolicy?(

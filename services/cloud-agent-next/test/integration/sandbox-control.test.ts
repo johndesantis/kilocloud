@@ -77,37 +77,34 @@ import {
   generateSandboxCredential,
   hashSandboxCredential,
 } from '../../src/sandbox-control/credential.js';
-import {
-  DEADLINE_MS,
-  type DeadlineId,
-  type DeadlineTable,
-} from '../../src/sandbox-control/deadlines.js';
+import { DEADLINE_MS } from '../../src/sandbox-control/deadlines.js';
 import type { VercelProviderLocator } from '../../src/sandbox-control/vercel-provider.js';
 import {
   loadAllocation,
-  loadDeadlines,
   loadRouteTable,
   loadSessionCredentialGrants,
   loadTransitionLog,
-  saveDeadlines,
-  savePhysicalRecord,
   saveRouteTable,
   saveSessionCredentialGrants,
   storeAllocation,
 } from '../../src/sandbox-control/durable-state.js';
 import {
+  controlAlarmAnchorAt,
+  loadControlAlarmAnchors,
+  setControlAlarmAnchor,
+} from '../../src/sandbox-control/control-alarm.js';
+import {
   WORKTREE_CREDENTIAL_CONTAINMENT,
   type AllocationRecord,
   type CredentialContainmentRequirements,
+  type VercelAllocationConfig,
 } from '../../src/sandbox-state/model/allocation.js';
 import { allocationAlarmAt } from '../../src/sandbox-state/schedule.js';
-import {
-  beginStop,
-  claimCreate,
-  initialPhysicalRecord,
-  type PhysicalRecord,
-} from '../../src/sandbox-control/physical-lifecycle.js';
-import type { ProviderAdapter, ProviderCreateIntent } from '../../src/sandbox-control/provider.js';
+import type {
+  ProviderAdapter,
+  ProviderAllocationIntent,
+  ProviderCreateIntent,
+} from '../../src/sandbox-control/provider.js';
 import {
   applyReportedSessionState,
   attachRoute,
@@ -179,7 +176,6 @@ import {
   seedCanonicalRunning,
   seedCreatingAllocation,
 } from './canonical-allocation-fixtures.js';
-import { projectAllocationToFlat } from '../../src/sandbox-control/allocation-view.js';
 import {
   ACQUISITION_CLEANUP_REOPENS_KEY,
   MAX_ACQUISITION_CLEANUP_REOPENS,
@@ -203,6 +199,72 @@ vi.mock('../../src/db/pg.js', () => ({
     throw new Error('PostgreSQL is not used by sandbox control integration tests');
   },
 }));
+
+function canonicalProviderRef(record: AllocationRecord): string | null {
+  const state = record.state;
+  if (state.kind === 'stopped') return state.summary?.providerRef ?? null;
+  return state.target?.providerRef ?? null;
+}
+
+function canonicalCreateIntent(record: AllocationRecord) {
+  return record.state.kind === 'stopped' ? null : record.state.createIntent;
+}
+
+function canonicalCreateIntentId(record: AllocationRecord): string | undefined {
+  return canonicalCreateIntent(record)?.intentId;
+}
+
+function canonicalAllocationName(record: AllocationRecord): string | undefined {
+  const state = record.state;
+  return state.kind === 'stopped' ? undefined : state.target?.allocationName;
+}
+
+function canonicalVercel(record: AllocationRecord) {
+  const state = record.state;
+  return state.kind === 'stopped' ? undefined : state.target?.vercel;
+}
+
+function canonicalStopIntent(record: AllocationRecord) {
+  const state = record.state;
+  return state.kind === 'stopping' || state.kind === 'unknown' ? state.stopIntent : null;
+}
+
+function canonicalStopAttempts(record: AllocationRecord): number | undefined {
+  const state = record.state;
+  return state.kind === 'stopping' || state.kind === 'unknown' ? state.attempts : undefined;
+}
+
+function canonicalTarget(record: AllocationRecord) {
+  return record.state.kind === 'stopped' ? null : record.state.target;
+}
+
+function canonicalProviderIntent(record: AllocationRecord): ProviderAllocationIntent | null {
+  const intent = canonicalCreateIntent(record);
+  const target = canonicalTarget(record);
+  if (intent === null || target === null) return null;
+  return {
+    intentId: intent.intentId,
+    createdAt: intent.createdAt,
+    ...(target.allocationName === undefined ? {} : { allocationName: target.allocationName }),
+    ...(target.vercel === undefined ? {} : { vercel: target.vercel }),
+    ...(target.containment === undefined ? {} : { containment: target.containment }),
+  };
+}
+
+/**
+ * Whole-record comparison for an operation that must not change the allocation.
+ * Only the two genuinely time-varying fields (`state.idleAt` and
+ * `state.health.deadlineAt`) are stripped; every other field is compared, so a
+ * dropped field still fails.
+ */
+function allocationWithoutTimeFields(record: AllocationRecord): unknown {
+  const comparable = structuredClone(record) as unknown as {
+    state: { idleAt?: unknown; health?: { deadlineAt?: unknown } };
+  };
+  delete comparable.state.idleAt;
+  if (comparable.state.health) delete comparable.state.health.deadlineAt;
+  return comparable;
+}
 
 const sandboxId = 'sbx__control_smoke';
 const ROOT_ID = 'ses_abcdefghijklmnopqrstuvwxyz';
@@ -284,7 +346,7 @@ async function attachGrantedSession(
 async function seedCredential(credential: string, id = sandboxId): Promise<void> {
   const stub = env.SANDBOX_CONTROL.getByName(id);
   await runInDurableObject(stub, async instance => {
-    if ((await instance.getPhysicalRecord()).state === 'stopped') {
+    if ((await instance.getAllocationRecord()).state.kind === 'stopped') {
       await seedCanonicalAllocation(instance['ctx'].storage, {
         state: 'creating',
         provider: 'cloudflare',
@@ -673,7 +735,7 @@ async function installProvider(
       VERCEL_SANDBOX_RUNTIME: 'node24',
       VERCEL_SANDBOX_INITIAL_TIMEOUT_MS: '300000',
       VERCEL_SANDBOX_EXTEND_DURATION_MS: '600000',
-      ...fakeCloudflareContainers(() => instance.getPhysicalRecord()).bindings,
+      ...fakeCloudflareContainers(() => instance.getAllocationRecord()).bindings,
       GIT_TOKEN_SERVICE: fakeCredentialBroker().binding,
       KILOCODE_BACKEND_BASE_URL: CONTAINMENT_TARGETS.backendBaseUrl,
       KILO_OPENROUTER_BASE: CONTAINMENT_TARGETS.providerBaseUrl,
@@ -690,20 +752,34 @@ async function installProvider(
   return { provider, allocations };
 }
 
+/** The control deadline ids the integration fixtures can force due. */
+type ControlDeadlineId =
+  | 'startup'
+  | 'wrapperReadiness'
+  | 'heartbeatExpiry'
+  | 'idleStop'
+  | 'socketHandshake'
+  | 'credentialExpiry'
+  | 'stopAttempt'
+  | 'reconciliation';
+
 /**
- * Allocation-owned deadline ids moved onto the canonical aggregate; only the
- * infrastructure anchors (socket handshake, credential expiry) remain in the
- * flat deadline table. `stopAttempt`/`reconciliation` are advanced through the
+ * Allocation-owned deadline ids live on the canonical aggregate; only the
+ * infrastructure anchors (socket handshake, credential expiry) live in the
+ * control-alarm anchor state. `stopAttempt`/`reconciliation` advance through the
  * canonical stop entrypoint, which owns the retry/observe ladder.
  */
-const CANONICAL_DEADLINE_IDS: ReadonlySet<DeadlineId> = new Set([
+const CANONICAL_DEADLINE_IDS: ReadonlySet<ControlDeadlineId> = new Set([
   'startup',
   'wrapperReadiness',
   'heartbeatExpiry',
   'idleStop',
 ]);
 
-async function rearmCanonicalDeadline(state: DurableObjectState, id: DeadlineId): Promise<void> {
+async function rearmCanonicalDeadline(
+  state: DurableObjectState,
+  id: ControlDeadlineId
+): Promise<void> {
   const record = (await loadAllocation(state.storage, false)) as AllocationRecord;
   const at = Date.now() - 1;
   const current = record.state;
@@ -738,7 +814,7 @@ async function canonicalIdleAt(state: DurableObjectState): Promise<number | null
 
 async function fireControlDeadline(
   control: DurableObjectStub<SandboxControl>,
-  id: DeadlineId
+  id: ControlDeadlineId
 ): Promise<void> {
   if (id === 'stopAttempt' || id === 'reconciliation') {
     await control.recordStopAttempt();
@@ -748,9 +824,9 @@ async function fireControlDeadline(
     if (CANONICAL_DEADLINE_IDS.has(id)) {
       await rearmCanonicalDeadline(state, id);
     } else {
-      const deadlines = await loadDeadlines(state.storage);
-      expect(deadlines[id]).toEqual(expect.any(Number));
-      await saveDeadlines(state.storage, { ...deadlines, [id]: Date.now() });
+      const anchors = await loadControlAlarmAnchors(state.storage);
+      expect(controlAlarmAnchorAt(anchors, id)).toEqual(expect.any(Number));
+      await setControlAlarmAnchor(state.storage, id, Date.now());
     }
     await instance.alarm();
   });
@@ -880,26 +956,6 @@ function containedRunningFixture(
   return runningAllocationFixture(providerRef, { containment });
 }
 
-/**
- * Canonical descriptor for a legacy flat physical record. The canonical
- * `unknown` kind folds the flat `failed`/`unknown` states, so a flat failure
- * seeds the canonical equivalent (not a running allocation).
- */
-function physicalToFixture(
-  physical: PhysicalRecord,
-  provider: 'vercel' | 'cloudflare'
-): AllocationFixture {
-  return {
-    state: physical.state,
-    provider,
-    providerRef: physical.providerRef,
-    createIntent: physical.createIntent,
-    stopTombstone: physical.stopTombstone,
-    resumable: physical.resumable,
-    ...(physical.containment === undefined ? {} : { containment: physical.containment }),
-  };
-}
-
 async function seedRunningVercel(
   instance: SandboxControl,
   state: DurableObjectState,
@@ -909,7 +965,6 @@ async function seedRunningVercel(
     ownerId?: string;
     providerKind?: 'vercel' | 'cloudflare';
     fixture?: AllocationFixture;
-    physical?: PhysicalRecord;
     bypassPin?: boolean;
   }
 ): Promise<string> {
@@ -919,11 +974,7 @@ async function seedRunningVercel(
   });
   await instance.initializeOwner(options?.ownerId ?? CONTAINMENT_OWNER);
   await state.storage.put('provider_kind', options?.providerKind ?? 'vercel');
-  const fixture =
-    options?.fixture ??
-    (options?.physical === undefined
-      ? containedRunningFixture(providerRef)
-      : physicalToFixture(options.physical, options.providerKind ?? 'vercel'));
+  const fixture = options?.fixture ?? containedRunningFixture(providerRef);
   await seedCanonicalAllocation(state.storage, fixture);
   Object.assign(instance, {
     provider,
@@ -931,7 +982,7 @@ async function seedRunningVercel(
     providerKind: options?.providerKind ?? 'vercel',
     ...(options?.bypassPin ? { pinProvider: async () => true } : {}),
   });
-  return options?.physical?.providerRef ?? providerRef;
+  return providerRef;
 }
 
 function policyUpdateInput(ownerId = CONTAINMENT_OWNER): {
@@ -1012,13 +1063,13 @@ function fakeCredentialBroker() {
 
 type WrapperLaunch = {
   env: Record<string, string>;
-  physical: PhysicalRecord;
+  physical: AllocationRecord;
   containerId?: string;
   outboundHandler?: string;
   networkPolicy?: VercelSandboxNetworkPolicy;
 };
 
-function fakeCloudflareContainers(readPhysical: () => Promise<PhysicalRecord>) {
+function fakeCloudflareContainers(readPhysical: () => Promise<AllocationRecord>) {
   const runtime = {
     launches: [] as WrapperLaunch[],
     destroyed: [] as string[],
@@ -1081,7 +1132,7 @@ function fakeCloudflareContainers(readPhysical: () => Promise<PhysicalRecord>) {
   };
 }
 
-function fakeVercelRuntime(sandboxName: string, readPhysical: () => Promise<PhysicalRecord>) {
+function fakeVercelRuntime(sandboxName: string, readPhysical: () => Promise<AllocationRecord>) {
   const runtime = {
     creates: 0,
     createInputs: [] as Parameters<VercelControlRestClient['createSandbox']>[0][],
@@ -1210,7 +1261,7 @@ function fakeVercelRuntime(sandboxName: string, readPhysical: () => Promise<Phys
     },
     createAdapter: (
       allocationName: string,
-      persisted?: NonNullable<PhysicalRecord['createIntent']>['vercel']
+      persisted?: VercelAllocationConfig
     ) =>
       createVercelProviderAdapter({
         sandboxName: allocationName,
@@ -1248,17 +1299,17 @@ async function credentialFixture(
   let containers: ReturnType<typeof fakeCloudflareContainers> | undefined;
   let vercel: ReturnType<typeof fakeVercelRuntime> | undefined;
   await runInDurableObject(control, instance => {
-    containers = fakeCloudflareContainers(() => instance.getPhysicalRecord());
-    vercel = fakeVercelRuntime(id, () => instance.getPhysicalRecord());
+    containers = fakeCloudflareContainers(() => instance.getAllocationRecord());
+    vercel = fakeVercelRuntime(id, () => instance.getAllocationRecord());
     Object.assign(environment, containers.bindings);
     Object.assign(instance, { env: environment });
     if (provider === 'vercel') {
       const runtime = vercel;
       Object.assign(instance, {
-        createProviderAdapter: (_kind: AgentSandboxProvider, physical?: PhysicalRecord) =>
+        createProviderAdapter: (_kind: AgentSandboxProvider, physical?: AllocationRecord) =>
           runtime.createAdapter(
-            physical?.createIntent?.allocationName ?? id,
-            physical?.createIntent?.vercel
+            physical ? (canonicalAllocationName(physical) ?? id) : id,
+            physical ? canonicalVercel(physical) : undefined
           ),
       });
     }
@@ -1628,10 +1679,13 @@ describe('SandboxControl in the Workers runtime', () => {
     await expect(firstClosed).resolves.toBe(4000);
     await expect(secondClosed).resolves.toBe(4001);
     await waitFor(() => expect(provider.stop).toHaveBeenCalled());
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopping',
-      providerRef: cloudflareRef(id),
-      stopTombstone: { reason: 'control_replaced', attempts: expect.any(Number) },
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: {
+        kind: 'stopping',
+        target: { providerRef: cloudflareRef(id) },
+        stopIntent: { reason: 'control_replaced' },
+        attempts: expect.any(Number),
+      },
     });
     await runInDurableObject(control, async instance => {
       await expect(instance.request({ operation: 'sandbox.status', payload: {} })).rejects.toThrow(
@@ -1665,7 +1719,7 @@ describe('SandboxControl in the Workers runtime', () => {
         physical: 'running',
         connection: 'connected',
       });
-      expect((await loadDeadlines(state.storage)).socketHandshake).toBeUndefined();
+      expect((await loadControlAlarmAnchors(state.storage)).socketHandshakeAt).toBeNull();
     });
 
     successful.close();
@@ -2027,7 +2081,7 @@ describe('SandboxControl Vercel network policy updates', () => {
       await expect(instance.updateNetworkPolicy(policyUpdateInput())).rejects.toThrow(
         'Sandbox instance changed during network policy update'
       );
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({ state: 'stopped' });
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
     });
   });
 
@@ -2068,10 +2122,10 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         resources: getSandboxAllocationResources(sandboxAllocation),
         allowCreate: true,
       });
-      const physical = await control.getPhysicalRecord();
+      const physical = await control.getAllocationRecord();
       const clock = vi
         .spyOn(Date, 'now')
-        .mockReturnValue((physical.createIntent?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1);
+        .mockReturnValue((canonicalCreateIntent(physical)?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1);
       try {
         await expect(
           control.deleteWorktreeResources({
@@ -2087,7 +2141,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       }
       expect(vercel.runtime.creates).toBe(1);
       expect(vercel.runtime.stoppedSessions).toEqual(['vsess_joined_1']);
-      expect((await control.getPhysicalRecord()).state).toBe('stopped');
+      expect((await control.getAllocationRecord()).state.kind).toBe('stopped');
       await runInDurableObject(control, async (_instance, state) => {
         expect(await state.storage.get('provider_configuration')).toBeUndefined();
         expect(await state.storage.get('provider_locator')).toBeUndefined();
@@ -2110,9 +2164,9 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       };
       vercel.runtime.loseCreateResponse = true;
       await expect(control.ensureReady(input)).resolves.toMatchObject({ physical: 'failed' });
-      const uncertain = await control.getPhysicalRecord();
-      expect(uncertain.providerRef).toBeNull();
-      expect(uncertain.createIntent?.vercel?.resources).toEqual(resources);
+      const uncertain = await control.getAllocationRecord();
+      expect(canonicalProviderRef(uncertain)).toBeNull();
+      expect(canonicalVercel(uncertain)?.resources).toEqual(resources);
       expect(vercel.runtime.createInputs[0]?.resources).toEqual(resources);
       expect(vercel.runtime.launches).toHaveLength(0);
 
@@ -2120,16 +2174,16 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         await abortAllDurableObjects();
         control = env.SANDBOX_CONTROL.getByName(sandboxId);
         await runInDurableObject(control, async (instance, state) => {
-          const physical = await instance.getPhysicalRecord();
+          const physical = await instance.getAllocationRecord();
           expect(await state.storage.get('provider_configuration')).toEqual({
             provider: 'vercel',
             ...(resources ? { resources } : {}),
           });
-          vercel.runtime.readPhysical = () => instance.getPhysicalRecord();
-          const createProviderAdapter = (_kind: AgentSandboxProvider, value?: PhysicalRecord) =>
+          vercel.runtime.readPhysical = () => instance.getAllocationRecord();
+          const createProviderAdapter = (_kind: AgentSandboxProvider, value?: AllocationRecord) =>
             vercel.createAdapter(
-              value?.createIntent?.allocationName ?? sandboxId,
-              value?.createIntent?.vercel
+              value ? (canonicalAllocationName(value) ?? sandboxId) : sandboxId,
+              value ? canonicalVercel(value) : undefined
             );
           Object.assign(instance, {
             env: environment,
@@ -2139,10 +2193,17 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         });
       };
       await restart();
-      expect((await control.getPhysicalRecord()).createIntent).toEqual(uncertain.createIntent);
+      const afterRestart = await control.getAllocationRecord();
+      expect({
+        createIntent: canonicalCreateIntent(afterRestart),
+        target: canonicalTarget(afterRestart),
+      }).toEqual({
+        createIntent: canonicalCreateIntent(uncertain),
+        target: canonicalTarget(uncertain),
+      });
       const clock = vi
         .spyOn(Date, 'now')
-        .mockReturnValue((uncertain.createIntent?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1);
+        .mockReturnValue((canonicalCreateIntent(uncertain)?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1);
       try {
         await fireControlDeadline(control, 'stopAttempt');
       } finally {
@@ -2150,15 +2211,14 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       }
       expect(vercel.runtime.inspectInputs).toHaveLength(1);
       expect(vercel.runtime.inspectInputs[0]).toMatchObject({
-        name: uncertain.createIntent?.allocationName,
-        operationId: uncertain.createIntent?.intentId,
+        name: canonicalAllocationName(uncertain),
+        operationId: canonicalCreateIntentId(uncertain),
       });
       expect(vercel.runtime.inspectInputs[0]?.resources).toEqual(resources);
       expect(vercel.runtime.creates).toBe(1);
       expect(vercel.runtime.stoppedSessions).toEqual(['vsess_joined_1']);
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        createIntent: null,
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped' },
       });
       await restart();
       await expect(async () =>
@@ -2172,11 +2232,9 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       ).rejects.toThrow('Sandbox resources mismatch');
       vercel.runtime.loseCreateResponse = false;
       await expect(control.ensureReady(input)).resolves.toMatchObject({ physical: 'running' });
-      const replacement = await control.getPhysicalRecord();
-      expect(replacement.createIntent?.vercel?.resources).toEqual(resources);
-      expect(replacement.createIntent?.allocationName).not.toBe(
-        uncertain.createIntent?.allocationName
-      );
+      const replacement = await control.getAllocationRecord();
+      expect(canonicalVercel(replacement)?.resources).toEqual(resources);
+      expect(canonicalAllocationName(replacement)).not.toBe(canonicalAllocationName(uncertain));
       expect(vercel.runtime.createInputs).toHaveLength(2);
       expect(vercel.runtime.createInputs[1]?.resources).toEqual(resources);
       expect(vercel.runtime.launches).toHaveLength(1);
@@ -2197,7 +2255,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         provider: 'cloudflare',
         allowCreate: true,
       });
-      const original = await control.getPhysicalRecord();
+      const original = await control.getAllocationRecord();
       const sibling = await registerSiblingWorktree({
         ...registration,
         workspace: {
@@ -2213,7 +2271,14 @@ describe('SandboxControl contained Vercel lifecycle', () => {
           allowCreate: true,
         })
       ).resolves.toMatchObject({ physical: 'running' });
-      expect((await control.getPhysicalRecord()).createIntent).toEqual(original.createIntent);
+      const afterSiblingReady = await control.getAllocationRecord();
+      expect({
+        createIntent: canonicalCreateIntent(afterSiblingReady),
+        target: canonicalTarget(afterSiblingReady),
+      }).toEqual({
+        createIntent: canonicalCreateIntent(original),
+        target: canonicalTarget(original),
+      });
       expect(containers.launches).toHaveLength(1);
     }
   );
@@ -2250,13 +2315,16 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       const ws = await connect(credential, requestedSandboxId);
       await rejectHello(ws, `hello-rejected-${identityKind}`, providerInstanceId);
       await runInDurableObject(stub, async instance => {
-        const physical = await instance.getPhysicalRecord();
+        const physical = await instance.getAllocationRecord();
         expect(physical).toMatchObject({
-          state: 'creating',
-          providerRef: null,
-          createIntent: { containment: CONTAINMENT_REQUIREMENTS },
+          state: {
+            kind: 'creating',
+            target: { providerRef: null, containment: CONTAINMENT_REQUIREMENTS },
+          },
         });
-        expect(physical.containment).toBeUndefined();
+        expect(
+          physical.state.kind === 'creating' ? physical.state.target.resolvedContainment : undefined
+        ).toBeUndefined();
         await expect(instance.getStatus()).resolves.toMatchObject({ connection: 'disconnected' });
       });
     }
@@ -2286,7 +2354,20 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       const ws = await connect(credential, requestedSandboxId);
       await rejectHello(ws, `hello-inactive-${physicalState}`, providerRef);
       await runInDurableObject(stub, async instance => {
-        await expect(instance.getPhysicalRecord()).resolves.toMatchObject({ state: physicalState });
+        // Flat `failed` and `unknown` both project to the canonical `unknown`
+        // kind; the remaining flat states keep their name. The canonical reason
+        // retains the flat provenance so the two collapses stay distinguishable.
+        const expectedKind = physicalState === 'failed' ? 'unknown' : physicalState;
+        const record = await instance.getAllocationRecord();
+        expect(record).toMatchObject({ state: { kind: expectedKind } });
+        if (expectedKind === 'unknown') {
+          expect(record).toMatchObject({
+            state: {
+              kind: 'unknown',
+              reason: physicalState === 'failed' ? 'legacy_failed' : 'legacy_unknown',
+            },
+          });
+        }
       });
     }
   );
@@ -2319,10 +2400,14 @@ describe('SandboxControl contained Vercel lifecycle', () => {
     );
     expect(current.readyState).toBe(1);
     await runInDurableObject(stub, async instance => {
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'running',
-        providerRef,
-        containment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: {
+          kind: 'allocated',
+          target: {
+            providerRef,
+            resolvedContainment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
+          },
+        },
       });
       await expect(instance.getStatus()).resolves.toMatchObject({ connection: 'connected' });
     });
@@ -2356,18 +2441,21 @@ describe('SandboxControl contained Vercel lifecycle', () => {
             sandboxName: intent.allocationName ?? requestedSandboxId,
             sessionId: 'vsess_authoritative',
           });
-          await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-            state: 'creating',
-            providerRef: null,
+          await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+            state: { kind: 'creating', target: { providerRef: null } },
           });
           return { providerRef };
         },
         async launch(ref, launchEnv) {
           expect(ref).toBe(providerRef);
-          await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-            state: 'running',
-            providerRef,
-            containment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
+          await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+            state: {
+              kind: 'allocated',
+              target: {
+                providerRef,
+                resolvedContainment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
+              },
+            },
           });
           credential = launchEnv.SANDBOX_CONTROL_CREDENTIAL ?? '';
         },
@@ -2450,9 +2538,8 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         const premature = await connect(credential, requestedSandboxId);
         await rejectHello(premature, 'hello-before-confirmation', providerRef);
         await runInDurableObject(stub, async (instance, state) => {
-          await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-            state: 'creating',
-            providerRef: null,
+          await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+            state: { kind: 'creating', target: { providerRef: null } },
           });
           await seedCanonicalRunning(state.storage, providerRef, {
             provider: 'vercel',
@@ -2464,11 +2551,16 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       const ws = await connect(credential, requestedSandboxId);
       await completeHello(ws, `hello-${order}`, { providerInstanceId: providerRef });
       await runInDurableObject(stub, async instance => {
-        await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-          state: 'running',
-          providerRef,
-          createIntent: { intentId: 'intent_race', containment: CONTAINMENT_REQUIREMENTS },
-          containment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
+        await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+          state: {
+            kind: 'allocated',
+            target: {
+              providerRef,
+              containment: CONTAINMENT_REQUIREMENTS,
+              resolvedContainment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
+            },
+            createIntent: { intentId: 'intent_race' },
+          },
         });
       });
       ws.close();
@@ -2552,7 +2644,7 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         expect(statuses.map(status => status.attachment?.kilo?.scopeId).sort()).toEqual(
           [WORKTREE_ID, OTHER_WORKTREE_ID].sort()
         );
-        expect((await instance.getPhysicalRecord()).state).toBe('running');
+        expect((await instance.getAllocationRecord()).state.kind).toBe('allocated');
       });
       expect(providerKind === 'vercel' ? vercel.runtime.creates : containers.launches.length).toBe(
         1
@@ -2587,22 +2679,20 @@ describe('SandboxControl contained Vercel lifecycle', () => {
             allowCreate: true,
           })
         ).resolves.toMatchObject({ physical: 'failed' });
-        expect(await instance.getPhysicalRecord()).toMatchObject({ providerRef: null });
+        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBeNull();
         expect(await state.storage.get('credential_policy_dirty')).toBe(true);
         if (cleanup === 'detach') {
           await expect(instance.detachSession(registration.identity.sessionId)).rejects.toThrow(
             'Sandbox credential revocation is pending'
           );
         }
-        const physical = await instance.getPhysicalRecord();
-        if (!physical.createIntent) throw new Error('Missing retained creation intent');
+        const physical = await instance.getAllocationRecord();
+        const createIntent = canonicalCreateIntent(physical);
+        if (!createIntent) throw new Error('Missing retained creation intent');
         const clock = vi
           .spyOn(Date, 'now')
-          .mockReturnValue(physical.createIntent.createdAt + DEADLINE_MS.createSettle + 1);
-        const legacyDeadlineId = cleanup === 'detach' ? 'stopAttempt' : 'reconciliation';
-        const legacyDeadlineAt = Date.now() - 1;
+          .mockReturnValue(createIntent.createdAt + DEADLINE_MS.createSettle + 1);
         try {
-          await state.storage.put('deadlines', { [legacyDeadlineId]: legacyDeadlineAt });
           await instance.alarm();
         } finally {
           clock.mockRestore();
@@ -2615,17 +2705,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         // The retained-deadline guard means the detach stop attempt does not
         // re-observe before the observe deadline; one observation settles it.
         expect(observations).toEqual([null]);
-        expect(await instance.getPhysicalRecord()).toMatchObject({
-          state: 'stopped',
-          providerRef: null,
-          createIntent: null,
-        });
+        const reconciled = await instance.getAllocationRecord();
+        expect(reconciled.state.kind).toBe('stopped');
+        expect(canonicalProviderRef(reconciled)).toBeNull();
         expect(await loadSessionCredentialGrants(state.storage)).toEqual([]);
         expect(await state.storage.get('credential_policy_dirty')).toBeUndefined();
-        // The live path never rewrites the legacy deadline table.
-        expect(await loadDeadlines(state.storage)).toEqual({
-          [legacyDeadlineId]: legacyDeadlineAt,
-        });
         expect(await state.storage.getAlarm()).toBeNull();
       });
     }
@@ -2651,10 +2735,9 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       const grants = await loadSessionCredentialGrants(state.storage);
       await state.storage.put('deadlines', { reconciliation: Date.now() - 1 });
       await instance.alarm();
-      expect(await instance.getPhysicalRecord()).toMatchObject({
-        state: 'failed',
-        providerRef: null,
-      });
+      const uncertain = await instance.getAllocationRecord();
+      expect(uncertain.state.kind).toBe('unknown');
+      expect(canonicalProviderRef(uncertain)).toBeNull();
       expect(await loadSessionCredentialGrants(state.storage)).toEqual(grants);
       expect(await state.storage.get('credential_policy_dirty')).toBe(true);
       const unknown = await readCanonicalAllocationRecord(state.storage);
@@ -2709,9 +2792,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         let hadReadyMarkerAtCreate = true;
         const createProviderAdapter = (
           _kind: AgentSandboxProvider,
-          physical?: PhysicalRecord
+          physical?: AllocationRecord
         ): ProviderAdapter => {
-          const adapter = vercel.createAdapter(physical?.createIntent?.allocationName ?? sandboxId);
+          const adapter = vercel.createAdapter(
+            physical ? (canonicalAllocationName(physical) ?? sandboxId) : sandboxId
+          );
           return {
             ...adapter,
             async stop(ref, intent) {
@@ -2893,11 +2978,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
           sessionId: registration.identity.sessionId,
         });
         expect(status.physical).toBe('stopping');
-        await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-          state: 'stopping',
-          providerRef,
-          stopTombstone: {
-            reason: 'credential_containment_unavailable',
+        await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+          state: {
+            kind: 'stopping',
+            target: { providerRef },
+            stopIntent: { reason: 'credential_containment_unavailable' },
             attempts: expect.any(Number),
           },
         });
@@ -2955,9 +3040,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         sessionId: registration.identity.sessionId,
       });
       expect(status.physical).toBe('creating');
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'creating',
-        createIntent: { intentId: 'intent_replacement' },
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: {
+          kind: 'creating',
+          createIntent: { intentId: 'intent_replacement' },
+        },
       });
       expect(stoppedRefs).toEqual([previousRef]);
       expect(creates).toBe(0);
@@ -3002,9 +3089,8 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         sessionId: registration.identity.sessionId,
       });
       expect(status.physical).toBe('stopped');
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef,
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped', summary: { providerRef } },
       });
       expect(stoppedRefs).toEqual([providerRef]);
       expect(creates).toBe(0);
@@ -3039,11 +3125,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         sessionId: registration.identity.sessionId,
       });
       expect(status.physical).toBe('stopping');
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopping',
-        providerRef: requestedSandboxId,
-        stopTombstone: {
-          reason: 'credential_containment_unavailable',
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: {
+          kind: 'stopping',
+          target: { providerRef: requestedSandboxId },
+          stopIntent: { reason: 'credential_containment_unavailable' },
           attempts: expect.any(Number),
         },
       });
@@ -3079,11 +3165,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       // nor replaced; the session stays unresolved until the create deadline
       // settles it.
       expect(status.physical).toBe('creating');
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'creating',
-        createIntent: {
-          intentId: 'intent_previous',
-          containment: { kilocode: false, github: true },
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: {
+          kind: 'creating',
+          target: { containment: { kilocode: false, github: true } },
+          createIntent: { intentId: 'intent_previous' },
         },
       });
     });
@@ -3121,12 +3207,9 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       expect(await loadSessionCredentialGrants(state.storage)).toEqual([grant]);
       expect(await state.storage.get('wrapper_credential_hash')).toBeUndefined();
       expect(creates).toBe(0);
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: null,
-        createIntent: null,
-        stopTombstone: null,
-      });
+      const settled = await instance.getAllocationRecord();
+      expect(settled.state.kind).toBe('stopped');
+      expect(canonicalProviderRef(settled)).toBeNull();
     });
   });
 
@@ -3153,9 +3236,8 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         async launch(ref, environment) {
           launchEnv = environment;
           expect(ref).toBe(providerRef);
-          await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-            state: 'running',
-            providerRef,
+          await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+            state: { kind: 'allocated', target: { providerRef } },
           });
           throw new Error('Wrapper startup failed');
         },
@@ -3180,15 +3262,18 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         sessionId: registration.identity.sessionId,
       });
       expect(status.physical).toBe('failed');
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'failed',
-        providerRef,
-        createIntent: {
-          intentId: capturedIntent?.intentId,
-          allocationName: capturedIntent?.allocationName,
+      const failed = await instance.getAllocationRecord();
+      expect(failed).toMatchObject({
+        state: {
+          kind: 'unknown',
+          target: {
+            providerRef,
+            resolvedContainment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
+          },
+          createIntent: { intentId: capturedIntent?.intentId },
         },
-        containment: { ...CONTAINMENT_REQUIREMENTS, providerRef },
       });
+      expect(canonicalAllocationName(failed)).toBe(capturedIntent?.allocationName);
       expect(stoppedRefs).toEqual([]);
       // An unresolved launch retains its startup deadline: an explicit stop
       // attempt before it is inert; the ladder starts only at the deadline.
@@ -3272,9 +3357,8 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       } finally {
         clock.mockRestore();
       }
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef,
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped', summary: { providerRef } },
       });
       expect(stoppedRefs).toEqual([providerRef]);
     });
@@ -3328,8 +3412,11 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       );
       expect(launchEnv).not.toHaveProperty('KILOCODE_TOKEN');
       expect(launchEnv).not.toHaveProperty('GH_TOKEN');
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        containment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: {
+          kind: 'allocated',
+          target: { resolvedContainment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef } },
+        },
       });
     });
   });
@@ -3353,10 +3440,14 @@ describe('SandboxControl contained Vercel lifecycle', () => {
         async launch(ref, environment) {
           expect(ref).toBe(providerRef);
           launchEnv = environment;
-          await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-            state: 'running',
-            providerRef,
-            containment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
+          await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+            state: {
+              kind: 'allocated',
+              target: {
+                providerRef,
+                resolvedContainment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
+              },
+            },
           });
         },
       });
@@ -3426,21 +3517,26 @@ describe('SandboxControl mandatory worktree credentials', () => {
     expect(containers.launches).toHaveLength(1);
     const launch = containers.launches[0];
     const providerRef = launch.env.PROVIDER_INSTANCE_ID;
-    const intent = launch.physical.createIntent;
-    expect(intent?.allocationName).not.toBe(fixture.sandboxId);
+    const allocationName = canonicalAllocationName(launch.physical);
+    const createIntent = canonicalCreateIntent(launch.physical);
+    expect(allocationName).not.toBe(fixture.sandboxId);
     expect(decodeCloudflareProviderRef(providerRef)).toEqual({
-      sandboxId: intent?.allocationName,
+      sandboxId: allocationName,
       containment: true,
-      instanceId: intent?.intentId,
+      instanceId: canonicalCreateIntentId(launch.physical),
     });
     expect(launch).toMatchObject({
       containerId: fixture.outboundContainerId,
       outboundHandler: MANAGED_SCM_OUTBOUND_HANDLER,
       physical: {
-        state: 'running',
-        providerRef,
-        createIntent: intent,
-        containment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
+        state: {
+          kind: 'allocated',
+          target: {
+            providerRef,
+            resolvedContainment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
+          },
+          createIntent,
+        },
       },
     });
     expectCredentialFreeLaunch(launch, broker);
@@ -3653,7 +3749,7 @@ describe('SandboxControl mandatory worktree credentials', () => {
     const initialPayload = initial.attachment;
     if (!initialPayload?.kilo) throw new Error('Missing initial contained attachment');
     await control.attachSession(attachInput(registration, initialPayload));
-    const physical = await control.getPhysicalRecord();
+    const physical = await control.getAllocationRecord();
     const [original] = await storedGrants(control);
     const clock = vi.spyOn(Date, 'now').mockReturnValue(original.preparedAt + 5 * HOUR);
     try {
@@ -3668,7 +3764,7 @@ describe('SandboxControl mandatory worktree credentials', () => {
       expect(ready.physical).toBe('running');
       const payload = ready.attachment;
       expect(payload).toEqual(initialPayload);
-      expect(await control.getPhysicalRecord()).toEqual(physical);
+      expect(await control.getAllocationRecord()).toEqual(physical);
       expect(containers.launches).toHaveLength(1);
       const [renewed] = await storedGrants(control);
       expect(renewed.expiresAt).toBe(original.preparedAt + 9 * HOUR);
@@ -3714,7 +3810,7 @@ describe('SandboxControl mandatory worktree credentials', () => {
           method: 'POST',
         })
       ).resolves.toBeNull();
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({ state: 'running' });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
     }
   );
 
@@ -3756,11 +3852,9 @@ describe('SandboxControl mandatory worktree credentials', () => {
       expect(containers.launches).toEqual([]);
       // A create that fails before the provider assigned a reference settles to
       // `stopped` (nothing was allocated), not the legacy flat `failed` shape.
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: null,
-        createIntent: null,
-      });
+      const failedCreate = await control.getAllocationRecord();
+      expect(failedCreate.state.kind).toBe('stopped');
+      expect(canonicalProviderRef(failedCreate)).toBeNull();
     }
   );
 
@@ -3797,12 +3891,9 @@ describe('SandboxControl mandatory worktree credentials', () => {
       expect(broker.kiloSubjects.size).toBe(0);
       expect(broker.githubSubjects.size).toBe(0);
       expect(fixture.containers.launches).toEqual([]);
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: null,
-        createIntent: null,
-        stopTombstone: null,
-      });
+      const rejectedMetadata = await control.getAllocationRecord();
+      expect(rejectedMetadata.state.kind).toBe('stopped');
+      expect(canonicalProviderRef(rejectedMetadata)).toBeNull();
     }
   );
 
@@ -3887,7 +3978,7 @@ describe('SandboxControl mandatory worktree credentials', () => {
       await expect(async () =>
         control.ensureReady({ ...credentialInput(second), allowCreate: true })
       ).rejects.toThrow('Worktree credential scope mismatch');
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({ state: 'running' });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
       expect(await storedGrants(control)).toEqual(original);
     }
   );
@@ -4050,9 +4141,9 @@ describe('SandboxControl mandatory worktree credentials', () => {
         })
       ).resolves.toBeNull();
       expect(await storedGrants(control)).toEqual([grant]);
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        providerRef: cloudflareRef(fixture.sandboxId, 'replacement'),
-      });
+      expect(canonicalProviderRef(await control.getAllocationRecord())).toBe(
+        cloudflareRef(fixture.sandboxId, 'replacement')
+      );
     } finally {
       clock.mockRestore();
     }
@@ -4171,16 +4262,20 @@ describe('SandboxControl native worktree containment', () => {
     expect(vercel.runtime.launches).toHaveLength(1);
     const launch = vercel.runtime.launches[0];
     const providerRef = encodeVercelProviderRef({
-      sandboxName: launch.physical.createIntent?.allocationName ?? '',
+      sandboxName: canonicalAllocationName(launch.physical) ?? '',
       sessionId: 'vsess_joined_1',
     });
     expect(launch.physical).toMatchObject({
-      state: 'running',
-      providerRef,
-      containment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
+      state: {
+        kind: 'allocated',
+        target: {
+          providerRef,
+          resolvedContainment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef },
+        },
+      },
     });
     expect(launch.env.PROVIDER_INSTANCE_ID).toBe(providerRef);
-    expect(launch.physical.createIntent?.allocationName).not.toBe(fixture.sandboxId);
+    expect(canonicalAllocationName(launch.physical)).not.toBe(fixture.sandboxId);
     expect(
       policyAuthorization(
         launch.networkPolicy,
@@ -4306,9 +4401,8 @@ describe('SandboxControl native worktree containment', () => {
       injectionRules: [],
     });
     expect(await storedGrants(control)).toEqual([]);
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'running',
-      providerRef,
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'allocated', target: { providerRef } },
     });
     ws.close();
   });
@@ -4355,9 +4449,9 @@ describe('SandboxControl native worktree containment', () => {
     if (!payload.kilo) throw new Error('Missing contained attachment');
     await control.ensureReady({ ...credentialInput(registration), allowCreate: true });
     await control.attachSession(attachInput(registration, payload));
-    const physical = await control.getPhysicalRecord();
+    const physical = await control.getAllocationRecord();
     const exportUrl = `${CONTAINMENT_TARGETS.sessionIngestBaseUrl}/api/session/${ROOT_ID}/export`;
-    await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+    await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
       status: 'active',
     });
     expect(policyAuthorization(vercel.runtime.policy, payload.kilo.token, exportUrl)).toBe(
@@ -4369,11 +4463,10 @@ describe('SandboxControl native worktree containment', () => {
     });
     expect(await storedGrants(control)).toEqual([]);
     expect(await control.listRoutes()).toEqual([]);
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopped',
-      providerRef: physical.providerRef,
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopped', summary: { providerRef: canonicalProviderRef(physical) } },
     });
-    await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+    await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
       status: 'terminal',
     });
     expect(new Set(vercel.runtime.stoppedSessions)).toEqual(new Set(['vsess_joined_1']));
@@ -4395,7 +4488,7 @@ describe('SandboxControl native worktree containment', () => {
     const payload = ready.attachment;
     if (!payload?.kilo) throw new Error('Missing contained attachment');
     await control.attachSession(attachInput(registration, payload));
-    const physical = await control.getPhysicalRecord();
+    const physical = await control.getAllocationRecord();
     const exportUrl = `${CONTAINMENT_TARGETS.sessionIngestBaseUrl}/api/session/${ROOT_ID}/export`;
     expect(policyAuthorization(vercel.runtime.policy, payload.kilo.token, exportUrl)).toBe(
       `Bearer ${KILO_TOKEN}`
@@ -4407,12 +4500,14 @@ describe('SandboxControl native worktree containment', () => {
     ).rejects.toThrow('Sandbox credential revocation is pending');
     expect(await storedGrants(control)).toEqual([]);
     expect(await control.listRoutes()).toEqual([]);
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopping',
-      providerRef: physical.providerRef,
-      stopTombstone: { reason: 'environment_failed' },
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: {
+        kind: 'stopping',
+        target: { providerRef: canonicalProviderRef(physical) },
+        stopIntent: { reason: 'environment_failed' },
+      },
     });
-    await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+    await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
       status: 'active',
     });
     expect(policyAuthorization(vercel.runtime.policy, payload.kilo.token, exportUrl)).toBe(
@@ -4425,7 +4520,7 @@ describe('SandboxControl native worktree containment', () => {
     await runInDurableObject(control, async (_instance, state) => {
       expect(await state.storage.get('credential_policy_dirty')).toBeTruthy();
     });
-    await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+    await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
       status: 'active',
     });
     expect(policyAuthorization(vercel.runtime.policy, payload.kilo.token, exportUrl)).toBe(
@@ -4437,16 +4532,15 @@ describe('SandboxControl native worktree containment', () => {
     await expect(control.detachSession(registration.identity.sessionId)).resolves.toEqual({
       existed: false,
     });
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopped',
-      providerRef: physical.providerRef,
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopped', summary: { providerRef: canonicalProviderRef(physical) } },
     });
     expect(new Set(vercel.runtime.stoppedSessions)).toEqual(new Set(['vsess_joined_1']));
     expect(await storedGrants(control)).toEqual([]);
     await runInDurableObject(control, async (_instance, state) => {
       expect(await state.storage.get('credential_policy_dirty')).not.toBeTruthy();
     });
-    await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+    await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
       status: 'terminal',
     });
   });
@@ -4465,7 +4559,7 @@ describe('SandboxControl native worktree containment', () => {
     if (!firstPayload?.kilo || !secondPayload?.kilo) throw new Error('Missing sibling attachments');
     await control.attachSession(attachInput(registration, firstPayload));
     await control.attachSession(attachInput(sibling, secondPayload));
-    const physical = await control.getPhysicalRecord();
+    const physical = await control.getAllocationRecord();
     const originalGrants = await storedGrants(control);
     const siblingGrants = originalGrants.filter(grant => grant.scopeId === OTHER_WORKTREE_ID);
     const firstUrl = `${CONTAINMENT_TARGETS.sessionIngestBaseUrl}/api/session/${ROOT_ID}/export`;
@@ -4504,7 +4598,9 @@ describe('SandboxControl native worktree containment', () => {
         'https://api.github.com/repos/acme/repo'
       )
     ).toBe(`Bearer ${GITHUB_TOKEN}`);
-    expect(await control.getPhysicalRecord()).toEqual(physical);
+    expect(allocationWithoutTimeFields(await control.getAllocationRecord())).toEqual(
+      allocationWithoutTimeFields(physical)
+    );
     expect(await storedGrants(control)).toEqual(siblingGrants);
     expect(await control.listRoutes()).toEqual([
       expect.objectContaining(attachInput(sibling, secondPayload)),
@@ -4584,7 +4680,7 @@ describe('SandboxControl native worktree containment', () => {
         throw new Error('Missing expiring attachments');
       await control.attachSession(attachInput(registration, firstPayload));
       await control.attachSession(attachInput(sibling, secondPayload));
-      const physical = await control.getPhysicalRecord();
+      const physical = await control.getAllocationRecord();
       const originalGrants = await storedGrants(control);
       await keepRuntimeLive(control, start + 24 * HOUR);
       const firstUrl = `${CONTAINMENT_TARGETS.sessionIngestBaseUrl}/api/session/${ROOT_ID}/export`;
@@ -4619,8 +4715,10 @@ describe('SandboxControl native worktree containment', () => {
         )
       ).toBe(`Bearer ${GITHUB_TOKEN}`);
       expect(await storedGrants(control)).toEqual(originalGrants);
-      expect(await control.getPhysicalRecord()).toEqual(physical);
-      await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+      expect(allocationWithoutTimeFields(await control.getAllocationRecord())).toEqual(
+        allocationWithoutTimeFields(physical)
+      );
+      await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
         status: 'active',
       });
       expect(await credentialExpiryDeadline(control)).toBe(start + 5 * HOUR);
@@ -4641,7 +4739,9 @@ describe('SandboxControl native worktree containment', () => {
       expect(policyAuthorization(vercel.runtime.policy, secondPayload.kilo.token, secondUrl)).toBe(
         `Bearer ${KILO_TOKEN}`
       );
-      expect(await control.getPhysicalRecord()).toEqual(physical);
+      expect(allocationWithoutTimeFields(await control.getAllocationRecord())).toEqual(
+        allocationWithoutTimeFields(physical)
+      );
       expect(await credentialExpiryDeadline(control)).toBe(start + 5 * HOUR);
     } finally {
       clock.mockRestore();
@@ -4666,7 +4766,7 @@ describe('SandboxControl native worktree containment', () => {
       const secondPayload = second.attachment;
       if (!firstPayload?.kilo || !secondPayload?.kilo)
         throw new Error('Missing expiring attachments');
-      const physical = await control.getPhysicalRecord();
+      const physical = await control.getAllocationRecord();
       const originalGrants = await storedGrants(control);
       await keepRuntimeLive(control, start + 24 * HOUR);
       expect(originalGrants.find(grant => grant.scopeId === WORKTREE_ID)?.expiresAt).toBe(expiry);
@@ -4712,7 +4812,9 @@ describe('SandboxControl native worktree containment', () => {
         expect(await state.storage.get('credential_policy_dirty')).not.toBeTruthy();
       });
       expect(await storedGrants(control)).toEqual(originalGrants);
-      expect(await control.getPhysicalRecord()).toEqual(physical);
+      expect(allocationWithoutTimeFields(await control.getAllocationRecord())).toEqual(
+        allocationWithoutTimeFields(physical)
+      );
 
       await runCredentialExpiryAlarm(control);
       expect(vercel.runtime.policy).toEqual({
@@ -4734,11 +4836,13 @@ describe('SandboxControl native worktree containment', () => {
       await runInDurableObject(control, async (instance, state) => {
         expect(await state.storage.get('credential_policy_dirty')).not.toBeTruthy();
         await instance.alarm();
-        expect((await loadDeadlines(state.storage)).credentialExpiry).toBeUndefined();
+        expect((await loadControlAlarmAnchors(state.storage)).credentialExpiryAt).toBeNull();
       });
       expect(await storedGrants(control)).toEqual(originalGrants);
-      expect(await control.getPhysicalRecord()).toEqual(physical);
-      await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+      expect(allocationWithoutTimeFields(await control.getAllocationRecord())).toEqual(
+        allocationWithoutTimeFields(physical)
+      );
+      await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
         status: 'active',
       });
     } finally {
@@ -4757,7 +4861,7 @@ describe('SandboxControl native worktree containment', () => {
         provider: 'vercel',
         allowCreate: true,
       });
-      const physical = await control.getPhysicalRecord();
+      const physical = await control.getAllocationRecord();
       const exportUrl = `${CONTAINMENT_TARGETS.sessionIngestBaseUrl}/api/session/${ROOT_ID}/export`;
       expect(
         policyAuthorization(vercel.runtime.policy, ready.attachment?.kilo?.token ?? '', exportUrl)
@@ -4765,11 +4869,10 @@ describe('SandboxControl native worktree containment', () => {
       vercel.runtime.failPolicy = true;
       clock.mockReturnValue(start + 4 * HOUR);
       await runCredentialExpiryAlarm(control);
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: physical.providerRef,
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped', summary: { providerRef: canonicalProviderRef(physical) } },
       });
-      await expect(vercel.provider.observe(physical.providerRef)).resolves.toMatchObject({
+      await expect(vercel.provider.observe(canonicalProviderRef(physical))).resolves.toMatchObject({
         status: 'terminal',
       });
       expect(new Set(vercel.runtime.stoppedSessions)).toEqual(new Set(['vsess_joined_1']));
@@ -4794,8 +4897,8 @@ describe('SandboxControl native worktree containment', () => {
       for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
         await fireControlDeadline(control, 'stopAttempt');
       }
-      const retired = await control.getPhysicalRecord();
-      expect(retired).toMatchObject({ state: 'stopping', stopTombstone: { attempts: 5 } });
+      const retired = await control.getAllocationRecord();
+      expect(retired).toMatchObject({ state: { kind: 'stopping', attempts: 5 } });
       clock.mockReturnValue(start + DEADLINE_MS.reconciliationWindow);
       await fireControlDeadline(control, 'reconciliation');
       const expiry = await credentialExpiryDeadline(control);
@@ -4813,15 +4916,12 @@ describe('SandboxControl native worktree containment', () => {
         Object.assign(instance, { provider });
         clock.mockReturnValue(expiry);
         await instance.alarm();
-        expect(await instance.getPhysicalRecord()).toMatchObject({
-          state: 'stopped',
-          providerRef: retired.providerRef,
-          createIntent: null,
-          stopTombstone: null,
+        expect(await instance.getAllocationRecord()).toMatchObject({
+          state: { kind: 'stopped', summary: { providerRef: canonicalProviderRef(retired) } },
         });
         expect(provider.observe).toHaveBeenCalledExactlyOnceWith(
-          retired.providerRef,
-          retired.createIntent
+          canonicalProviderRef(retired),
+          canonicalProviderIntent(retired)
         );
         expect(provider.stop).not.toHaveBeenCalled();
         expect(await loadSessionCredentialGrants(state.storage)).toEqual([]);
@@ -4854,8 +4954,8 @@ describe('SandboxControl native worktree containment', () => {
         for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
           await fireControlDeadline(control, 'stopAttempt');
         }
-        const retired = await control.getPhysicalRecord();
-        expect(retired).toMatchObject({ state: 'stopping', stopTombstone: { attempts: 5 } });
+        const retired = await control.getAllocationRecord();
+        expect(retired).toMatchObject({ state: { kind: 'stopping', attempts: 5 } });
         clock.mockReturnValue(start + DEADLINE_MS.reconciliationWindow);
         const expiry = await credentialExpiryDeadline(control);
         if (expiry === undefined) throw new Error('Missing credential expiry');
@@ -4873,17 +4973,15 @@ describe('SandboxControl native worktree containment', () => {
           clock.mockReturnValue(expiry);
           await instance.alarm();
           expect(provider.observe).toHaveBeenCalledExactlyOnceWith(
-            retired.providerRef,
-            retired.createIntent
+            canonicalProviderRef(retired),
+            canonicalProviderIntent(retired)
           );
           expect(provider.updateNetworkPolicy).not.toHaveBeenCalled();
           if (observation === 'active') {
             // The explicit check found the runtime alive: destroy it and settle.
             expect(provider.stop).toHaveBeenCalledTimes(1);
-            expect(await instance.getPhysicalRecord()).toMatchObject({
-              state: 'stopped',
-              createIntent: null,
-              stopTombstone: null,
+            expect(await instance.getAllocationRecord()).toMatchObject({
+              state: { kind: 'stopped' },
             });
             expect(await loadSessionCredentialGrants(state.storage)).toEqual([]);
             expect(await state.storage.get('credential_policy_dirty')).toBeUndefined();
@@ -4891,7 +4989,9 @@ describe('SandboxControl native worktree containment', () => {
           } else {
             // Inconclusive or failed observation: never confirm death on a guess.
             expect(provider.stop).not.toHaveBeenCalled();
-            expect(await instance.getPhysicalRecord()).toMatchObject({ state: 'stopping' });
+            expect(await instance.getAllocationRecord()).toMatchObject({
+              state: { kind: 'stopping' },
+            });
             expect(await loadSessionCredentialGrants(state.storage)).toEqual(grants);
             expect(await state.storage.get('credential_policy_dirty')).toBe(true);
             expect(await readControlAlarmAnchors(state)).toEqual({
@@ -4922,12 +5022,12 @@ describe('SandboxControl native worktree containment', () => {
         for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
           await fireControlDeadline(control, 'stopAttempt');
         }
-        const retired = await control.getPhysicalRecord();
+        const retired = await control.getAllocationRecord();
         clock.mockReturnValue(start + DEADLINE_MS.reconciliationWindow);
         const expiry = await credentialExpiryDeadline(control);
         if (expiry === undefined) throw new Error('Missing credential expiry');
         await runInDurableObject(control, async (instance, state) => {
-          let replacement: PhysicalRecord | undefined;
+          let replacement: AllocationRecord | undefined;
           let replacementGrants: SessionCredentialGrant[] | undefined;
           let replacementAnchors: ControlAlarmAnchors | undefined;
           let replacementAlarm: number | null | undefined;
@@ -4945,7 +5045,7 @@ describe('SandboxControl native worktree containment', () => {
                 },
               });
               await storeAllocation(state.storage, replacementRecord);
-              replacement = projectAllocationToFlat(replacementRecord);
+              replacement = replacementRecord;
               await instance.prepareSessionCredentials(credentialInput(registration));
               replacementGrants = await loadSessionCredentialGrants(state.storage);
               replacementAnchors = await readControlAlarmAnchors(state);
@@ -4958,15 +5058,15 @@ describe('SandboxControl native worktree containment', () => {
           Object.assign(instance, { provider });
           clock.mockReturnValue(expiry);
           await instance.alarm();
-          expect(replacement).toMatchObject({ state: 'creating', stopTombstone: null });
-          expect(await instance.getPhysicalRecord()).toEqual(replacement);
+          expect(replacement).toMatchObject({ state: { kind: 'creating' } });
+          expect(await instance.getAllocationRecord()).toEqual(replacement);
           expect(await loadSessionCredentialGrants(state.storage)).toEqual(replacementGrants);
           expect(await state.storage.get('credential_policy_dirty')).toBe(true);
           expect(await readControlAlarmAnchors(state)).toEqual(replacementAnchors);
           expect(await state.storage.getAlarm()).toBe(replacementAlarm);
           expect(provider.observe).toHaveBeenCalledExactlyOnceWith(
-            retired.providerRef,
-            retired.createIntent
+            canonicalProviderRef(retired),
+            canonicalProviderIntent(retired)
           );
           expect(provider.stop).not.toHaveBeenCalled();
         });
@@ -4989,10 +5089,12 @@ describe('SandboxControl native worktree containment', () => {
         allowCreate: true,
       });
       await runInDurableObject(control, async instance => {
-        let replacement: PhysicalRecord | undefined;
+        let replacement: AllocationRecord | undefined;
         vercel.runtime.beforePolicyUpdate = async () => {
           await instance.beginStop('old_policy_allocation_retired');
-          await expect(instance.recordStopAttempt()).resolves.toMatchObject({ state: 'stopped' });
+          await expect(instance.recordStopAttempt()).resolves.toMatchObject({
+            state: { kind: 'stopped' },
+          });
           const replacementRecord = canonicalAllocation({
             state: 'creating',
             provider: 'vercel',
@@ -5004,8 +5106,8 @@ describe('SandboxControl native worktree containment', () => {
             },
           });
           await storeAllocation(instance['ctx'].storage, replacementRecord);
-          replacement = projectAllocationToFlat(replacementRecord);
-          expect(replacement.state).toBe('creating');
+          replacement = replacementRecord;
+          expect(replacement.state.kind).toBe('creating');
           if (completion === 'reject') throw new Error('Old allocation policy rejected');
         };
         const outcome = await instance.detachSession(registration.identity.sessionId).then(
@@ -5013,7 +5115,7 @@ describe('SandboxControl native worktree containment', () => {
           error => ({ status: 'rejected', error })
         );
         expect(replacement).toBeDefined();
-        await expect(instance.getPhysicalRecord()).resolves.toEqual(replacement);
+        await expect(instance.getAllocationRecord()).resolves.toEqual(replacement);
         expect(outcome).toEqual({ status: 'fulfilled', result: { existed: false } });
       });
     }
@@ -5032,14 +5134,14 @@ describe('SandboxControl native worktree containment', () => {
         const factory = instance as unknown as {
           createProviderAdapter(
             kind: AgentSandboxProvider,
-            physical?: PhysicalRecord
+            physical?: AllocationRecord
           ): ProviderAdapter;
         };
         const createAdapter = factory.createProviderAdapter.bind(instance);
         Object.assign(instance, {
           createProviderAdapter: (
             kind: AgentSandboxProvider,
-            physical?: PhysicalRecord
+            physical?: AllocationRecord
           ): ProviderAdapter => {
             const adapter = createAdapter(kind, physical);
             native = adapter;
@@ -5083,22 +5185,31 @@ describe('SandboxControl native worktree containment', () => {
         const firstRef = firstResult.providerRef;
         if (completion === 'startup-failed') {
           await waitFor(() => expect(containers.launches).toHaveLength(1));
-          await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-            state: 'running',
-            providerRef: firstRef,
-            containment: { ...WORKTREE_CREDENTIAL_CONTAINMENT, providerRef: firstRef },
+          await expect(control.getAllocationRecord()).resolves.toMatchObject({
+            state: {
+              kind: 'allocated',
+              target: {
+                providerRef: firstRef,
+                resolvedContainment: {
+                  ...WORKTREE_CREDENTIAL_CONTAINMENT,
+                  providerRef: firstRef,
+                },
+              },
+            },
           });
         } else {
-          await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-            state: 'creating',
-            providerRef: null,
-            createIntent: { intentId: firstIntentId },
+          await expect(control.getAllocationRecord()).resolves.toMatchObject({
+            state: {
+              kind: 'creating',
+              target: { providerRef: null },
+              createIntent: { intentId: firstIntentId },
+            },
           });
           expect(containers.launches).toEqual([]);
         }
         const [firstGrant] = await storedGrants(control);
         if (!firstGrant?.scm) throw new Error('Missing first instance credentials');
-        const firstCreatedAt = (await control.getPhysicalRecord()).createIntent?.createdAt;
+        const firstCreatedAt = canonicalCreateIntent(await control.getAllocationRecord())?.createdAt;
         if (firstCreatedAt === undefined) throw new Error('Missing first allocation intent');
         await control.markFailed();
         const clock = vi
@@ -5109,15 +5220,15 @@ describe('SandboxControl native worktree containment', () => {
         } finally {
           clock.mockRestore();
         }
-        await expect(control.getPhysicalRecord()).resolves.toMatchObject({ state: 'stopped' });
+        await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
         const replacement = await control.ensureReady(input);
         const attachment = replacement.attachment;
         if (!attachment?.kilo || !attachment.git?.token)
           throw new Error('Missing replacement credentials');
-        const physical = await control.getPhysicalRecord();
-        if (!physical.providerRef) throw new Error('Missing replacement provider reference');
-        expect(physical.state).toBe('running');
-        expect(physical.providerRef).not.toBe(firstRef);
+        const physical = await control.getAllocationRecord();
+        if (!canonicalProviderRef(physical)) throw new Error('Missing replacement provider reference');
+        expect(physical.state.kind).toBe('allocated');
+        expect(canonicalProviderRef(physical)).not.toBe(firstRef);
         expect(attachment.kilo.token).not.toBe(firstGrant.kilo.alias);
         expect(attachment.git.token).not.toBe(firstGrant.scm.alias);
         const grants = await storedGrants(control);
@@ -5129,10 +5240,10 @@ describe('SandboxControl native worktree containment', () => {
         await control.attachSession(attachInput(registration, attachment));
         const launch = containers.launches[completion === 'startup-failed' ? 1 : 0];
         expect(launch.physical).toEqual(physical);
-        expect(launch.env.PROVIDER_INSTANCE_ID).toBe(physical.providerRef);
+        expect(launch.env.PROVIDER_INSTANCE_ID).toBe(canonicalProviderRef(physical));
         currentSocket = await connect(launch.env.SANDBOX_CONTROL_CREDENTIAL, sandboxId);
         await completeHello(currentSocket, `hello-current-${completion}`, {
-          providerInstanceId: physical.providerRef,
+          providerInstanceId: canonicalProviderRef(physical),
         });
         signalWrapperReady(currentSocket);
         await waitFor(async () => {
@@ -5141,6 +5252,7 @@ describe('SandboxControl native worktree containment', () => {
             connection: 'ready',
           });
         });
+        const readyPhysical = await control.getAllocationRecord();
 
         if (completion === 'reject')
           deferred.reject(new Error('Deferred Cloudflare creation failed'));
@@ -5148,7 +5260,14 @@ describe('SandboxControl native worktree containment', () => {
           launchDeferred.reject(new Error('Deferred wrapper launch failed'));
         else deferred.resolve({ providerRef: firstRef });
         const outcome = await pending;
-        expect(await control.getPhysicalRecord()).toEqual(physical);
+        // The replacement is fully ready before the stale operation settles, so
+        // the final record must equal this post-readiness snapshot. A late
+        // completion that overwrote the replacement's health, incarnation or
+        // heartbeat evidence fails here; only the two time-varying fields
+        // (`state.idleAt`, `state.health.deadlineAt`) are stripped.
+        expect(allocationWithoutTimeFields(await control.getAllocationRecord())).toEqual(
+          allocationWithoutTimeFields(readyPhysical)
+        );
         await expect(control.getStatus()).resolves.toMatchObject({
           physical: 'running',
           connection: 'ready',
@@ -5157,7 +5276,7 @@ describe('SandboxControl native worktree containment', () => {
         expect(containers.running.has(launch.containerId ?? '')).toBe(true);
         if (!native) throw new Error('Missing current native adapter');
         await expect(
-          native.observe(physical.providerRef, physical.createIntent)
+          native.observe(canonicalProviderRef(physical), canonicalCreateIntent(physical))
         ).resolves.toMatchObject({ status: 'active' });
         expect(await storedGrants(control)).toEqual(grants);
         if (outcome.type === 'resolved' && outcome.status.attachment) {
@@ -5201,13 +5320,13 @@ describe('SandboxControl native worktree containment', () => {
       control.ensureReady({ ...credentialInput(registration), allowCreate: true })
     ).resolves.toMatchObject({ physical: 'failed' });
     expect(containers.launches).toEqual([]);
-    const physical = await control.getPhysicalRecord();
-    const nativeId = decodeCloudflareProviderRef(physical.providerRef)?.sandboxId;
-    expect(nativeId).toBe(physical.createIntent?.allocationName);
+    const physical = await control.getAllocationRecord();
+    const nativeId = decodeCloudflareProviderRef(canonicalProviderRef(physical))?.sandboxId;
+    expect(nativeId).toBe(canonicalAllocationName(physical));
     expect(Array.from(broker.kiloSubjects.values())[0]?.outboundContainerId).toBe(
       `contained:${nativeId}`
     );
-    const createdAt = physical.createIntent?.createdAt;
+    const createdAt = canonicalCreateIntent(physical)?.createdAt;
     if (createdAt === undefined) throw new Error('Missing allocation intent');
     const clock = vi.spyOn(Date, 'now').mockReturnValue(createdAt + DEADLINE_MS.createSettle + 1);
     try {
@@ -5219,9 +5338,8 @@ describe('SandboxControl native worktree containment', () => {
     // the canonical machine settles the allocation to stopped without a destroy.
     expect(containers.destroyed).toEqual([]);
     expect(await storedGrants(control)).toEqual([]);
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopped',
-      providerRef: physical.providerRef,
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopped', summary: { providerRef: canonicalProviderRef(physical) } },
     });
   });
 
@@ -5354,13 +5472,15 @@ describe('SandboxControl acquisition receipts', () => {
     );
     try {
       await waitFor(() => expect(responseHeld).toBe(true));
-      const physical = await control.getPhysicalRecord();
-      expect(physical).toMatchObject({ state: 'running', providerRef: expect.any(String) });
+      const physical = await control.getAllocationRecord();
+      expect(physical).toMatchObject({
+        state: { kind: 'allocated', target: { providerRef: expect.any(String) } },
+      });
       const receipts = await runInDurableObject(control, (_instance, state) =>
         state.storage.get('acquisition_receipts')
       );
       expect(receipts).toEqual([
-        { ...acquisition, allocation: { kind: 'intent', id: physical.createIntent?.intentId } },
+        { ...acquisition, allocation: { kind: 'intent', id: canonicalCreateIntentId(physical) } },
       ]);
       expect(provider.create).toHaveBeenCalledTimes(1);
       expect(provider.launch).toHaveBeenCalledTimes(1);
@@ -5374,10 +5494,8 @@ describe('SandboxControl acquisition receipts', () => {
       });
       await control.beginStop('lost_acquisition_response');
       await fireControlDeadline(control, 'stopAttempt');
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: expect.any(String),
-        createIntent: null,
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped', summary: { providerRef: expect.any(String) } },
       });
       expect(allocations.size).toBe(0);
 
@@ -5440,9 +5558,9 @@ describe('SandboxControl acquisition receipts', () => {
       await expect(control.ensureReady({ ...input, acquisition: fresh })).resolves.toMatchObject({
         physical: 'running',
       });
-      const replacement = await control.getPhysicalRecord();
-      expect(replacement.providerRef).not.toBe(physical.providerRef);
-      expect(allocations).toEqual(new Set([replacement.providerRef]));
+      const replacement = await control.getAllocationRecord();
+      expect(canonicalProviderRef(replacement)).not.toBe(canonicalProviderRef(physical));
+      expect(allocations).toEqual(new Set([canonicalProviderRef(replacement)]));
       expect(provider.create).toHaveBeenCalledTimes(2);
       expect(provider.launch).toHaveBeenCalledTimes(2);
       await expect(Promise.resolve(control.ensureReady(input))).rejects.toThrow(
@@ -5452,7 +5570,7 @@ describe('SandboxControl acquisition receipts', () => {
       await runInDurableObject(control, async (_instance, state) => {
         expect(await state.storage.get('acquisition_receipts')).toEqual([
           ...(receipts as unknown[]),
-          { ...fresh, allocation: { kind: 'intent', id: replacement.createIntent?.intentId } },
+          { ...fresh, allocation: { kind: 'intent', id: canonicalCreateIntentId(replacement) } },
         ]);
       });
     } finally {
@@ -5484,19 +5602,17 @@ describe('SandboxControl acquisition receipts', () => {
     for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
       await fireControlDeadline(control, 'stopAttempt');
     }
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopping',
-      stopTombstone: { attempts: 5 },
-    });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopping', attempts: 5 },
+      });
 
     // Replaying the original, still-bound acquisition must wait: no provider
     // effect and no budget reset.
     const stopCalls = provider.stop.mock.calls.length;
     await expect(control.ensureReady(input)).resolves.toMatchObject({ physical: 'stopping' });
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopping',
-      stopTombstone: { attempts: 5 },
-    });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopping', attempts: 5 },
+      });
     expect(provider.stop.mock.calls.length).toBe(stopCalls);
 
     // An expired request never advances the step.
@@ -5506,16 +5622,15 @@ describe('SandboxControl acquisition receipts', () => {
         acquisition: { id: crypto.randomUUID(), deadlineAt: Date.now() - 1 },
       })
     ).rejects.toThrow('Sandbox acquisition expired');
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopping',
-      stopTombstone: { attempts: 5 },
-    });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopping', attempts: 5 },
+      });
 
     // A fresh acquisition advances the exhausted stop and settles it.
     provider.stop.mockResolvedValue('terminal');
     const fresh = { id: crypto.randomUUID(), deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
     await control.ensureReady({ ...input, acquisition: fresh });
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({ state: 'stopped' });
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
     expect(provider.stop.mock.calls.length).toBeGreaterThan(stopCalls);
 
     // The old acquisition cannot spend itself on a replacement.
@@ -5694,10 +5809,9 @@ describe('SandboxControl acquisition receipts', () => {
     for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
       await fireControlDeadline(control, 'stopAttempt');
     }
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopping',
-      stopTombstone: { attempts: 5 },
-    });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopping', attempts: 5 },
+      });
 
     // Fill every reopen slot for this cleanup with a live marker.
     const now = Date.now();
@@ -5754,17 +5868,17 @@ describe('SandboxControl acquisition receipts', () => {
     expect(cleanupDeadlines.length).toBeGreaterThan(deadlinesBefore);
   });
 
-  it('keeps commit side effects canonical when the flat projection labels diverge', async () => {
+  it('keeps commit side effects canonical without the retired flat projection', async () => {
     const sandboxId = `usr-${crypto.randomUUID().replaceAll('-', '')}` as const;
     const control = env.SANDBOX_CONTROL.getByName(sandboxId);
     await installProvider(control);
     const sessionId = GRANT_SESSION_ID;
-    const ownerId = 'owner_commit_projection';
+    const ownerId = 'owner_commit_canonical';
     await registerCredentialSession({
       identity: { sessionId, userId: ownerId },
       auth: { kiloSessionId: ROOT_ID, kilocodeToken: KILO_TOKEN },
       agent: {},
-      workspace: { sandboxId, workspacePath: '/workspace/commit-projection' },
+      workspace: { sandboxId, workspacePath: '/workspace/commit-canonical' },
     });
     const acquisition = {
       id: crypto.randomUUID(),
@@ -5814,7 +5928,7 @@ describe('SandboxControl acquisition receipts', () => {
       },
     };
 
-    const runCommit = (to: AllocationRecord, diverges: (record: AllocationRecord) => boolean) =>
+    const runCommit = (to: AllocationRecord) =>
       runInDurableObject(control, async instance => {
         const seen: Array<{ wrapperInstanceId: string; confirmed: boolean }> = [];
         const target = instance as unknown as {
@@ -5822,7 +5936,6 @@ describe('SandboxControl acquisition receipts', () => {
             wrapperInstanceId: string,
             confirmed: boolean
           ) => Promise<boolean>;
-          projectPhysical: (record: AllocationRecord) => PhysicalRecord;
           afterCanonicalCommit: (
             from: AllocationRecord,
             to: AllocationRecord,
@@ -5835,32 +5948,13 @@ describe('SandboxControl acquisition receipts', () => {
             return true;
           }
         );
-        // Hold the canonical records fixed and only change the compatibility
-        // projection's labels for the target.
-        vi.spyOn(target, 'projectPhysical').mockImplementation(record => {
-          const flat = projectAllocationToFlat(record);
-          if (!diverges(record)) return flat as PhysicalRecord;
-          return {
-            ...flat,
-            state: 'stopped',
-            stopTombstone: {
-              reason: 'environment_stopped',
-              attempts: 5,
-              createdAt: Date.now() - 1_000,
-              wrapperInstanceId: 'flat-only-wrapper',
-            },
-          } as unknown as PhysicalRecord;
-        });
-        await target.afterCanonicalCommit(allocated, to, 'projection-test');
+        await target.afterCanonicalCommit(allocated, to, 'commit-test');
         return seen;
       });
 
-    // Canonical `allocated` → `allocated` while the projection claims `stopped`:
-    // credential cleanup, grant clearing and invalidation must stay canonical.
-    const invalidations = await runCommit(
-      allocatedTo,
-      record => record.state.kind === 'allocated' && record.state.idleAt === 999
-    );
+    // Canonical `allocated` → `allocated`: credential cleanup, grant clearing and
+    // terminal invalidation must not run.
+    const invalidations = await runCommit(allocatedTo);
     expect(invalidations).toEqual([]);
     const preserved = await runInDurableObject(control, async (_instance, state) => ({
       credentialHash: await state.storage.get('wrapper_credential_hash'),
@@ -5881,13 +5975,9 @@ describe('SandboxControl acquisition receipts', () => {
       recovery: [{ marker: 'recovery' }],
     });
 
-    // Canonical `stopping` while the projection claims `stopped`: invalidation
-    // uses the canonical stop-intent identity and confirmation flag, and the
-    // live grants are not cleared.
-    const stoppingInvalidations = await runCommit(
-      stoppingTo,
-      record => record.state.kind === 'stopping'
-    );
+    // Canonical `stopping`: invalidation uses the canonical stop-intent identity
+    // and confirmation flag, and the live grants are not cleared.
+    const stoppingInvalidations = await runCommit(stoppingTo);
     expect(stoppingInvalidations).toEqual([
       { wrapperInstanceId: 'canonical-wrapper', confirmed: false },
     ]);
@@ -5925,10 +6015,9 @@ describe('SandboxControl acquisition receipts', () => {
     for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
       await fireControlDeadline(control, 'stopAttempt');
     }
-    await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopping',
-      stopTombstone: { attempts: 5 },
-    });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopping', attempts: 5 },
+      });
 
     const dispatched: string[] = [];
     await runInDurableObject(control, async instance => {
@@ -6011,69 +6100,8 @@ describe('SandboxControl acquisition receipts', () => {
     expect(storedIntent).toBe('replacement-intent');
   });
 
-  it('dispatches the same canonical event regardless of the projected tombstone', async () => {
-    const run = async (divergent: boolean) => {
-      const sandboxId = `usr-${crypto.randomUUID().replaceAll('-', '')}` as const;
-      const control = env.SANDBOX_CONTROL.getByName(sandboxId);
-      await installProvider(control);
-      const sessionId = GRANT_SESSION_ID;
-      const ownerId = `owner_projection_${divergent ? 'divergent' : 'normal'}`;
-      await registerCredentialSession({
-        identity: { sessionId, userId: ownerId },
-        auth: { kiloSessionId: ROOT_ID, kilocodeToken: KILO_TOKEN },
-        agent: {},
-        workspace: { sandboxId, workspacePath: '/workspace/projection-event' },
-      });
-      const acquisition = {
-        id: crypto.randomUUID(),
-        deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS,
-      };
-      await expect(control.ensureReady({ ownerId, sessionId, acquisition })).resolves.toMatchObject(
-        {
-          physical: 'running',
-        }
-      );
-      return runInDurableObject(control, async instance => {
-        const events: string[] = [];
-        const target = instance as unknown as {
-          refreshWorktreeNetworkPolicy: (ownerId: string) => Promise<void>;
-          enforceWorktreeNetworkPolicy: (ownerId: string) => Promise<void>;
-          projectPhysical: (record: AllocationRecord) => PhysicalRecord;
-          allocationOrchestrator: { dispatch(event: unknown, now?: number): Promise<unknown> };
-        };
-        vi.spyOn(target, 'refreshWorktreeNetworkPolicy').mockRejectedValue(
-          new Error('policy refresh failed')
-        );
-        const orchestrator = target.allocationOrchestrator;
-        const original = orchestrator.dispatch.bind(orchestrator);
-        vi.spyOn(orchestrator, 'dispatch').mockImplementation(async (event, now) => {
-          events.push(JSON.stringify(event));
-          return original(event, now);
-        });
-        if (divergent) {
-          // Same canonical input, different compatibility labels/tombstone.
-          vi.spyOn(target, 'projectPhysical').mockImplementation(record => {
-            return {
-              ...projectAllocationToFlat(record),
-              state: 'stopping',
-              stopTombstone: {
-                reason: 'environment_stopped',
-                attempts: 5,
-                createdAt: Date.now() - 1_000,
-                wrapperInstanceId: 'flat-only-wrapper',
-              },
-            } as unknown as PhysicalRecord;
-          });
-        }
-        await target.enforceWorktreeNetworkPolicy(ownerId);
-        return events;
-      });
-    };
-    const normal = await run(false);
-    const divergent = await run(true);
-    expect(normal[0]).toContain('CANCEL');
-    expect(divergent).toEqual(normal);
-  });
+  // Retired: the projected tombstone seam (projectPhysical/allocation-view) is deleted
+  // with C3d; the dispatch events are canonical by construction.
 
   it('keeps an unresolved create unobserved until its retained startup deadline', async () => {
     const sandboxId = `usr-${crypto.randomUUID().replaceAll('-', '')}` as const;
@@ -6141,7 +6169,7 @@ describe('SandboxControl acquisition receipts', () => {
         clock.mockRestore();
       }
       expect(observations).toEqual([null]);
-      expect(await instance.getPhysicalRecord()).toMatchObject({ state: 'stopped' });
+      expect(await instance.getAllocationRecord()).toMatchObject({ state: { kind: 'stopped' } });
     });
   });
 });
@@ -6160,11 +6188,11 @@ describe('SandboxControl durable remainder', () => {
     const stub = env.SANDBOX_CONTROL.getByName('sbx__control_create_intent');
     await runInDurableObject(stub, async (instance, state) => {
       await seedCreatingAllocation(state.storage, 'intent_1');
-      const record = await instance.getPhysicalRecord();
-      expect(record.state).toBe('creating');
-      expect(record.createIntent?.intentId).toBe('intent_1');
-      expect(record.providerRef).toBeNull();
-      await expect(instance.getPhysicalRecord()).resolves.toEqual(record);
+      const record = await instance.getAllocationRecord();
+      expect(record.state.kind).toBe('creating');
+      expect(canonicalCreateIntentId(record)).toBe('intent_1');
+      expect(canonicalProviderRef(record)).toBeNull();
+      await expect(instance.getAllocationRecord()).resolves.toEqual(record);
       await expect(instance.getStatus()).resolves.toMatchObject({
         reported: 'booting',
         physical: 'creating',
@@ -6236,7 +6264,7 @@ describe('SandboxControl durable remainder', () => {
       const idleStop = await canonicalIdleAt(state);
       expect(idleStop).toBeGreaterThanOrEqual(detachedAt + DEADLINE_MS.idleStop);
       await expect(instance.listRoutes()).resolves.toEqual([]);
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({ state: 'running' });
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
 
       await expect(instance.detachSession(GRANT_SESSION_ID)).resolves.toEqual({
         existed: false,
@@ -6255,11 +6283,11 @@ describe('SandboxControl durable remainder', () => {
         createIntent: { intentId: 'intent_stop', createdAt: Date.now() },
         stopTombstone: { reason: 'idle', attempts: 0, createdAt: Date.now() },
       });
-      const stopping = await instance.getPhysicalRecord();
-      expect(stopping.state).toBe('stopping');
-      expect(stopping.providerRef).toBeNull();
-      expect(stopping.createIntent?.intentId).toBe('intent_stop');
-      expect(stopping.stopTombstone?.reason).toBe('idle');
+      const stopping = await instance.getAllocationRecord();
+      expect(stopping.state.kind).toBe('stopping');
+      expect(canonicalProviderRef(stopping)).toBeNull();
+      expect(canonicalCreateIntentId(stopping)).toBe('intent_stop');
+      expect(canonicalStopIntent(stopping)?.reason).toBe('idle');
       await expect(instance.getStatus()).resolves.toMatchObject({
         reported: 'shutting-down',
         physical: 'stopping',
@@ -6445,8 +6473,7 @@ describe('SandboxControl durable remainder', () => {
         await waitFor(async () => {
           await runInDurableObject(control, async (_instance, state) => {
             const record = (await loadAllocation(state.storage, false)) as AllocationRecord;
-            const deadlines = await loadDeadlines(state.storage);
-            expect(deadlines.idleStop).toBeUndefined();
+            expect(await canonicalIdleAt(state)).toBeNull();
             expect(
               record.state.kind === 'allocated' ? record.state.health : undefined
             ).toMatchObject({ deadlineAt: idleStop + 1 + DEADLINE_MS.heartbeatExpiry });
@@ -6473,7 +6500,7 @@ describe('SandboxControl durable remainder', () => {
       await instance.eraseRecord();
       expect(await instance.getTransitionLog()).toEqual([]);
       await expect(instance.getOwner()).resolves.toBeNull();
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({ state: 'stopped' });
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
     });
   });
 
@@ -6519,9 +6546,8 @@ describe('SandboxControl durable remainder', () => {
       );
       await runInDurableObject(stub, async instance => {
         await expect(instance.listRoutes()).resolves.toEqual(before);
-        await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-          state: 'running',
-          stopTombstone: null,
+        await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+          state: { kind: 'allocated' },
         });
       });
       response.webSocket.close();
@@ -6806,13 +6832,14 @@ describe('SandboxControl passive status', () => {
       // unhealthy stop directly so the quarantine state under test is reached.
       await instance.beginStop('health_unhealthy_unresponsive');
       await waitFor(async () => {
-        expect((await instance.getPhysicalRecord()).stopTombstone).toMatchObject({
+        const stopping = await instance.getAllocationRecord();
+        expect(canonicalStopIntent(stopping)).toMatchObject({
           reason: 'health_unhealthy_unresponsive',
-          attempts: DEADLINE_MS.stopAttemptLadder.length,
         });
+        expect(canonicalStopAttempts(stopping)).toBe(DEADLINE_MS.stopAttemptLadder.length);
       });
       expect(await state.storage.get('wrapper_ready_at')).toBeUndefined();
-      expect((await loadDeadlines(state.storage)).heartbeatExpiry).toBeUndefined();
+      expect((await instance.getAllocationRecord()).state.kind).toBe('stopping');
       const fresh = await reconstructControl(instance, state);
       expect(fresh['kiloReady']).toBe(false);
       const records = await state.storage.list();
@@ -6858,10 +6885,9 @@ describe('SandboxControl passive status', () => {
     sendHello(second, 'hello-status-new', { wrapperInstanceId: crypto.randomUUID() });
     await expect(closed).resolves.toBe(4001);
     await waitFor(async () => {
-      expect((await stub.getPhysicalRecord()).stopTombstone).toMatchObject({
-        reason: 'control_replaced',
-        attempts: DEADLINE_MS.stopAttemptLadder.length,
-      });
+      const replaced = await stub.getAllocationRecord();
+      expect(canonicalStopIntent(replaced)).toMatchObject({ reason: 'control_replaced' });
+      expect(canonicalStopAttempts(replaced)).toBe(DEADLINE_MS.stopAttemptLadder.length);
     });
     await runInDurableObject(stub, async (instance, state) => {
       const fresh = await reconstructControl(instance, state);
@@ -9786,8 +9812,10 @@ describe('SandboxSession control-plane regressions', () => {
         throw new Error('Missing first acquisition');
       const firstAttemptId = firstMessage.preparationAttemptId;
       const deadlineAt = firstMessage.deliveryDeadlineAt;
-      const physical = await control.getPhysicalRecord();
-      expect(physical).toMatchObject({ state: 'running', providerRef: expect.any(String) });
+      const physical = await control.getAllocationRecord();
+      expect(physical).toMatchObject({
+        state: { kind: 'allocated', target: { providerRef: expect.any(String) } },
+      });
       await expect(
         runInDurableObject(control, (_instance, state) =>
           state.storage.get<Array<{ id: string; allocation: unknown }>>('acquisition_receipts')
@@ -9798,10 +9826,8 @@ describe('SandboxSession control-plane regressions', () => {
 
       await control.beginStop('external_kill');
       await fireControlDeadline(control, 'stopAttempt');
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: expect.any(String),
-        createIntent: null,
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped', summary: { providerRef: expect.any(String) } },
       });
 
       const acquisitions: Parameters<typeof control.ensureReady>[0][] = [];
@@ -10307,7 +10333,7 @@ describe('SandboxSession control-plane regressions', () => {
           result: { status: 'failed' },
         });
         await runInDurableObject(control, async instance => {
-          expect((await instance.getPhysicalRecord()).stopTombstone?.attempts).toBe(
+          expect(canonicalStopAttempts(await instance.getAllocationRecord())).toBe(
             DEADLINE_MS.stopAttemptLadder.length
           );
         });
@@ -10327,10 +10353,13 @@ describe('SandboxSession control-plane regressions', () => {
       // The heartbeat failure drains the bounded stop ladder inline; the runtime
       // is not confirmed dead, so no replacement is created.
       expect(provider.stop).toHaveBeenCalledTimes(DEADLINE_MS.stopAttemptLadder.length);
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopping',
-        providerRef: cloudflareRef(fixture.sandboxId),
-        stopTombstone: { attempts: 5, wrapperInstanceId: fixture.wrapperInstanceId },
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: {
+          kind: 'stopping',
+          target: { providerRef: cloudflareRef(fixture.sandboxId) },
+          attempts: 5,
+          stopIntent: { wrapperInstanceId: fixture.wrapperInstanceId },
+        },
       });
       await expect(control.getStatus()).resolves.toMatchObject({ connection: 'disconnected' });
       const stoppedBeforeChecks = provider.stop.mock.calls.length;
@@ -10339,15 +10368,16 @@ describe('SandboxSession control-plane regressions', () => {
         stoppedBeforeChecks + DEADLINE_MS.stopAttemptLadder.length
       );
       await fireControlDeadline(control, 'reconciliation');
-      expect((await control.getPhysicalRecord()).stopTombstone?.attempts).toBe(5);
+      expect(canonicalStopAttempts(await control.getAllocationRecord())).toBe(5);
       expect(provider.create).not.toHaveBeenCalled();
 
       allocations.delete(cloudflareRef(fixture.sandboxId));
       await fireControlDeadline(control, 'reconciliation');
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: cloudflareRef(fixture.sandboxId),
-        stopTombstone: null,
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: {
+          kind: 'stopped',
+          summary: { providerRef: cloudflareRef(fixture.sandboxId) },
+        },
       });
       await runInDurableObject(session, instance => instance.alarm());
       expect(provider.create).not.toHaveBeenCalled();
@@ -10363,7 +10393,7 @@ describe('SandboxSession control-plane regressions', () => {
       const launch = provider.launch.mock.calls[0];
       if (!launch) throw new Error('Expected replacement wrapper launch');
       expect(launch[0]).not.toBe(cloudflareRef(fixture.sandboxId));
-      expect((await control.getPhysicalRecord()).providerRef).toBe(launch[0]);
+      expect(canonicalProviderRef(await control.getAllocationRecord())).toBe(launch[0]);
       replacement = await connect(launch[1].SANDBOX_CONTROL_CREDENTIAL, fixture.sandboxId);
       await completeHello(replacement, 'hello_cleanup_recovery', {
         providerInstanceId: launch[0],
@@ -11357,7 +11387,7 @@ describe('SandboxSession control-plane regressions', () => {
             lastState: 'active',
           }),
         ]);
-        await expect(instance.getPhysicalRecord()).resolves.toMatchObject({ state: 'running' });
+        await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
         expect(await canonicalIdleAt(state)).toBeNull();
         expect(
           (await loadSessionCredentialGrants(state.storage)).flatMap(grant => grant.members)
@@ -11550,7 +11580,7 @@ describe('SandboxControl terminal runtime coordination', () => {
       allowCreate: true,
       billing,
     });
-    const physical = await control.getPhysicalRecord();
+    const physical = await control.getAllocationRecord();
     const second = await control.ensureReady({
       ...credentialInput(sibling),
       allowCreate: false,
@@ -11562,11 +11592,11 @@ describe('SandboxControl terminal runtime coordination', () => {
       ...billing,
       sessionId: GRANT_SESSION_ID,
     });
-    expect(provider.ensureBillingAdmission).toHaveBeenCalledWith(physical.providerRef, {
+    expect(provider.ensureBillingAdmission).toHaveBeenCalledWith(canonicalProviderRef(physical), {
       ...billing,
       sessionId: GRANT_SESSION_ID,
     });
-    expect(await control.getPhysicalRecord()).toEqual(physical);
+    expect(await control.getAllocationRecord()).toEqual(physical);
     for (const change of [
       { subject: { type: 'org', id: 'other-org' } },
       { actor: { type: 'bot', id: 'other-bot' }, onBehalfOf: billing.subject },
@@ -11587,7 +11617,7 @@ describe('SandboxControl terminal runtime coordination', () => {
     await control.attachSession(attachInput(registration, first.attachment));
     await control.attachSession(attachInput(sibling, second.attachment));
     const launch = provider.launch.mock.calls[0];
-    const native = decodeCloudflareProviderRef(physical.providerRef);
+    const native = decodeCloudflareProviderRef(canonicalProviderRef(physical));
     if (!launch || !native) throw new Error('Missing billed physical allocation');
     const wrapperInstanceId = crypto.randomUUID();
     const socket = await connect(launch[1].SANDBOX_CONTROL_CREDENTIAL, sandboxId);
@@ -11703,7 +11733,7 @@ describe('SandboxControl terminal runtime coordination', () => {
               ).resolves.toBeNull();
             }
           }
-          const physical = await control.getPhysicalRecord();
+          const physical = await control.getAllocationRecord();
           await expect(
             Promise.all([
               control.recordTerminalActivity(access),
@@ -11719,7 +11749,9 @@ describe('SandboxControl terminal runtime coordination', () => {
             scm: { alias: original.scm?.alias },
           });
           expect(renewed[0].expiresAt).toBeGreaterThan(now + 3 * HOUR);
-          expect(await control.getPhysicalRecord()).toEqual(physical);
+          expect(allocationWithoutTimeFields(await control.getAllocationRecord())).toEqual(
+            allocationWithoutTimeFields(physical)
+          );
           await expect(control.validateTerminalAccess(access)).resolves.toEqual({ allowed: true });
           expect(await storedGrants(control)).toEqual(renewed);
           if (provider === 'vercel') {
@@ -11946,27 +11978,77 @@ describe('SandboxControl terminal runtime coordination', () => {
   });
 
   it('records anchor-migration completion so reconstruction never re-reads legacy deadlines', async () => {
-    const sandboxId = `usr-${crypto.randomUUID().replaceAll('-', '')}` as const;
-    const control = env.SANDBOX_CONTROL.getByName(sandboxId);
-    await runInDurableObject(control, async (instance, state) => {
+    const future = Date.now() + 60_000;
+
+    const boot = async (
+      legacy: unknown,
+      assert: (instance: SandboxControl, state: DurableObjectState) => Promise<void>
+    ) => {
+      const sandboxId = `usr-${crypto.randomUUID().replaceAll('-', '')}` as const;
+      const control = env.SANDBOX_CONTROL.getByName(sandboxId);
+      await runInDurableObject(control, async (instance, state) => {
+        const reinitializable = instance as unknown as {
+          operationalInitialization: Promise<void> | null;
+          ensureOperationalInitialized: () => Promise<void>;
+        };
+        await state.storage.put('deadlines', legacy);
+        await reinitializable.ensureOperationalInitialized();
+        await assert(instance, state);
+      });
+    };
+
+    await boot({ socketHandshake: future, credentialExpiry: future }, async (_instance, state) => {
+      expect(await readControlAlarmAnchors(state)).toEqual({
+        socketHandshakeAt: future,
+        credentialExpiryAt: future,
+      });
+    });
+
+    await boot({}, async (_instance, state) => {
+      expect(await state.storage.get('control_alarm_anchors')).toEqual({
+        credentialExpiryAt: null,
+        socketHandshakeAt: null,
+      });
+    });
+
+    await boot(
+      { socketHandshake: future, credentialExpiry: 'not-a-number' },
+      async (_instance, state) => {
+        expect(await readControlAlarmAnchors(state)).toEqual({
+          socketHandshakeAt: future,
+          credentialExpiryAt: null,
+        });
+      }
+    );
+
+    await boot(
+      { socketHandshake: '4102444800000', credentialExpiry: future },
+      async (_instance, state) => {
+        // Raw stored value: the future numeric string passes `>` by coercion and
+        // is persisted unchanged; the schema-validating loader would reject it.
+        expect(await state.storage.get('control_alarm_anchors')).toEqual({
+          socketHandshakeAt: '4102444800000',
+          credentialExpiryAt: future,
+        });
+      }
+    );
+
+    // A future legacy anchor written after the first boot must not be ported on
+    // reconstruction: the persisted marker short-circuits the reader.
+    await boot({ socketHandshake: future, credentialExpiry: future }, async (instance, state) => {
       const reinitializable = instance as unknown as {
         operationalInitialization: Promise<void> | null;
         ensureOperationalInitialized: () => Promise<void>;
       };
-      // First boot sees no future legacy anchors; completion must still persist.
-      await state.storage.put('deadlines', {});
-      await reinitializable.ensureOperationalInitialized();
-      expect(await state.storage.get('control_alarm_anchors')).toBeDefined();
-
-      // A future legacy anchor written after the first boot must not be ported
-      // when the object is reconstructed: the migration already completed.
-      const future = Date.now() + 60_000;
-      await state.storage.put('deadlines', { socketHandshake: future, credentialExpiry: future });
+      await state.storage.put('deadlines', {
+        socketHandshake: future + 60_000,
+        credentialExpiry: future + 60_000,
+      });
       reinitializable.operationalInitialization = null;
       await reinitializable.ensureOperationalInitialized();
       expect(await readControlAlarmAnchors(state)).toEqual({
-        credentialExpiryAt: null,
-        socketHandshakeAt: null,
+        socketHandshakeAt: future,
+        credentialExpiryAt: future,
       });
     });
   });
@@ -12188,11 +12270,9 @@ describe('SandboxControl terminal runtime coordination', () => {
         allowed: false,
         reason: 'runtime_not_running',
       });
-      await expect(instance.getPhysicalRecord()).resolves.toMatchObject({
-        state: 'stopped',
-        providerRef: null,
-        createIntent: null,
-      });
+      const untouched = await instance.getAllocationRecord();
+      expect(untouched.state.kind).toBe('stopped');
+      expect(canonicalProviderRef(untouched)).toBeNull();
     });
   });
 
@@ -12227,7 +12307,7 @@ describe('SandboxControl terminal runtime coordination', () => {
         });
         await expect(replaced).resolves.toBe(4001);
         await waitFor(async () => {
-          await expect(control.getPhysicalRecord()).resolves.toMatchObject({ state: 'stopped' });
+          await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
           await runInDurableObject(session, (_instance, state) => {
             expect(state.storage.kv.get<{ state: string }>('terminal:pty_original')).toMatchObject({
               state: 'ended',
@@ -12295,7 +12375,7 @@ describe('SandboxControl terminal runtime coordination', () => {
     await waitForWrapperReady(fixture);
 
     await runInDurableObject(control, async instance => {
-      await expect(instance.markFailed()).resolves.toMatchObject({ state: 'stopped' });
+      await expect(instance.markFailed()).resolves.toMatchObject({ state: { kind: 'stopped' } });
       expect(await instance.getStatus()).not.toHaveProperty('wrapperInstanceId');
       await expect(
         instance.validateTerminalAccess({
@@ -12304,7 +12384,7 @@ describe('SandboxControl terminal runtime coordination', () => {
           wrapperInstanceId: fixture.wrapperInstanceId ?? '',
         })
       ).resolves.toEqual({ allowed: false, reason: 'runtime_not_running' });
-      await expect(instance.recordStopAttempt()).resolves.toMatchObject({ state: 'stopped' });
+      await expect(instance.recordStopAttempt()).resolves.toMatchObject({ state: { kind: 'stopped' } });
     });
     expect(provider.stop).toHaveBeenCalled();
     expect(provider.stop.mock.calls[0]?.[0]).toBe(cloudflareRef(fixture.sandboxId));
@@ -12331,7 +12411,7 @@ describe('SandboxControl terminal runtime coordination', () => {
 
     await runInDurableObject(control, async instance => {
       await instance.beginStop('test');
-      await expect(instance.confirmStopped()).resolves.toMatchObject({ state: 'stopped' });
+      await expect(instance.confirmStopped()).resolves.toMatchObject({ state: { kind: 'stopped' } });
       expect(await instance.getStatus()).not.toHaveProperty('wrapperInstanceId');
     });
     await waitFor(async () => {
@@ -12423,7 +12503,7 @@ describe('SandboxControl terminal runtime coordination', () => {
 
         clock.mockReturnValue(now + 1_001);
         await expect(runDurableObjectAlarm(control)).resolves.toBe(true);
-        await expect(control.getPhysicalRecord()).resolves.toMatchObject({ state: 'running' });
+        await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
         expect(provider.stop).not.toHaveBeenCalled();
         expect(provider.create).not.toHaveBeenCalled();
 
@@ -12689,7 +12769,7 @@ describe('SandboxControl targeted detach', () => {
       expect(await instance.listRoutes()).toEqual([
         expect.objectContaining({ sessionId: GRANT_SESSION_ID, kiloSessionId: ROOT_ID }),
       ]);
-      expect((await loadDeadlines(state.storage)).idleStop).toBeUndefined();
+      expect(await canonicalIdleAt(state)).toBeNull();
     });
   });
 });
@@ -14644,29 +14724,21 @@ describe('SandboxControl Vercel runtime identity', () => {
             return new Response('not found', { status: 404 });
           }
           if (pathname === '/v2/sandboxes') {
-            const physical = await instance.getPhysicalRecord();
-            expect(physical.state).toBe('creating');
+            const physical = await instance.getAllocationRecord();
+            expect(physical.state.kind).toBe('creating');
             expect(await state.storage.get('provider_locator')).toEqual(currentLocator);
-            if (!physical.createIntent?.allocationName)
-              throw new Error('Missing persisted create intent');
-            return Response.json(
-              providerEnvelope(
-                physical.createIntent.allocationName,
-                currentLocator,
-                physical.createIntent.intentId
-              )
-            );
+            const allocationName = canonicalAllocationName(physical);
+            const intentId = canonicalCreateIntentId(physical);
+            if (!allocationName || !intentId) throw new Error('Missing persisted create intent');
+            return Response.json(providerEnvelope(allocationName, currentLocator, intentId));
           }
           if (pathname.endsWith('/network-policy')) {
-            const physical = await instance.getPhysicalRecord();
-            if (!physical.createIntent?.allocationName)
-              throw new Error('Missing persisted create intent');
+            const physical = await instance.getAllocationRecord();
+            const allocationName = canonicalAllocationName(physical);
+            const intentId = canonicalCreateIntentId(physical);
+            if (!allocationName || !intentId) throw new Error('Missing persisted create intent');
             return Response.json({
-              session: providerEnvelope(
-                physical.createIntent.allocationName,
-                currentLocator,
-                physical.createIntent.intentId
-              ).session,
+              session: providerEnvelope(allocationName, currentLocator, intentId).session,
             });
           }
           if (pathname.endsWith('/cmd')) {
@@ -14766,7 +14838,7 @@ describe('SandboxControl Vercel runtime identity', () => {
             });
           }
           await instance.alarm();
-          await expect(instance.getPhysicalRecord()).resolves.toMatchObject({ state: 'stopped' });
+          await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
           expect(await state.storage.get('provider_locator')).toEqual(originalLocator);
           expect(requests.map(url => url.pathname)).toEqual([
             ...(physicalState === 'creating'
@@ -15002,7 +15074,7 @@ describe('SandboxSession targeted deletion', () => {
       await expect(control.listRoutes()).resolves.toEqual(
         originalRoutes.filter(route => route.sessionId === siblingSessionId)
       );
-      await expect(control.getPhysicalRecord()).resolves.toMatchObject({ state: 'running' });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
       await runInDurableObject(control, async (_instance, state) => {
         expect(await loadSessionCredentialGrants(state.storage)).toEqual(siblingGrants);
       });

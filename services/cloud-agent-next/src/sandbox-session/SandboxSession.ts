@@ -198,7 +198,7 @@ import {
 import { acceptedAlarmDecision, acceptedInactivityDue } from './accepted-overdue.js';
 import { acceptedSnapshotKind, isRealTurnActivity } from './turn-activity.js';
 import { bootPreparingStep, provisionPreparingStep } from './preparing-steps.js';
-import type { PhysicalState } from '../sandbox-control/status-projection.js';
+import type { PhysicalState } from '../shared/sandbox-status.js';
 import { createSandboxTerminalBridge, type SandboxTerminalRecord } from './terminal-bridge.js';
 import {
   createSandboxTerminalLifecycle,

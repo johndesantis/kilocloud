@@ -1,6 +1,4 @@
-import type { DeadlineId } from './deadlines.js';
-import type { FlatAllocationState } from './allocation-view.js';
-import type { ConnectionState } from './status-projection.js';
+import type { ConnectionState } from '../shared/sandbox-status.js';
 import type { SessionActivityState } from './session-routes.js';
 
 export const TRANSITION_LOG_MAX_ROWS = 200;
@@ -14,6 +12,18 @@ export type TransitionKind =
   | 'provider'
   | 'credential'
   | 'route';
+
+/** Infrastructure alarm anchors still recorded on the transition log. */
+export type DeadlineId = 'credentialExpiry' | 'socketHandshake';
+
+/** Legacy flat allocation labels; the transition log predates the canonical kinds. */
+export type FlatAllocationState =
+  | 'stopped'
+  | 'creating'
+  | 'running'
+  | 'stopping'
+  | 'failed'
+  | 'unknown';
 
 export type DeadlineAction = 'armed' | 'cancelled' | 'fired';
 

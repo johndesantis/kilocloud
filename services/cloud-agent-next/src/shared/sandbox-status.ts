@@ -18,6 +18,11 @@ export const SandboxLifecycleStatusSchema = z.enum([
 
 export type SandboxLifecycleStatus = z.infer<typeof SandboxLifecycleStatusSchema>;
 
+/** Legacy flat allocation label; retained until the public projection is canonical. */
+export type PhysicalState = 'stopped' | 'creating' | 'running' | 'stopping' | 'failed' | 'unknown';
+
+export type ConnectionState = 'disconnected' | 'connected' | 'ready';
+
 export const SandboxProviderLabelSchema = z.enum(['Cloudflare', 'Vercel', 'Unknown']);
 
 export type SandboxProviderLabel = z.infer<typeof SandboxProviderLabelSchema>;

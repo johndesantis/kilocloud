@@ -26,14 +26,13 @@ import type {
 } from './socket.js';
 import { DEADLINE_MS } from './deadlines.js';
 import {
-  loadDeadlines,
-  loadPhysicalRecord,
   loadRouteTable,
   loadSessionCredentialGrants,
   loadSessionReferences,
   loadAllocation as loadCanonicalAllocation,
   storeAllocation,
 } from './durable-state.js';
+import { emptyControlAlarmAnchors, loadControlAlarmAnchors } from './control-alarm.js';
 import {
   addSessionReference,
   emptySessionReferenceState,
@@ -48,10 +47,71 @@ import { decodeCloudflareProviderRef, encodeCloudflareProviderRef } from './clou
 import { parseSessionMetadata } from '../persistence/session-metadata.js';
 import { logger } from '../logger.js';
 import { validateControlLogUploadGrant } from './log-upload-grant.js';
-import { summarizeHeartbeatIdle } from './status-projection.js';
+import { summarizeHeartbeatIdle } from './socket.js';
 
 import { seedCanonicalAllocationRecord } from '../sandbox-state/persist/access.js';
 import { allocationFixture } from '../sandbox-state/model/allocation-fixtures.js';
+import type { AllocationRecord } from '../sandbox-state/model/allocation.js';
+
+function canonicalProviderRef(record: AllocationRecord): string | null {
+  const state = record.state;
+  if (state.kind === 'stopped') return state.summary?.providerRef ?? null;
+  return state.target?.providerRef ?? null;
+}
+
+function canonicalCreateIntentId(record: AllocationRecord): string | undefined {
+  const state = record.state;
+  return state.kind === 'stopped' ? undefined : state.createIntent?.intentId;
+}
+
+function canonicalCreateIntent(record: AllocationRecord) {
+  return record.state.kind === 'stopped' ? null : record.state.createIntent;
+}
+
+function canonicalTarget(record: AllocationRecord) {
+  return record.state.kind === 'stopped' ? null : record.state.target;
+}
+
+function canonicalAllocationName(record: AllocationRecord): string | undefined {
+  const state = record.state;
+  return state.kind === 'stopped' ? undefined : state.target?.allocationName;
+}
+
+function canonicalVercel(record: AllocationRecord) {
+  const state = record.state;
+  return state.kind === 'stopped' ? undefined : state.target?.vercel;
+}
+
+function canonicalContainment(record: AllocationRecord) {
+  const state = record.state;
+  return state.kind === 'creating' || state.kind === 'allocated'
+    ? state.target.containment
+    : undefined;
+}
+
+function canonicalStopIntent(record: AllocationRecord) {
+  const state = record.state;
+  return state.kind === 'stopping' || state.kind === 'unknown' ? state.stopIntent : null;
+}
+
+function canonicalStopAttempts(record: AllocationRecord): number | undefined {
+  const state = record.state;
+  return state.kind === 'stopping' || state.kind === 'unknown' ? state.attempts : undefined;
+}
+
+/** The canonical idle-stop anchor, absent unless the record is allocated. */
+function canonicalIdleAt(record: AllocationRecord): number | null {
+  return record.state.kind === 'allocated' ? record.state.idleAt : null;
+}
+
+/** The canonical scheduling evidence that replaced the legacy deadline table. */
+async function readSchedule(storage: Parameters<typeof loadControlAlarmAnchors>[0]) {
+  const [anchors, allocation] = await Promise.all([
+    loadControlAlarmAnchors(storage),
+    loadCanonicalAllocation(storage as Parameters<typeof loadCanonicalAllocation>[0]),
+  ]);
+  return { anchors, state: allocation.state };
+}
 const mocks = vi.hoisted(() => ({
   getSandbox: vi.fn(),
   providerCreate: vi.fn(),
@@ -416,12 +476,13 @@ async function harness(
       });
     },
     async ready(runtime?: { wrapperVersion: string | null; recoveryCapable?: boolean }) {
-      const physical = await control.getPhysicalRecord();
-      if (!physical.providerRef) throw new Error('No physical allocation');
+      const physical = await control.getAllocationRecord();
+      const providerInstanceId = canonicalProviderRef(physical);
+      if (!providerInstanceId) throw new Error('No physical allocation');
       connection = {
         connectionId: crypto.randomUUID(),
         wrapperInstanceId: crypto.randomUUID(),
-        providerInstanceId: physical.providerRef,
+        providerInstanceId,
         recoveryCapable: runtime?.recoveryCapable === true,
       };
       const identity = connection;
@@ -477,28 +538,26 @@ describe('SandboxControl lifecycle boundaries', () => {
     const fields = vi.spyOn(logger, 'withFields').mockReturnValue(logger);
     try {
       await h.create();
-      const physical = await h.control.getPhysicalRecord();
+      const physical = await h.control.getAllocationRecord();
       expect(fields).toHaveBeenCalledWith(
         expect.objectContaining({
           diagnosticEvent: 'allocation_launch',
           sandboxId: SANDBOX_ID,
-          physicalSandboxId: physical.createIntent?.allocationName,
+          physicalSandboxId: canonicalAllocationName(physical),
         })
       );
       expect(fields).toHaveBeenCalledWith(
         expect.objectContaining({
           diagnosticEvent: 'physical_committed',
           sandboxId: SANDBOX_ID,
-          physicalSandboxId: physical.createIntent?.allocationName,
+          physicalSandboxId: canonicalAllocationName(physical),
         })
       );
       await h.control.beginStop('idle');
       await h.control.confirmStopped();
       await h.create();
-      const replacement = await h.control.getPhysicalRecord();
-      expect(replacement.createIntent?.allocationName).not.toBe(
-        physical.createIntent?.allocationName
-      );
+      const replacement = await h.control.getAllocationRecord();
+      expect(canonicalAllocationName(replacement)).not.toBe(canonicalAllocationName(physical));
     } finally {
       fields.mockRestore();
     }
@@ -741,9 +800,9 @@ describe('SandboxControl lifecycle boundaries', () => {
       readyConnectionId: identity.connectionId,
     });
     h.records.set('session_routes', [first, sibling]);
-    h.records.set('deadlines', {
-      idleStop: now + DEADLINE_MS.idleStop,
-      heartbeatExpiry: now + DEADLINE_MS.heartbeatExpiry,
+    h.records.set('control_alarm_anchors', {
+      credentialExpiryAt: now + DEADLINE_MS.heartbeatExpiry,
+      socketHandshakeAt: null,
     });
     const before = structuredClone([...h.records]);
     const alarm = h.alarmAt;
@@ -787,12 +846,12 @@ describe('SandboxControl lifecycle boundaries', () => {
             deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS,
           });
         }
-        const physical = await h.control.getPhysicalRecord();
-        const native = decodeCloudflareProviderRef(physical.providerRef);
+        const physical = await h.control.getAllocationRecord();
+        const native = decodeCloudflareProviderRef(canonicalProviderRef(physical));
         if (!native) throw new Error('Missing native allocation');
         const contained = containmentEnabled !== false;
         expect(native.containment).toBe(contained);
-        expect(physical.createIntent?.containment).toEqual({
+        expect(canonicalContainment(physical)).toEqual({
           kilocode: contained,
           github: contained,
           worktreeScoped: true,
@@ -801,7 +860,7 @@ describe('SandboxControl lifecycle boundaries', () => {
           contained ? h.namespaces.SandboxSmallContainment : h.namespaces.SandboxSmall,
           native.sandboxId
         );
-        const runtime = h.runtime(physical.providerRef ?? '');
+        const runtime = h.runtime(canonicalProviderRef(physical) ?? '');
         if (!runtime) throw new Error('Missing runtime');
         expect(runtime.startProcess).toHaveBeenCalledOnce();
         expect(runtime.configureBilling).toHaveBeenCalledWith({
@@ -810,7 +869,9 @@ describe('SandboxControl lifecycle boundaries', () => {
         });
         if (contained) expect(runtime.setOutboundHandler).toHaveBeenCalled();
         else expect(runtime.setOutboundHandler).not.toHaveBeenCalled();
-        await expect(h.hooks.validateHandshake?.(physical.providerRef ?? '')).resolves.toBe(true);
+        await expect(
+          h.hooks.validateHandshake?.(canonicalProviderRef(physical) ?? '')
+        ).resolves.toBe(true);
         const identity = await h.ready();
         const payload = await h.control.prepareSessionCredentials({
           ownerId: OWNER,
@@ -876,8 +937,8 @@ describe('SandboxControl lifecycle boundaries', () => {
         if (state === 'creating') await billingEntered.promise;
         else await acquiring;
         const identity = state === 'running' ? await h.ready() : undefined;
-        const physical = await h.control.getPhysicalRecord();
-        expect(physical.state).toBe(state);
+        const physical = await h.control.getAllocationRecord();
+        expect(physical.state.kind).toBe(state === 'running' ? 'allocated' : 'creating');
         const runtime = [...h.allocations.values()][0];
         if (!runtime) throw new Error('Missing runtime');
         const originalMetadata = await h.session.getCredentialMetadata();
@@ -914,7 +975,7 @@ describe('SandboxControl lifecycle boundaries', () => {
         const receipts = structuredClone(h.records.get('acquisition_receipts'));
         const grants = await loadSessionCredentialGrants(h.storage);
         const routes = await h.control.listRoutes();
-        const deadlines = await loadDeadlines(h.storage);
+        const schedule = await readSchedule(h.storage);
         const alarmAt = h.alarmAt;
         await expect(
           h.control.ensureReady({
@@ -926,11 +987,11 @@ describe('SandboxControl lifecycle boundaries', () => {
           })
         ).rejects.toThrow('Sandbox containment mode conflicts with the session');
         await h.flush();
-        expect(await h.control.getPhysicalRecord()).toEqual(physical);
+        expect(await h.control.getAllocationRecord()).toEqual(physical);
         expect(h.records.get('acquisition_receipts')).toEqual(receipts);
         expect(await loadSessionCredentialGrants(h.storage)).toEqual(grants);
         expect(await h.control.listRoutes()).toEqual(routes);
-        expect(await loadDeadlines(h.storage)).toEqual(deadlines);
+        expect(await readSchedule(h.storage)).toEqual(schedule);
         expect(h.alarmAt).toBe(alarmAt);
         expect(runtime.destroy).not.toHaveBeenCalled();
         expect(runtime.state.running).toBe(state === 'running');
@@ -940,7 +1001,7 @@ describe('SandboxControl lifecycle boundaries', () => {
         expect(h.allocations.size).toBe(1);
         expect(mocks.providerCreate).toHaveBeenCalledOnce();
         await h.evict();
-        expect(await h.control.getPhysicalRecord()).toEqual(physical);
+        expect(await h.control.getAllocationRecord()).toEqual(physical);
         expect(h.records.get('acquisition_receipts')).toEqual(receipts);
         releaseBilling.resolve();
         await acquiring;
@@ -1077,18 +1138,18 @@ describe('SandboxControl lifecycle boundaries', () => {
       },
     });
     await h.create();
-    const physical = await h.control.getPhysicalRecord();
+    const physical = await h.control.getAllocationRecord();
     expect(launchEnv).toBeDefined();
     if (!launchEnv) throw new Error('Wrapper was not launched');
     expect(
       validateControlLogUploadGrant(`Bearer ${launchEnv.CONTROL_LOG_UPLOAD_GRANT}`, secret)
     ).toMatchObject({
       sandboxId: SANDBOX_ID,
-      allocationId: physical.createIntent?.intentId,
+      allocationId: canonicalCreateIntentId(physical),
       wrapperInstanceId: launchEnv.CONTROL_WRAPPER_INSTANCE_ID,
     });
     expect(launchEnv.CONTROL_LOG_UPLOAD_URL).toBe(
-      `https://example.test/sandbox-logs/${SANDBOX_ID}/${physical.createIntent?.intentId}/${launchEnv.CONTROL_WRAPPER_INSTANCE_ID}`
+      `https://example.test/sandbox-logs/${SANDBOX_ID}/${canonicalCreateIntentId(physical)}/${launchEnv.CONTROL_WRAPPER_INSTANCE_ID}`
     );
     expect(Object.values(launchEnv)).not.toContain(secret);
   });
@@ -1137,10 +1198,13 @@ describe('SandboxControl lifecycle boundaries', () => {
     const h = await harness({
       configureAllocation: runtime => {
         runtime.startProcess.mockImplementation(async () => {
-          const physical = await h.control.getPhysicalRecord();
+          const physical = await h.control.getAllocationRecord();
           expect(h.transactionActive).toBe(false);
           expect(h.records.get('acquisition_receipts')).toEqual([
-            { ...acquisition, allocation: { kind: 'intent', id: physical.createIntent?.intentId } },
+            {
+              ...acquisition,
+              allocation: { kind: 'intent', id: canonicalCreateIntentId(physical) },
+            },
           ]);
           expect(h.alarmAt).not.toBeNull();
           runtime.state.running = true;
@@ -1149,14 +1213,21 @@ describe('SandboxControl lifecycle boundaries', () => {
       },
     });
     await Promise.all([h.acquire(acquisition), h.acquire(acquisition)]);
-    const physical = await h.control.getPhysicalRecord();
+    const physical = await h.control.getAllocationRecord();
     expect(mocks.providerCreate).toHaveBeenCalledOnce();
     expect(h.allocations.size).toBe(1);
-    const runtime = h.runtime(physical.providerRef ?? '');
+    const runtime = h.runtime(canonicalProviderRef(physical) ?? '');
     expect(runtime?.startProcess).toHaveBeenCalledOnce();
     await h.evict();
     await h.acquire(acquisition);
-    expect((await h.control.getPhysicalRecord()).createIntent).toEqual(physical.createIntent);
+    const afterEvict = await h.control.getAllocationRecord();
+    expect({
+      createIntent: canonicalCreateIntent(afterEvict),
+      target: canonicalTarget(afterEvict),
+    }).toEqual({
+      createIntent: canonicalCreateIntent(physical),
+      target: canonicalTarget(physical),
+    });
     expect(runtime?.startProcess).toHaveBeenCalledOnce();
     expect(mocks.providerCreate).toHaveBeenCalledOnce();
     expect(h.allocations.size).toBe(1);
@@ -1182,7 +1253,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     expect(mocks.providerCreate).toHaveBeenCalledOnce();
     // The expired acquisition aborts the atomic create+launch before the
     // wrapper starts, so the create is uncertain and observed later.
-    expect((await h.control.getPhysicalRecord()).state).toBe('failed');
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('unknown');
     for (const runtime of h.allocations.values()) {
       expect(runtime.startProcess).not.toHaveBeenCalled();
     }
@@ -1207,7 +1278,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     );
     await expect(h.acquire(acquisition)).rejects.toThrow('acquisition transaction failed');
     expect(h.records.has('acquisition_receipts')).toBe(false);
-    expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
     expect(h.alarmAt).toBeNull();
     expect(h.allocations.size).toBe(0);
     await h.acquire(acquisition);
@@ -1229,16 +1300,23 @@ describe('SandboxControl lifecycle boundaries', () => {
         return result;
       });
     await expect(h.acquire(acquisition)).rejects.toThrow('reset after acquisition commit');
-    const claimed = await h.control.getPhysicalRecord();
-    expect(claimed.state).toBe('creating');
+    const claimed = await h.control.getAllocationRecord();
+    expect(claimed.state.kind).toBe('creating');
     expect(h.records.get('acquisition_receipts')).toEqual([
-      { ...acquisition, allocation: { kind: 'intent', id: claimed.createIntent?.intentId } },
+      { ...acquisition, allocation: { kind: 'intent', id: canonicalCreateIntentId(claimed) } },
     ]);
     expect(h.allocations.size).toBe(0);
     await h.evict();
     await expect(h.acquire(acquisition)).resolves.toMatchObject({ physical: 'creating' });
     expect(h.allocations.size).toBe(0);
-    expect((await h.control.getPhysicalRecord()).createIntent).toEqual(claimed.createIntent);
+    const afterEvict = await h.control.getAllocationRecord();
+    expect({
+      createIntent: canonicalCreateIntent(afterEvict),
+      target: canonicalTarget(afterEvict),
+    }).toEqual({
+      createIntent: canonicalCreateIntent(claimed),
+      target: canonicalTarget(claimed),
+    });
     await h.fireAlarm();
     // The spent receipt must not create a second allocation. Past its create
     // deadline the record is `failed` and the acquisition drives the observe
@@ -1246,7 +1324,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     await expect(h.acquire(acquisition)).resolves.toMatchObject({ physical: 'failed' });
     expect(mocks.providerCreate).not.toHaveBeenCalled();
     expect(h.records.get('acquisition_receipts')).toEqual([
-      { ...acquisition, allocation: { kind: 'intent', id: claimed.createIntent?.intentId } },
+      { ...acquisition, allocation: { kind: 'intent', id: canonicalCreateIntentId(claimed) } },
     ]);
   });
 
@@ -1258,7 +1336,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.control.beginStop('execution_failed');
     await h.control.recordStopAttempt();
     await h.flush();
-    expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
     expect(h.runtime(original.providerInstanceId)?.state.running).toBe(false);
     await h.evict();
     const lostPromise = h.acquire(acquisition);
@@ -1272,7 +1350,9 @@ describe('SandboxControl lifecycle boundaries', () => {
     const replacement = await h.ready();
     expect(replacement.providerInstanceId).not.toBe(original.providerInstanceId);
     await expect(h.acquire(acquisition)).rejects.toThrow('no longer owns this allocation');
-    expect((await h.control.getPhysicalRecord()).providerRef).toBe(replacement.providerInstanceId);
+    expect(canonicalProviderRef(await h.control.getAllocationRecord())).toBe(
+      replacement.providerInstanceId
+    );
     expect(h.allocations.size).toBe(2);
     expect(mocks.providerCreate).toHaveBeenCalledTimes(2);
     expect(h.runtime(replacement.providerInstanceId)?.startProcess).toHaveBeenCalledOnce();
@@ -1308,7 +1388,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       await h.create();
       const original = await h.ready({ wrapperVersion: null, recoveryCapable: true });
       await h.flush();
-      expect((await h.control.getPhysicalRecord()).state).toBe('running');
+      expect((await h.control.getAllocationRecord()).state.kind).toBe('allocated');
       expect(await h.control.getStatus()).toMatchObject({ connection: 'ready' });
       await h.hooks.onSocketClosed?.(true, original);
       h.disconnect();
@@ -1342,22 +1422,23 @@ describe('SandboxControl lifecycle boundaries', () => {
       });
       const creating = h.create();
       await entered.promise;
-      const physical = await h.control.getPhysicalRecord();
-      expect(physical.state).toBe('running');
-      if (!physical.providerRef) throw new Error('Missing provider reference');
-      const runtime = h.runtime(physical.providerRef);
+      const physical = await h.control.getAllocationRecord();
+      expect(physical.state.kind).toBe('allocated');
+      const providerRef = canonicalProviderRef(physical);
+      if (!providerRef) throw new Error('Missing provider reference');
+      const runtime = h.runtime(providerRef);
       if (!runtime) throw new Error('Missing runtime');
       expect(runtime.state.running).toBe(false);
 
       const acquisition = { id: 'attempt_a', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
       await expect(h.acquire(acquisition)).resolves.toMatchObject({ physical: 'running' });
-      expect((await h.control.getPhysicalRecord()).stopTombstone).toBeNull();
+      expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
       expect(runtime.destroy).not.toHaveBeenCalled();
       expect(mocks.providerCreate).toHaveBeenCalledOnce();
 
       release.resolve();
       await creating;
-      expect((await h.control.getPhysicalRecord()).state).toBe('running');
+      expect((await h.control.getAllocationRecord()).state.kind).toBe('allocated');
       expect(runtime.startProcess).toHaveBeenCalledOnce();
       expect(mocks.providerCreate).toHaveBeenCalledOnce();
     });
@@ -1378,12 +1459,12 @@ describe('SandboxControl lifecycle boundaries', () => {
       await h.control.beginStop('execution_failed');
       await h.control.recordStopAttempt();
       await h.flush();
-      expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+      expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
 
       await h.acquire({ ...acquisition, id: 'attempt_b' });
       const replacement = await h.ready();
       expect(replacement.providerInstanceId).not.toBe(original.providerInstanceId);
-      const before = await h.control.getPhysicalRecord();
+      const before = await h.control.getAllocationRecord();
 
       probe.resolve(false);
       const outcome = await losing.then(
@@ -1396,11 +1477,11 @@ describe('SandboxControl lifecycle boundaries', () => {
         expect(outcome.value.physical).not.toBe('failed');
       }
 
-      const after = await h.control.getPhysicalRecord();
-      expect(after.state).toBe('running');
-      expect(after.providerRef).toBe(replacement.providerInstanceId);
-      expect(after.providerRef).toBe(before.providerRef);
-      expect(after.stopTombstone).toBeNull();
+      const after = await h.control.getAllocationRecord();
+      expect(after.state.kind).toBe('allocated');
+      expect(canonicalProviderRef(after)).toBe(replacement.providerInstanceId);
+      expect(canonicalProviderRef(after)).toBe(canonicalProviderRef(before));
+      expect(canonicalStopIntent(after)).toBeNull();
       expect(h.runtime(replacement.providerInstanceId)?.destroy).not.toHaveBeenCalled();
       expect(mocks.providerCreate).toHaveBeenCalledTimes(2);
     });
@@ -1436,7 +1517,7 @@ describe('SandboxControl lifecycle boundaries', () => {
           row => row.kind === 'physical' && row.from === 'running' && row.to === 'stopped'
         )
       ).toHaveLength(1);
-      expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+      expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
       expect(runtime.destroy).not.toHaveBeenCalled();
 
       // The overlapping second probe observes the same (now settled) record and
@@ -1469,14 +1550,14 @@ describe('SandboxControl lifecycle boundaries', () => {
       const acquisition = { id: 'attempt_a', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
       await expect(h.acquire(acquisition)).resolves.toMatchObject({ physical: 'running' });
       expect(runtime.isContainerRunning.mock.calls.length).toBe(probesBefore);
-      expect((await h.control.getPhysicalRecord()).stopTombstone).toBeNull();
+      expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
     });
 
     it('does not tombstone an established runtime that is still running', async () => {
       const { h, runtime } = await establishedRuntime();
       const acquisition = { id: 'attempt_a', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
       await expect(h.acquire(acquisition)).resolves.toMatchObject({ physical: 'running' });
-      expect((await h.control.getPhysicalRecord()).stopTombstone).toBeNull();
+      expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
       expect(runtime.destroy).not.toHaveBeenCalled();
       expect(mocks.providerCreate).toHaveBeenCalledOnce();
       expect(h.allocations.size).toBe(1);
@@ -1487,7 +1568,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       runtime.isContainerRunning.mockRejectedValue(new Error('probe failed'));
       const acquisition = { id: 'attempt_a', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
       await expect(h.acquire(acquisition)).resolves.toMatchObject({ physical: 'running' });
-      expect((await h.control.getPhysicalRecord()).stopTombstone).toBeNull();
+      expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
       expect(runtime.destroy).not.toHaveBeenCalled();
       expect(mocks.providerCreate).toHaveBeenCalledOnce();
     });
@@ -1505,7 +1586,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       await entered.promise;
       await vi.advanceTimersByTimeAsync(DEADLINE_MS.stopAttempt + 1);
       await expect(acquiring).resolves.toMatchObject({ physical: 'running' });
-      expect((await h.control.getPhysicalRecord()).stopTombstone).toBeNull();
+      expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
       expect(runtime.destroy).not.toHaveBeenCalled();
       expect(mocks.providerCreate).toHaveBeenCalledOnce();
     });
@@ -1526,11 +1607,11 @@ describe('SandboxControl lifecycle boundaries', () => {
         expect(['stopping', 'failed']).toContain(first.value.physical);
       }
 
-      if ((await h.control.getPhysicalRecord()).state !== 'stopped') {
+      if ((await h.control.getAllocationRecord()).state.kind !== 'stopped') {
         await h.control.recordStopAttempt();
         await h.flush();
       }
-      expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+      expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
       expect(h.runtime(original.providerInstanceId)?.state.running).toBe(false);
 
       await h.acquire({ ...acquisition, id: 'attempt_b' });
@@ -1572,9 +1653,9 @@ describe('SandboxControl lifecycle boundaries', () => {
     });
     const acquiring = h.acquire(acquisition);
     await entered.promise;
-    const physical = await h.control.getPhysicalRecord();
+    const physical = await h.control.getAllocationRecord();
     expect(h.records.get('acquisition_receipts')).toEqual([
-      { ...acquisition, allocation: { kind: 'intent', id: physical.createIntent?.intentId } },
+      { ...acquisition, allocation: { kind: 'intent', id: canonicalCreateIntentId(physical) } },
     ]);
     await h.control.beginStop('execution_failed');
     await h.control.recordStopAttempt();
@@ -1588,7 +1669,9 @@ describe('SandboxControl lifecycle boundaries', () => {
     expect(changed).toMatchObject({ message: 'Sandbox runtime changed during billing admission' });
     await h.evict();
     await expect(h.acquire(acquisition)).rejects.toThrow('no longer owns this allocation');
-    expect((await h.control.getPhysicalRecord()).providerRef).toBe(replacement.providerInstanceId);
+    expect(canonicalProviderRef(await h.control.getAllocationRecord())).toBe(
+      replacement.providerInstanceId
+    );
     expect(h.allocations.size).toBe(2);
   });
 
@@ -1610,19 +1693,14 @@ describe('SandboxControl lifecycle boundaries', () => {
     };
     const acquiring = h.acquire(acquisition);
     await entered.promise;
-    const physical = await h.control.getPhysicalRecord();
+    const physical = await h.control.getAllocationRecord();
     // Synthetic defensive fixture: no production transition was established to produce this record.
     await storeAllocation(
       h.storage,
       allocationFixture({
         state: 'unknown',
-        providerRef: physical.providerRef,
-        createIntent: physical.createIntent
-          ? {
-              intentId: physical.createIntent.intentId,
-              createdAt: physical.createIntent.createdAt,
-            }
-          : null,
+        providerRef: canonicalProviderRef(physical),
+        createIntent: canonicalCreateIntent(physical),
         stopTombstone: null,
         resumable: physical.resumable,
       })!
@@ -1683,12 +1761,10 @@ describe('SandboxControl lifecycle boundaries', () => {
     const h = await harness();
     vi.spyOn(h.storage, 'setAlarm').mockRejectedValueOnce(new Error('alarm write failed'));
     await expect(h.create()).rejects.toThrow('alarm write failed');
-    await expect(h.control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopped',
-      createIntent: null,
-      providerRef: null,
+    await expect(h.control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopped', summary: null },
     });
-    expect(await loadDeadlines(h.storage)).toEqual({});
+    expect(await loadControlAlarmAnchors(h.storage)).toEqual(emptyControlAlarmAnchors());
     expect(h.alarmAt).toBeNull();
     expect(h.allocations.size).toBe(0);
     await h.create();
@@ -1721,7 +1797,7 @@ describe('SandboxControl lifecycle boundaries', () => {
         await expect(
           h.control.request(requestFor(replacement.wrapperInstanceId))
         ).resolves.toMatchObject({ ok: true });
-        const deadlines = await loadDeadlines(h.storage);
+        const schedule = await readSchedule(h.storage);
         const alarmAt = h.alarmAt;
         vi.setSystemTime(Date.now() + 1_000);
         const rejected = expect(delayed).rejects.toThrow('wrapper runtime changed');
@@ -1730,9 +1806,9 @@ describe('SandboxControl lifecycle boundaries', () => {
         expect(h.sendRequest).toHaveBeenCalledExactlyOnceWith(
           requestFor(replacement.wrapperInstanceId)
         );
-        expect(await loadDeadlines(h.storage)).toEqual(deadlines);
+        expect(await readSchedule(h.storage)).toEqual(schedule);
         expect(h.alarmAt).toBe(alarmAt);
-        expect((await h.control.getPhysicalRecord()).providerRef).toBe(
+        expect(canonicalProviderRef(await h.control.getAllocationRecord())).toBe(
           replacement.providerInstanceId
         );
         expect(mocks.providerCreate).toHaveBeenCalledTimes(2);
@@ -1745,12 +1821,12 @@ describe('SandboxControl lifecycle boundaries', () => {
           const h = await harness();
           await h.create();
           await h.ready();
-          const deadlines = await loadDeadlines(h.storage);
+          const schedule = await readSchedule(h.storage);
           const alarmAt = h.alarmAt;
           vi.setSystemTime(Date.now() + 1_000);
           await expect(h.control.request(requestFor(value as string))).rejects.toThrow();
           expect(h.sendRequest).not.toHaveBeenCalled();
-          expect(await loadDeadlines(h.storage)).toEqual(deadlines);
+          expect(await readSchedule(h.storage)).toEqual(schedule);
           expect(h.alarmAt).toBe(alarmAt);
         }
       );
@@ -1761,7 +1837,7 @@ describe('SandboxControl lifecycle boundaries', () => {
           const h = await harness();
           await h.create();
           const identity = await h.ready();
-          const deadlines = await loadDeadlines(h.storage);
+          const schedule = await readSchedule(h.storage);
           const alarmAt = h.alarmAt;
           const entered = deferred<void>();
           const release = deferred<void>();
@@ -1816,13 +1892,13 @@ describe('SandboxControl lifecycle boundaries', () => {
               connectionId: crypto.randomUUID(),
             });
           }
-          const expectedDeadlines = stage === 'commit' ? await loadDeadlines(h.storage) : deadlines;
+          const expectedSchedule = stage === 'commit' ? await readSchedule(h.storage) : schedule;
           const expectedAlarm = stage === 'commit' ? h.alarmAt : alarmAt;
           const rejected = expect(pending).rejects.toThrow('wrapper runtime changed');
           release.resolve();
           await rejected;
           expect(h.sendRequest).not.toHaveBeenCalled();
-          expect(await loadDeadlines(h.storage)).toEqual(expectedDeadlines);
+          expect(await readSchedule(h.storage)).toEqual(expectedSchedule);
           expect(h.alarmAt).toBe(expectedAlarm);
         }
       );
@@ -1898,11 +1974,11 @@ describe('SandboxControl lifecycle boundaries', () => {
     const first = await h.ready({ wrapperVersion: null, recoveryCapable: true });
     await h.flush();
     expect((await h.control.getStatus()).connection).toBe('ready');
-    const physical = await h.control.getPhysicalRecord();
-    expect(physical.createIntent).not.toBeNull();
+    const physical = await h.control.getAllocationRecord();
+    expect(canonicalCreateIntent(physical)).not.toBeNull();
     expect(await h.control.getRuntimeCredentialProxyFence(input)).toEqual({
       plane: 'control',
-      allocationId: physical.createIntent?.intentId,
+      allocationId: canonicalCreateIntentId(physical),
       providerInstanceId: first.providerInstanceId,
       connectionId: first.connectionId,
       wrapperInstanceId: first.wrapperInstanceId,
@@ -1914,7 +1990,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.hooks.onSocketClosed?.(true, first);
     expect(await h.control.getRuntimeCredentialProxyFence(input)).toEqual({
       plane: 'control',
-      allocationId: physical.createIntent?.intentId,
+      allocationId: canonicalCreateIntentId(physical),
       providerInstanceId: first.providerInstanceId,
       connectionId: first.connectionId,
       wrapperInstanceId: first.wrapperInstanceId,
@@ -1925,7 +2001,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.hooks.onHandshakeComplete?.(reconnected);
     expect(await h.control.getRuntimeCredentialProxyFence(input)).toEqual({
       plane: 'control',
-      allocationId: physical.createIntent?.intentId,
+      allocationId: canonicalCreateIntentId(physical),
       providerInstanceId: reconnected.providerInstanceId,
       connectionId: reconnected.connectionId,
       wrapperInstanceId: reconnected.wrapperInstanceId,
@@ -2088,7 +2164,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       }
       expect(h.runtime(identity.providerInstanceId)?.state.running).toBe(false);
       expect(h.runtime(identity.providerInstanceId)?.destroy).toHaveBeenCalledOnce();
-      expect(await h.control.getPhysicalRecord()).toMatchObject({ state: 'stopped' });
+      expect(await h.control.getAllocationRecord()).toMatchObject({ state: { kind: 'stopped' } });
     }
   );
 
@@ -2096,7 +2172,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     const h = await harness();
     await h.create();
     await h.ready();
-    const deadlines = await loadDeadlines(h.storage);
+    const schedule = await readSchedule(h.storage);
     vi.setSystemTime(Date.now() + 1_000);
     await h.control.getStatus();
     await h.control.request({ operation: 'sandbox.status', payload: {} });
@@ -2122,7 +2198,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       },
     ]) {
       await expect(h.control.request(request)).rejects.toThrow();
-      expect(await loadDeadlines(h.storage)).toEqual(deadlines);
+      expect(await readSchedule(h.storage)).toEqual(schedule);
     }
     expect(h.sendRequest).toHaveBeenCalledTimes(2);
   });
@@ -2131,14 +2207,14 @@ describe('SandboxControl lifecycle boundaries', () => {
     const h = await harness();
     await h.create();
     await h.ready();
-    const deadlines = await loadDeadlines(h.storage);
+    const schedule = await readSchedule(h.storage);
     const alarmAt = h.alarmAt;
     vi.setSystemTime(Date.now() + 1_000);
     vi.spyOn(h.storage, 'setAlarm').mockRejectedValueOnce(new Error('alarm write failed'));
     await expect(
       h.control.request({ operation: 'session.prompt', session: ROUTE, payload: PROMPT })
     ).rejects.toThrow('alarm write failed');
-    expect(await loadDeadlines(h.storage)).toEqual(deadlines);
+    expect(await readSchedule(h.storage)).toEqual(schedule);
     expect(h.alarmAt).toBe(alarmAt);
     expect(h.sendRequest).not.toHaveBeenCalled();
   });
@@ -2156,12 +2232,12 @@ describe('SandboxControl lifecycle boundaries', () => {
     });
     // The canonical allocation deadline arms the alarm; the live path no longer
     // writes the legacy deadline table.
-    expect(await loadDeadlines(h.storage)).toEqual({});
+    expect(await loadControlAlarmAnchors(h.storage)).toEqual(emptyControlAlarmAnchors());
     expect(h.alarmAt).not.toBeNull();
     await h.evict();
     await h.fireAlarm();
     expect(h.runtime(identity.providerInstanceId)?.state.running).toBe(false);
-    expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
     await h.create();
     const replacement = await h.ready();
     await h.hooks.onHeartbeat?.(
@@ -2174,8 +2250,8 @@ describe('SandboxControl lifecycle boundaries', () => {
   it('keeps credential seeding of an unallocated sandbox idle', async () => {
     const h = await harness();
     await h.control.setWrapperCredentialHash('a'.repeat(64));
-    expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
-    expect(await loadDeadlines(h.storage)).toEqual({});
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
+    expect(await loadControlAlarmAnchors(h.storage)).toEqual(emptyControlAlarmAnchors());
     expect(h.alarmAt).toBeNull();
     expect(h.allocations.size).toBe(0);
   });
@@ -2188,7 +2264,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     if (!runtime) throw new Error('Missing runtime');
     runtime.destroy.mockImplementation(async () => {
       expect(h.transactionActive).toBe(false);
-      expect((await h.control.getPhysicalRecord()).stopTombstone?.attempts).toBe(1);
+      expect(canonicalStopAttempts(await h.control.getAllocationRecord())).toBe(1);
       expect(h.alarmAt).toBeGreaterThan(Date.now());
       runtime.state.running = false;
     });
@@ -2208,7 +2284,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       configureAllocation: runtime => {
         runtime.startProcess.mockImplementation(async () => {
           observed.push({
-            providerRef: (await h.control.getPhysicalRecord()).providerRef,
+            providerRef: canonicalProviderRef(await h.control.getAllocationRecord()),
             alarmAt: h.alarmAt,
           });
           runtime.state.running = true;
@@ -2217,21 +2293,21 @@ describe('SandboxControl lifecycle boundaries', () => {
       },
     });
     await h.create();
-    const physical = await h.control.getPhysicalRecord();
+    const physical = await h.control.getAllocationRecord();
     // The create is confirmed before the wrapper launches, so the launch sees
     // the committed reference; the launch still runs under the armed startup
     // deadline and the record keeps the create intent identity.
     expect(observed).toEqual([{ providerRef: expect.any(String), alarmAt: expect.any(Number) }]);
-    expect(physical.createIntent).not.toBeNull();
-    const native = decodeCloudflareProviderRef(physical.providerRef);
+    expect(canonicalCreateIntent(physical)).not.toBeNull();
+    const native = decodeCloudflareProviderRef(canonicalProviderRef(physical));
     expect(native?.sandboxId).toMatch(/^ses-[a-f0-9]{48}$/);
     expect(native?.sandboxId).not.toBe(SANDBOX_ID);
     expect(native).toEqual({
-      sandboxId: physical.createIntent?.allocationName,
+      sandboxId: canonicalAllocationName(physical),
       containment: true,
-      instanceId: physical.createIntent?.intentId,
+      instanceId: canonicalCreateIntentId(physical),
     });
-    const runtime = h.runtime(physical.providerRef ?? '');
+    const runtime = h.runtime(canonicalProviderRef(physical) ?? '');
     expect(runtime?.configureBilling).toHaveBeenCalledWith({
       ...BILLING,
       sandboxId: native?.sandboxId,
@@ -2240,7 +2316,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       expect.any(String),
       expect.objectContaining({
         env: expect.objectContaining({
-          PROVIDER_INSTANCE_ID: physical.providerRef,
+          PROVIDER_INSTANCE_ID: canonicalProviderRef(physical),
           SANDBOX_CONTROL_URL: `wss://example.test/sandbox-control/${SANDBOX_ID}`,
         }),
       })
@@ -2412,7 +2488,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       })
     ).rejects.toThrow();
     expect(h.records.has('provider_configuration')).toBe(false);
-    expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
     expect(mocks.getSandbox).not.toHaveBeenCalled();
   });
 
@@ -2426,9 +2502,8 @@ describe('SandboxControl lifecycle boundaries', () => {
         allowCreate: true,
       })
     ).rejects.toThrow('configuration is unavailable');
-    await expect(h.control.getPhysicalRecord()).resolves.toMatchObject({
-      state: 'stopped',
-      createIntent: null,
+    await expect(h.control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopped', summary: null },
     });
     await expect(
       h.control.ensureReady({
@@ -2499,12 +2574,12 @@ describe('SandboxControl lifecycle boundaries', () => {
     );
     await h.create();
     await h.control.attachSession(ROUTE);
-    const first = await h.control.getPhysicalRecord();
+    const first = await h.control.getAllocationRecord();
     await h.control.markFailed();
     vi.setSystemTime(Date.now() + DEADLINE_MS.createSettle);
     await h.control.recordStopAttempt();
-    expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
-    expect(h.runtime(first.providerRef ?? '')?.state.running).toBe(false);
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
+    expect(h.runtime(canonicalProviderRef(first) ?? '')?.state.running).toBe(false);
     await h.create();
     const replacement = await h.ready();
     const currentWrapperInstanceId = replacement.wrapperInstanceId;
@@ -2647,13 +2722,14 @@ describe('SandboxControl lifecycle boundaries', () => {
       await allocated.promise;
       await vi.advanceTimersByTimeAsync(DEADLINE_MS.startup);
       await expect(creating).resolves.toMatchObject({ physical: 'failed' });
-      const uncertain = await h.control.getPhysicalRecord();
-      expect(uncertain.providerRef).toBeNull();
-      expect(uncertain.createIntent).toMatchObject({
-        allocationName: [...remote.keys()][0],
-        vercel: { runtimeBuildId: 'build_1', snapshotId: 'snapshot_1' },
+      const uncertain = await h.control.getAllocationRecord();
+      expect(canonicalProviderRef(uncertain)).toBeNull();
+      expect(canonicalAllocationName(uncertain)).toBe([...remote.keys()][0]);
+      expect(canonicalVercel(uncertain)).toMatchObject({
+        runtimeBuildId: 'build_1',
+        snapshotId: 'snapshot_1',
       });
-      expect(uncertain.createIntent?.vercel?.resources).toEqual(resources);
+      expect(canonicalVercel(uncertain)?.resources).toEqual(resources);
       expect(h.records.get('provider_configuration')).toEqual({
         provider: 'vercel',
         ...(resources ? { resources } : {}),
@@ -2665,17 +2741,15 @@ describe('SandboxControl lifecycle boundaries', () => {
       await h.fireAlarm();
       expect(inspected).toHaveLength(1);
       expect(inspected[0]?.searchParams.get('resume')).toBe('false');
-      expect((await h.control.getPhysicalRecord()).state).toBe('stopped');
+      expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
       expect([...remote.values()][0]?.session.status).toBe('stopped');
       await h.evict();
       await h.create();
-      expect((await h.control.getPhysicalRecord()).createIntent?.vercel?.resources).toEqual(
-        resources
-      );
+      expect(canonicalVercel(await h.control.getAllocationRecord())?.resources).toEqual(resources);
       await h.ready();
       expect(remote.size).toBe(2);
       expect([...remote.values()][1]?.session.sourceSnapshotId).toBe('snapshot_2');
-      expect((await h.control.getPhysicalRecord()).createIntent?.vercel?.runtimeBuildId).toBe(
+      expect(canonicalVercel(await h.control.getAllocationRecord())?.runtimeBuildId).toBe(
         'build_2'
       );
       expect(mocks.getSandbox).not.toHaveBeenCalled();
@@ -2685,7 +2759,7 @@ describe('SandboxControl lifecycle boundaries', () => {
           h.control.prepareSessionCredentials({ ownerId: OWNER, sessionId: ROUTE.sessionId })
         ).resolves.toMatchObject({ kilo: { token: 'test-token' } });
         await h.control.detachSession(ROUTE.sessionId);
-        expect(await loadDeadlines(h.storage)).not.toHaveProperty('credentialExpiry');
+        expect((await loadControlAlarmAnchors(h.storage)).credentialExpiryAt).toBeNull();
         expect(policyUpdates).toEqual([]);
         expect(h.issueKiloSessionCapability).not.toHaveBeenCalled();
       }
@@ -3447,7 +3521,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     await h.control.detachSession(ROUTE.sessionId);
     forwarding.reject(new Error('Session transport failed'));
     await h.flush();
-    expect((await h.control.getPhysicalRecord()).stopTombstone).toBeNull();
+    expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
     expect(h.runtime(connection.providerInstanceId)?.state.running).toBe(true);
     expect(h.session.failWaitingMessages).not.toHaveBeenCalled();
   });
@@ -3470,7 +3544,7 @@ describe('SandboxControl lifecycle boundaries', () => {
     const replacement = await h.ready();
     forwarding.reject(new Error('Session transport failed'));
     await h.flush();
-    expect((await h.control.getPhysicalRecord()).stopTombstone).toBeNull();
+    expect(canonicalStopIntent(await h.control.getAllocationRecord())).toBeNull();
     await expect(h.control.getStatus()).resolves.toMatchObject({
       reported: 'ready',
       wrapperInstanceId: replacement.wrapperInstanceId,
@@ -3517,8 +3591,8 @@ describe('SandboxControl lifecycle boundaries', () => {
       },
       connection
     );
-    expect((await h.control.getPhysicalRecord()).state).toBe('running');
-    expect(await loadDeadlines(h.storage)).not.toHaveProperty('idleStop');
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('allocated');
+    expect(canonicalIdleAt(await loadCanonicalAllocation(h.storage))).toBeNull();
     expect(h.runtime(connection.providerInstanceId)?.destroy).not.toHaveBeenCalled();
     await h.fireAlarm();
     expect(h.runtime(connection.providerInstanceId)?.state.running).toBe(false);
@@ -3551,8 +3625,8 @@ describe('SandboxControl lifecycle boundaries', () => {
         },
         connection
       );
-      expect((await h.control.getPhysicalRecord()).state).toBe('running');
-      expect(await loadDeadlines(h.storage)).not.toHaveProperty('idleStop');
+      expect((await h.control.getAllocationRecord()).state.kind).toBe('allocated');
+      expect(canonicalIdleAt(await loadCanonicalAllocation(h.storage))).toBeNull();
       expect(h.runtime(connection.providerInstanceId)?.destroy).not.toHaveBeenCalled();
     }
   );
@@ -3591,7 +3665,7 @@ describe('SandboxControl lifecycle boundaries', () => {
       await h.flush();
     }
     expect(h.runtime(connection.providerInstanceId)?.destroy).toHaveBeenCalledOnce();
-    expect(await h.control.getPhysicalRecord()).toMatchObject({ state: 'stopped' });
+    expect(await h.control.getAllocationRecord()).toMatchObject({ state: { kind: 'stopped' } });
     expect(h.session.notifyStopped).toHaveBeenCalledWith(
       expect.objectContaining({ reason: 'idle' })
     );
@@ -3634,8 +3708,8 @@ describe('SandboxControl lifecycle boundaries', () => {
       { state: 'active', pendingMessages: 1, kilo: { ready: true }, sessions: [] },
       connection
     );
-    expect((await h.control.getPhysicalRecord()).state).toBe('running');
-    expect(await loadDeadlines(h.storage)).not.toHaveProperty('idleStop');
+    expect((await h.control.getAllocationRecord()).state.kind).toBe('allocated');
+    expect(canonicalIdleAt(await loadCanonicalAllocation(h.storage))).toBeNull();
     expect(h.runtime(connection.providerInstanceId)?.destroy).not.toHaveBeenCalled();
   });
 
@@ -4102,7 +4176,7 @@ describe('SandboxControl worktree reference index', () => {
     const first = await loadSessionReferences(h.storage);
     expect(first.reconciled).toBe(false);
     expect(first.overflowed).toBe(false);
-    expect(await loadPhysicalRecord(h.storage)).toMatchObject({ state: 'stopped' });
+    expect((await loadCanonicalAllocation(h.storage)).state.kind).toBe('stopped');
 
     getRuntimeLocation.mockImplementation(async () => ({
       cloudAgentSessionId: CONTROL_SESSION_ID,
@@ -4115,7 +4189,7 @@ describe('SandboxControl worktree reference index', () => {
     await expect(h.control.deleteWorktreeResources(input)).resolves.toMatchObject({
       deleted: true,
     });
-    expect(await loadPhysicalRecord(h.storage)).toMatchObject({ providerRef: null });
+    expect(canonicalProviderRef(await loadCanonicalAllocation(h.storage))).toBeNull();
   });
 
   it('blocks instead of throwing when reconciliation cannot complete', async () => {

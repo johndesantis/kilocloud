@@ -54,7 +54,27 @@ import {
   createControlRequestWaiters,
   type ControlRequestWaiters,
 } from './waiters.js';
-import { summarizeHeartbeatIdle } from './status-projection.js';
+import { sha256Hex } from '../utils/sha256.js';
+
+export async function summarizeHeartbeatIdle(
+  payload: SandboxHeartbeatPayload
+): Promise<SandboxControlObservation['idle']> {
+  if (
+    !payload.kilo.ready ||
+    payload.state !== 'idle' ||
+    payload.pendingMessages !== 0 ||
+    (payload.activeKiloSessions !== undefined && payload.activeKiloSessions !== 0) ||
+    payload.sessions.some(session => session.state !== 'idle' || session.waitingOn !== undefined)
+  ) {
+    return null;
+  }
+  const sessionIds = payload.sessions.map(session => session.kiloSessionId);
+  if (new Set(sessionIds).size !== sessionIds.length) return null;
+  return {
+    sessionCount: sessionIds.length,
+    sessionIdsHash: await sha256Hex(JSON.stringify(sessionIds.sort())),
+  };
+}
 
 export type SandboxControlSocketState = DurableObjectState;
 

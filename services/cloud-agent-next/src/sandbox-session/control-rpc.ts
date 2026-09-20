@@ -10,7 +10,7 @@ import {
 import { DEFAULT_DO_RETRY_CONFIG, type DORetryScope } from '@kilocode/worker-utils';
 import type { SandboxControlOutboundRequest } from '../sandbox-control/socket.js';
 import type { AttachRouteInput } from '../sandbox-control/session-routes.js';
-import type { ConnectionState, PhysicalState } from '../sandbox-control/status-projection.js';
+import type { ConnectionState, PhysicalState } from '../shared/sandbox-status.js';
 import type {
   SandboxTerminalAccessInput,
   SandboxTerminalAccessResult,

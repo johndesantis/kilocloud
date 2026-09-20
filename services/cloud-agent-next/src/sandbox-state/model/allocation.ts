@@ -50,6 +50,14 @@ export const WORKTREE_CREDENTIAL_CONTAINMENT = {
   worktreeScoped: true,
 } satisfies CredentialContainmentRequirements;
 
+export function getWorktreeCredentialContainment(
+  enabled: boolean
+): CredentialContainmentRequirements {
+  return enabled
+    ? WORKTREE_CREDENTIAL_CONTAINMENT
+    : { kilocode: false, github: false, worktreeScoped: true };
+}
+
 export const allocationContainmentSchema = credentialContainmentSchema.extend({
   providerRef: z.string().min(1),
 });

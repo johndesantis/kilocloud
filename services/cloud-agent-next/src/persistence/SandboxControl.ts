@@ -90,14 +90,6 @@ import {
 } from '../shared/sandbox-control-protocol.js';
 import { DEADLINE_MS, leaseAtLeastMs } from '../sandbox-control/deadlines.js';
 import {
-  sameAllocation,
-  getWorktreeCredentialContainment,
-  sandboxProviderConfigurationSchema,
-  type SandboxProviderConfiguration,
-  type CreateIntent,
-  type PhysicalRecord,
-} from '../sandbox-control/physical-lifecycle.js';
-import {
   applyReportedSessionState,
   attachRoute,
   detachRoute,
@@ -110,26 +102,22 @@ import {
 } from '../sandbox-control/session-routes.js';
 import {
   projectReportedStatus,
-  type ConnectionState,
   type ReportedSandboxStatus,
   type WorkState,
 } from '../sandbox-control/status-projection.js';
-import { projectAllocationToFlat } from '../sandbox-control/allocation-view.js';
 import { projectStatusSnapshot } from '../sandbox-control/status-snapshot.js';
 import {
   type AllocationController,
   isLiveAllocation,
 } from '../sandbox-control/allocation-controller.js';
 import {
-  CONTROL_ALARM_ANCHORS_KEY,
   controlAlarmAnchorAt,
   dueControlAlarmAnchors,
-  emptyControlAlarmAnchors,
+  importLegacyControlAlarmAnchors,
   loadControlAlarmAnchors,
   scheduleControlAlarm,
   setControlAlarmAnchor,
   type ControlAlarmAnchorId,
-  type ControlAlarmAnchorState,
 } from '../sandbox-control/control-alarm.js';
 import {
   createHealthController,
@@ -152,6 +140,7 @@ import { createReconcilePort } from '../sandbox-state/ports/reconcile.js';
 import { loadAllocation as loadAllocationResult } from '../sandbox-state/persist/load.js';
 import {
   WORKTREE_CREDENTIAL_CONTAINMENT,
+  getWorktreeCredentialContainment,
   type AllocatedAllocation,
   type AllocationContainment,
   type AllocationRecord,
@@ -176,7 +165,6 @@ import {
 import {
   eraseSandboxRecord,
   loadAllocation,
-  loadDeadlines,
   initialRuntimeMetadata,
   loadRuntimeMetadata,
   saveRuntimeMetadata,
@@ -210,11 +198,13 @@ import {
   withControlDORetry as withDORetry,
   type ControlDiagnosticFields,
 } from '../sandbox-control/diagnostics.js';
-import type {
-  ProviderAdapter,
-  ProviderCreateIntent,
-  ProviderObservation,
-  StopResult,
+import {
+  sandboxProviderConfigurationSchema,
+  type ProviderAdapter,
+  type ProviderAllocationIntent,
+  type ProviderCreateIntent,
+  type ProviderObservation,
+  type SandboxProviderConfiguration,
 } from '../sandbox-control/provider.js';
 import { ControlRequestError } from '../sandbox-session/control-dispatch.js';
 import {
@@ -253,6 +243,8 @@ import {
 import type { AgentSandboxProvider } from '../types.js';
 import {
   safeSandboxRuntimeVersion,
+  type ConnectionState,
+  type PhysicalState,
   type SandboxRuntimeMetadata,
   type SandboxStatusSnapshot,
 } from '../shared/sandbox-status.js';
@@ -282,7 +274,7 @@ function assertAcquisitionDeadline(acquisition: SandboxAcquisition): void {
   if (Date.now() >= acquisition.deadlineAt) throw new Error('Sandbox acquisition expired');
 }
 
-/** Legacy `sameAllocation` identity, expressed over the canonical record. */
+/** Same canonical allocation: the create intent id, else the provider reference. */
 function sameCanonicalAllocation(left: AllocationRecord, right: AllocationRecord): boolean {
   const leftIntent = left.state.kind === 'stopped' ? undefined : left.state.createIntent?.intentId;
   const rightIntent =
@@ -307,6 +299,33 @@ function canonicalStopIntent(record: AllocationRecord) {
 
 function canonicalStopWrapperInstanceId(record: AllocationRecord): string | undefined {
   return canonicalStopIntent(record)?.wrapperInstanceId;
+}
+
+/** Stop cleanup attempts already spent, only when a canonical stop intent is attached. */
+function canonicalStopAttempts(record: AllocationRecord): number | undefined {
+  const state = record.state;
+  if (state.kind === 'stopping') return state.attempts;
+  return state.kind === 'unknown' && state.stopIntent !== null ? state.attempts : undefined;
+}
+/** The legacy flat allocation label for a canonical record (public status only). */
+function legacyPhysicalState(record: AllocationRecord): PhysicalState {
+  const state = record.state;
+  switch (state.kind) {
+    case 'stopped':
+      return 'stopped';
+    case 'creating':
+      return 'creating';
+    case 'allocated':
+      return 'running';
+    case 'stopping':
+      return 'stopping';
+    case 'unknown':
+      return state.reason === 'legacy_failed'
+        ? 'failed'
+        : state.reason === 'legacy_unknown' || state.stopIntent !== null
+          ? 'unknown'
+          : 'failed';
+  }
 }
 
 /**
@@ -416,7 +435,7 @@ function packSessionReport(sessions: SandboxHeartbeatPayload['sessions']): strin
 type TerminalRuntimeSnapshot = {
   allowed: true;
   connection: SandboxControlConnectionIdentity;
-  physical: PhysicalRecord;
+  physical: AllocationRecord;
   provider: AgentSandboxProvider;
   route: SessionRoute;
   grant: SessionCredentialGrant;
@@ -449,7 +468,7 @@ export type AttachSessionInput = AttachRouteInput;
 
 export type SandboxControlStatus = {
   reported: ReportedSandboxStatus;
-  physical: PhysicalRecord['state'];
+  physical: PhysicalState;
   connection: ConnectionState;
   work: WorkState;
   wrapperInstanceId?: string;
@@ -521,12 +540,8 @@ export class SandboxControl extends DurableObject<Env> {
    */
   private controlAcquisitionDeadline: number | null = null;
   private stopAttemptInFlight: {
-    physical: PhysicalRecord;
-    promise: Promise<PhysicalRecord>;
-  } | null = null;
-  private providerStopInFlight: {
-    physical: PhysicalRecord;
-    promise: Promise<StopResult>;
+    record: AllocationRecord;
+    promise: Promise<AllocationRecord>;
   } | null = null;
   private vercelLocator: VercelProviderLocator | undefined;
   private readonly deletingWorktrees = new Set<string>();
@@ -609,23 +624,22 @@ export class SandboxControl extends DurableObject<Env> {
   private ensureOperationalInitialized(): Promise<void> {
     return (this.operationalInitialization ??= this.ctx.blockConcurrencyWhile(async () => {
       const ctx = this.ctx;
-      const [readyAt, runtime, configuration, physical] = await Promise.all([
+      const [readyAt, runtime, configuration, record] = await Promise.all([
         ctx.storage.get<number>(WRAPPER_READY_AT_KEY),
         ctx.storage.get<PersistedWrapperRuntime>(ACTIVE_WRAPPER_RUNTIME_KEY),
         this.readProviderConfiguration(),
-        this.readFlatProjection(ctx.storage),
+        loadAllocation(ctx.storage),
       ]);
-      // One-time migration cleanup, separate from any live lifecycle decision:
-      // the pre-cutover infrastructure anchors move into the alarm owner and are
-      // never read from the legacy deadline table again.
-      await this.migrateLegacyInfrastructureAnchors();
+      // One-time pre-cutover import, owned by the alarm module and run before
+      // any anchor mutation at this boot boundary.
+      await importLegacyControlAlarmAnchors(ctx.storage, Date.now());
       this.vercelLocator = vercelProviderLocatorSchema
         .optional()
         .parse(await ctx.storage.get(PROVIDER_LOCATOR_KEY));
       this.providerKind = configuration?.provider ?? 'cloudflare';
       this.vercelResources =
         configuration?.provider === 'vercel' ? configuration.resources : undefined;
-      this.provider = this.createProviderAdapter(this.providerKind, physical);
+      this.provider = this.createProviderAdapter(this.providerKind, record);
       this.runtimeDeleted = (await ctx.storage.get(RUNTIME_DELETED_KEY)) === true;
       this.exclusiveDeletionWorktreeId = cloudAgentWorktreeIdSchema
         .optional()
@@ -636,8 +650,8 @@ export class SandboxControl extends DurableObject<Env> {
         );
       }
       if (
-        physical.stopTombstone ||
-        (physical.state !== 'running' && physical.state !== 'creating')
+        canonicalStopIntent(record) !== null ||
+        (record.state.kind !== 'allocated' && record.state.kind !== 'creating')
       ) {
         this.socketHandler.closeAll('Sandbox runtime unavailable');
         return;
@@ -659,32 +673,6 @@ export class SandboxControl extends DurableObject<Env> {
         this.kiloReady = !runtime && current !== null && readyAt !== undefined;
       }
     }));
-  }
-
-  /**
-   * One-time migration of the pre-cutover `socketHandshake`/`credentialExpiry`
-   * anchors into the alarm owner's own key. Only future anchors are carried, so
-   * a stale legacy record cannot change readiness or arm a spurious alarm.
-   */
-  private async migrateLegacyInfrastructureAnchors(): Promise<void> {
-    if ((await this.ctx.storage.get(CONTROL_ALARM_ANCHORS_KEY)) !== undefined) return;
-    const legacy = await loadDeadlines(this.ctx.storage);
-    const now = Date.now();
-    const anchors: ControlAlarmAnchorState = {
-      ...emptyControlAlarmAnchors(),
-      socketHandshakeAt:
-        legacy.socketHandshake !== undefined && legacy.socketHandshake > now
-          ? legacy.socketHandshake
-          : null,
-      credentialExpiryAt:
-        legacy.credentialExpiry !== undefined && legacy.credentialExpiry > now
-          ? legacy.credentialExpiry
-          : null,
-    };
-    // Persist even the empty state: the marker is the completion record, so a
-    // reconstructed object must never re-read the legacy table (which may have
-    // been repopulated after the first boot).
-    await this.ctx.storage.put(CONTROL_ALARM_ANCHORS_KEY, anchors);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -846,10 +834,10 @@ export class SandboxControl extends DurableObject<Env> {
     ) {
       return null;
     }
-    const [ownerId, routes, physical, grants] = await Promise.all([
+    const [ownerId, routes, record, grants] = await Promise.all([
       this.readOwner(),
       loadRouteTable(this.ctx.storage),
-      this.readFlatProjection(this.ctx.storage),
+      this.readCanonicalAllocation(),
       loadSessionCredentialGrants(this.ctx.storage),
     ]);
     if (ownerId !== input.ownerId) return null;
@@ -878,24 +866,23 @@ export class SandboxControl extends DurableObject<Env> {
       this.runtimeDeleted ||
       this.exclusiveDeletionWorktreeId ||
       (worktreeId && this.deletingWorktrees.has(worktreeId)) ||
-      physical.state !== 'running' ||
-      physical.stopTombstone !== null ||
-      physical.createIntent === null ||
-      physical.providerRef === null
+      record.state.kind !== 'allocated' ||
+      canonicalStopIntent(record) !== null ||
+      canonicalProviderRefOf(record) === null
     ) {
       return null;
     }
-    const runtime = this.establishedWrapperForAllocation(physical);
+    const runtime = this.establishedWrapperForAllocation(record);
     if (
       !runtime ||
       !runtime.wrapperInstanceId ||
-      runtime.providerInstanceId !== physical.providerRef
+      runtime.providerInstanceId !== canonicalProviderRefOf(record)
     ) {
       return null;
     }
     return {
       plane: 'control',
-      allocationId: physical.createIntent.intentId,
+      allocationId: record.state.createIntent.intentId,
       providerInstanceId: runtime.providerInstanceId,
       connectionId: runtime.connectionId,
       wrapperInstanceId: runtime.wrapperInstanceId,
@@ -1001,11 +988,11 @@ export class SandboxControl extends DurableObject<Env> {
       maintenanceAuthorization.data.wrapperInstanceId !== runtime.wrapperInstanceId
     )
       throw new Error('Sandbox wrapper runtime changed');
-    const physical = await this.readFlatProjection(this.ctx.storage);
+    const allocation = await this.readCanonicalAllocation();
     if (
-      (!maintenance && physical.state !== 'running') ||
-      (!maintenance && physical.stopTombstone !== null) ||
-      physical.providerRef !== runtime.providerInstanceId ||
+      (!maintenance && allocation.state.kind !== 'allocated') ||
+      (!maintenance && canonicalStopIntent(allocation) !== null) ||
+      canonicalProviderRefOf(allocation) !== runtime.providerInstanceId ||
       !isCurrent()
     ) {
       throw new ControlRequestError({
@@ -1031,14 +1018,14 @@ export class SandboxControl extends DurableObject<Env> {
       if (!identity.success) throw new Error('session identity is required');
       let pinned: { from: AllocationRecord; to: AllocationRecord } | undefined;
       await this.ctx.storage.transaction(async () => {
-        const current = await this.readFlatProjection(this.ctx.storage);
+        const current = await this.readCanonicalAllocation();
         const table = await loadRouteTable(this.ctx.storage);
         const route = table.get(identity.data.sessionId);
         if (
-          current.state !== 'running' ||
-          current.stopTombstone ||
-          current.providerRef !== runtime.providerInstanceId ||
-          !sameAllocation(physical, current) ||
+          current.state.kind !== 'allocated' ||
+          canonicalStopIntent(current) !== null ||
+          canonicalProviderRefOf(current) !== runtime.providerInstanceId ||
+          !sameCanonicalAllocation(allocation, current) ||
           !isCurrent()
         ) {
           throw new Error('Sandbox wrapper runtime changed');
@@ -1087,7 +1074,7 @@ export class SandboxControl extends DurableObject<Env> {
       if (pinned) await this.afterCanonicalCommit(pinned.from, pinned.to, 'demand');
     }
     if (!usesMaintenanceChannel) await this.assertRequestWorktreeAdmission(input);
-    if (recoveryInteraction) await this.assertRecoveryInteraction(input, runtime, physical);
+    if (recoveryInteraction) await this.assertRecoveryInteraction(input, runtime, allocation);
     if (!isCurrent()) throw new Error('Sandbox wrapper runtime changed');
     const outbound =
       input.operation === 'session.attach'
@@ -1105,13 +1092,13 @@ export class SandboxControl extends DurableObject<Env> {
   private async assertRecoveryInteraction(
     input: SandboxControlOutboundRequest,
     runtime: SandboxControlConnectionIdentity,
-    physical: PhysicalRecord
+    allocation: AllocationRecord
   ): Promise<void> {
     const session = sessionRequestIdentitySchema.parse(input.session);
     const payload = parseOperationPayload(input.operation, input.payload);
     if (!payload.ok) throw new Error(payload.error.message);
     await this.ctx.storage.transaction(async tx => {
-      const current = await this.readFlatProjection(tx);
+      const current = await this.readCanonicalAllocation();
       const route = (await loadRouteTable(tx)).get(session.sessionId);
       // The canonical/current-connection contract: the interaction is admitted
       // only for the active recovery-capable connection whose allocation,
@@ -1121,10 +1108,10 @@ export class SandboxControl extends DurableObject<Env> {
         this.runtimeDeleted ||
         !runtime.recoveryCapable ||
         !this.isCurrentConnection(runtime) ||
-        current.state !== 'running' ||
-        current.stopTombstone !== null ||
-        !sameAllocation(physical, current) ||
-        current.providerRef !== runtime.providerInstanceId ||
+        current.state.kind !== 'allocated' ||
+        canonicalStopIntent(current) !== null ||
+        !sameCanonicalAllocation(allocation, current) ||
+        canonicalProviderRefOf(current) !== runtime.providerInstanceId ||
         !route ||
         route.kiloSessionId !== session.kiloSessionId ||
         route.directory !== session.directory ||
@@ -1145,28 +1132,29 @@ export class SandboxControl extends DurableObject<Env> {
       session !== undefined &&
       route?.kiloSessionId === session.kiloSessionId &&
       route.directory === session.directory;
-    const physical = await this.readFlatProjection(this.ctx.storage);
+    const allocation = await this.readCanonicalAllocation();
     const routes = await loadRouteTable(this.ctx.storage);
     const route = session ? routes.get(session.sessionId) : undefined;
     const runtime = this.readyWrapperRuntime();
     const socket = this.socketHandler.getReadySocket();
+    const allocationStopping = canonicalStopIntent(allocation) !== null;
     this.assertWorktreeAdmission(route?.worktreeId);
     if (
-      physical.state !== 'running' ||
-      physical.stopTombstone ||
+      allocation.state.kind !== 'allocated' ||
+      allocationStopping ||
       !runtime ||
-      physical.providerRef !== runtime.providerInstanceId ||
+      canonicalProviderRefOf(allocation) !== runtime.providerInstanceId ||
       !matchesRoute(route) ||
       !socket
     ) {
       const guard =
-        physical.state !== 'running'
+        allocation.state.kind !== 'allocated'
           ? 'physical_not_running'
-          : physical.stopTombstone
+          : allocationStopping
             ? 'physical_stopping'
             : !runtime
               ? 'runtime_not_ready'
-              : physical.providerRef !== runtime.providerInstanceId
+              : canonicalProviderRefOf(allocation) !== runtime.providerInstanceId
                 ? 'provider_mismatch'
                 : !matchesRoute(route)
                   ? 'route_mismatch'
@@ -1191,17 +1179,17 @@ export class SandboxControl extends DurableObject<Env> {
     } catch {
       return errorResponse(crypto.randomUUID(), 'protocol_error', 'Worktree capture failed');
     }
-    const currentPhysical = await this.readFlatProjection(this.ctx.storage);
+    const currentAllocation = await this.readCanonicalAllocation();
     const currentRoutes = await loadRouteTable(this.ctx.storage);
     const currentRoute = session ? currentRoutes.get(session.sessionId) : undefined;
     await this.assertRequestWorktreeAdmission(input);
     this.assertWorktreeAdmission(currentRoute?.worktreeId);
     const currentRuntime = this.readyWrapperRuntime();
     if (
-      currentPhysical.state !== 'running' ||
-      currentPhysical.stopTombstone ||
-      currentPhysical.providerRef !== physical.providerRef ||
-      !sameAllocation(physical, currentPhysical) ||
+      currentAllocation.state.kind !== 'allocated' ||
+      canonicalStopIntent(currentAllocation) !== null ||
+      canonicalProviderRefOf(currentAllocation) !== canonicalProviderRefOf(allocation) ||
+      !sameCanonicalAllocation(allocation, currentAllocation) ||
       !currentRuntime ||
       !this.sameConnection(runtime, currentRuntime) ||
       !matchesRoute(currentRoute) ||
@@ -1342,19 +1330,21 @@ export class SandboxControl extends DurableObject<Env> {
     return this.withCredentialUpdate(async () => {
       try {
         const alias = parseControlPlaneCredential(input.credential);
-        const physical = await this.readFlatProjection(this.ctx.storage);
-        const native = decodeCloudflareProviderRef(physical.providerRef);
+        const allocation = await this.readCanonicalAllocation();
+        const providerRef = canonicalProviderRefOf(allocation);
+        const native = decodeCloudflareProviderRef(providerRef);
         if (
           alias?.sandboxId !== this.sandboxId ||
           this.providerKind !== 'cloudflare' ||
-          physical.state !== 'running' ||
+          allocation.state.kind !== 'allocated' ||
           !native ||
           input.outboundContainerId !==
             getOutboundContainerId(this.env, native.sandboxId, { managedScmContainment: true })
         ) {
           return null;
         }
-        if (!this.matchesContainment(physical, WORKTREE_CREDENTIAL_CONTAINMENT)) return null;
+        if (!this.matchesCanonicalContainment(allocation, WORKTREE_CREDENTIAL_CONTAINMENT))
+          return null;
         const ownerId = await this.requireOwner();
         const grants = await loadSessionCredentialGrants(this.ctx.storage);
         for (const grant of grants) {
@@ -1373,11 +1363,11 @@ export class SandboxControl extends DurableObject<Env> {
           const resolved = await resolveSessionCredential({ env: this.env, grant, ...input });
           if (!resolved) return null;
           return await this.ctx.storage.transaction(async () => {
-            const current = await this.readFlatProjection(this.ctx.storage);
+            const current = await this.readCanonicalAllocation();
             if (
-              current.providerRef !== physical.providerRef ||
-              !sameAllocation(current, physical) ||
-              !this.matchesContainment(current, WORKTREE_CREDENTIAL_CONTAINMENT) ||
+              canonicalProviderRefOf(current) !== providerRef ||
+              !sameCanonicalAllocation(current, allocation) ||
+              !this.matchesCanonicalContainment(current, WORKTREE_CREDENTIAL_CONTAINMENT) ||
               Date.now() >= resolved.grant.expiresAt ||
               this.deletingWorktrees.has(grant.scopeId)
             ) {
@@ -1467,9 +1457,7 @@ export class SandboxControl extends DurableObject<Env> {
         selected.record.state.kind === 'allocated' &&
         this.readyWrapperRuntime() === null
       ) {
-        const established = this.establishedWrapperForAllocation(
-          this.projectPhysical(selected.record)
-        );
+        const established = this.establishedWrapperForAllocation(selected.record);
         if (established?.wrapperInstanceId) {
           await this.observeCanonicalLoss(selected.record);
           selected = await this.acquireCanonicalAllocation(
@@ -1490,7 +1478,7 @@ export class SandboxControl extends DurableObject<Env> {
         );
       }
       if (selected.action === 'wait') {
-        return this.waitingAcquisitionStatus(this.projectPhysical(selected.record));
+        return this.waitingAcquisitionStatus(selected.record);
       }
       record = selected.record;
       createCommands = selected.action === 'create' ? selected.commands : undefined;
@@ -1537,7 +1525,7 @@ export class SandboxControl extends DurableObject<Env> {
           await this.ctx.storage.put(PROVIDER_LOCATOR_KEY, this.vercelLocator);
         }
       }
-      this.provider = this.createProviderAdapter(this.providerKind, this.projectPhysical(record));
+      this.provider = this.createProviderAdapter(this.providerKind, record);
     }
     if (record.state.kind !== 'creating' && record.state.kind !== 'allocated') {
       return currentStatus();
@@ -1690,10 +1678,7 @@ export class SandboxControl extends DurableObject<Env> {
           throw new SandboxAcquisitionLostError(error);
         throw new Error(error);
       }
-      return this.statusForPhysical(
-        this.projectPhysical(current),
-        this.allocationIncarnationOf(current)
-      );
+      return this.statusForAllocation(current, this.allocationIncarnationOf(current));
     });
     return { ...status, attachment };
   }
@@ -1932,10 +1917,7 @@ export class SandboxControl extends DurableObject<Env> {
       ) {
         throw new SandboxAcquisitionLostError();
       }
-      return this.statusForPhysical(
-        this.projectPhysical(current),
-        this.allocationIncarnationOf(current)
-      );
+      return this.statusForAllocation(current, this.allocationIncarnationOf(current));
     });
   }
 
@@ -1949,13 +1931,13 @@ export class SandboxControl extends DurableObject<Env> {
     to: AllocationRecord,
     cause: string
   ): Promise<void> {
-    const fromFlat = this.projectPhysical(from);
-    const toFlat = this.projectPhysical(to);
-    // Diagnostics only. The compatibility projection may label the same
-    // canonical state differently; it must never gate a side effect.
-    const diagnosticChanged =
-      fromFlat.state !== toFlat.state ||
-      (fromFlat.stopTombstone === null && toFlat.stopTombstone !== null);
+    const fromState = legacyPhysicalState(from);
+    const toState = legacyPhysicalState(to);
+    const fromStop = canonicalStopIntent(from);
+    const toStop = canonicalStopIntent(to);
+    // Diagnostics only. The compatibility labels may differ for the same
+    // canonical input; they must never gate a side effect.
+    const diagnosticChanged = fromState !== toState || (fromStop === null && toStop !== null);
     const changed = canonicalAllocationChanged(from, to);
     const unavailable = to.state.kind !== 'creating' && to.state.kind !== 'allocated';
     const wrapperInstanceId =
@@ -1982,23 +1964,27 @@ export class SandboxControl extends DurableObject<Env> {
     }
     if (diagnosticChanged) {
       await this.appendLog(
-        physicalTransition(Date.now(), fromFlat.state, toFlat.state, cause, toFlat.providerRef)
+        physicalTransition(Date.now(), fromState, toState, cause, canonicalProviderRefOf(to))
       );
     }
+    const toIntentId = to.state.kind === 'stopped' ? undefined : to.state.createIntent?.intentId;
+    const fromIntentId =
+      from.state.kind === 'stopped' ? undefined : from.state.createIntent?.intentId;
+    const toAllocationName =
+      to.state.kind === 'stopped' ? undefined : to.state.target?.allocationName;
+    const fromAllocationName =
+      from.state.kind === 'stopped' ? undefined : from.state.target?.allocationName;
     this.logDiagnostic('physical_committed', {
-      allocationId: toFlat.createIntent?.intentId ?? fromFlat.createIntent?.intentId,
-      physicalSandboxId:
-        toFlat.createIntent?.allocationName ?? fromFlat.createIntent?.allocationName,
+      allocationId: toIntentId ?? fromIntentId,
+      physicalSandboxId: toAllocationName ?? fromAllocationName,
       wrapperInstanceId,
-      fromState: fromFlat.state,
-      toState: toFlat.state,
+      fromState,
+      toState,
       cause: diagnosticCause(cause),
-      stopCause: toFlat.stopTombstone ? diagnosticCause(toFlat.stopTombstone.reason) : undefined,
-      stopAttempts: toFlat.stopTombstone?.attempts ?? fromFlat.stopTombstone?.attempts,
-      cleanupAgeMs: fromFlat.stopTombstone
-        ? Date.now() - fromFlat.stopTombstone.createdAt
-        : undefined,
-      hasTombstone: toFlat.stopTombstone !== null,
+      stopCause: toStop ? diagnosticCause(toStop.reason) : undefined,
+      stopAttempts: canonicalStopAttempts(to) ?? canonicalStopAttempts(from),
+      cleanupAgeMs: fromStop ? Date.now() - fromStop.createdAt : undefined,
+      hasTombstone: toStop !== null,
       ...this.forwarding,
     });
     if (unavailable) {
@@ -2028,17 +2014,17 @@ export class SandboxControl extends DurableObject<Env> {
     if (providerKind !== 'vercel') {
       throw new Error('Sandbox network policy requires a Vercel provider');
     }
-    const physical = await this.readFlatProjection(this.ctx.storage);
-    if (physical.state !== 'running' || physical.providerRef === null) {
+    const record = await this.readCanonicalAllocation();
+    const providerRef = canonicalProviderRefOf(record);
+    if (record.state.kind !== 'allocated' || providerRef === null) {
       throw new Error('Sandbox network policy requires a running instance');
     }
-    const providerRef = physical.providerRef;
-    if (!this.matchesProviderReference(physical, providerRef)) {
+    if (!this.matchesCanonicalProviderReference(record.state, providerRef)) {
       throw new Error('Sandbox network policy requires an exact provider reference');
     }
     if (
       (!input.requiredContainment.kilocode && !input.requiredContainment.github) ||
-      !this.matchesContainment(physical, input.requiredContainment)
+      !this.matchesCanonicalContainment(record, input.requiredContainment)
     ) {
       throw new Error('Sandbox credential containment mismatch');
     }
@@ -2053,14 +2039,14 @@ export class SandboxControl extends DurableObject<Env> {
     );
 
     const currentProviderKind = await this.ctx.storage.get<AgentSandboxProvider>(PROVIDER_KIND_KEY);
-    const currentPhysical = await this.readFlatProjection(this.ctx.storage);
+    const currentRecord = await this.readCanonicalAllocation();
     const currentOwnerId = await this.readOwner();
     if (
       currentProviderKind !== 'vercel' ||
       currentOwnerId !== ownerId ||
-      currentPhysical.state !== 'running' ||
-      currentPhysical.providerRef !== providerRef ||
-      !this.matchesContainment(currentPhysical, input.requiredContainment)
+      currentRecord.state.kind !== 'allocated' ||
+      canonicalProviderRefOf(currentRecord) !== providerRef ||
+      !this.matchesCanonicalContainment(currentRecord, input.requiredContainment)
     ) {
       throw new Error('Sandbox instance changed during network policy update');
     }
@@ -2085,8 +2071,8 @@ export class SandboxControl extends DurableObject<Env> {
         throw new Error('Session has no matching worktree credential grant');
       }
       if (
-        !this.matchesContainment(
-          await this.readFlatProjection(this.ctx.storage),
+        !this.matchesCanonicalContainment(
+          await this.readCanonicalAllocation(),
           getWorktreeCredentialContainment(grant.containmentEnabled !== false)
         )
       ) {
@@ -2337,8 +2323,7 @@ export class SandboxControl extends DurableObject<Env> {
         admittedTeardown ||
         (await this.fenceAndCheckWorktreeExclusivity(input, directory));
       if (!exclusive) {
-        if ((await this.readFlatProjection(this.ctx.storage)).state !== 'stopped')
-          await getProvider();
+        if ((await this.readCanonicalAllocation()).state.kind !== 'stopped') await getProvider();
         await this.revokeWorktreeCredentials(input.worktreeId);
       }
       journal = await cleanWorktreeRuntime({
@@ -2419,9 +2404,9 @@ export class SandboxControl extends DurableObject<Env> {
     return { deleted: true, sessionIds: journal.sessionIds };
   }
 
-  private async stopDeletedWorktreeRuntime(): Promise<PhysicalRecord> {
-    const physical = await this.beginStop('worktree_deleted');
-    if (physical.state === 'stopped') return physical;
+  private async stopDeletedWorktreeRuntime(): Promise<AllocationRecord> {
+    const record = await this.beginStop('worktree_deleted');
+    if (record.state.kind === 'stopped') return record;
     return this.recordStopAttempt();
   }
 
@@ -2591,7 +2576,7 @@ export class SandboxControl extends DurableObject<Env> {
 
     let billing: SandboxTerminalAccessResult;
     try {
-      const providerRef = decodeCloudflareProviderRef(runtime.physical.providerRef);
+      const providerRef = decodeCloudflareProviderRef(canonicalProviderRefOf(runtime.physical));
       if (!providerRef) return { allowed: false, reason: 'runtime_not_running' };
       const allocationId = providerRef.sandboxId;
       const namespace = getSandboxNamespace(this.env, allocationId, {
@@ -2634,7 +2619,7 @@ export class SandboxControl extends DurableObject<Env> {
     return (
       this.sameConnection(left.connection, right.connection) &&
       left.provider === right.provider &&
-      left.physical.providerRef === right.physical.providerRef &&
+      canonicalProviderRefOf(left.physical) === canonicalProviderRefOf(right.physical) &&
       left.route.kiloSessionId === right.route.kiloSessionId &&
       left.route.directory === right.route.directory &&
       left.grant.scopeId === right.grant.scopeId &&
@@ -2707,22 +2692,6 @@ export class SandboxControl extends DurableObject<Env> {
    */
   private async readCanonicalAllocation(): Promise<AllocationRecord> {
     return loadAllocation(this.ctx.storage, this.provider.resumable);
-  }
-
-  /** Canonical → flat representation for the preserved port/status shape. */
-  private projectPhysical(record: AllocationRecord): PhysicalRecord {
-    return projectAllocationToFlat(record) as PhysicalRecord;
-  }
-
-  /**
-   * Live-path replacement for the flat reader: read the canonical aggregate and
-   * project it to the flat representation. Never reads the flat key, so the live
-   * path cannot observe a stale persisted twin.
-   */
-  private async readFlatProjection(
-    storage: Parameters<typeof loadAllocation>[0]
-  ): Promise<PhysicalRecord> {
-    return this.projectPhysical(await loadAllocation(storage, this.provider.resumable));
   }
 
   /** The canonical incarnation while an allocation is allocated, else nothing. */
@@ -2815,25 +2784,23 @@ export class SandboxControl extends DurableObject<Env> {
   async getStatus(): Promise<SandboxControlStatus> {
     await this.ensureOperationalInitialized();
     const record = await this.readCanonicalAllocation();
-    return this.statusForPhysical(
-      this.projectPhysical(record),
-      this.allocationIncarnationOf(record)
-    );
+    return this.statusForAllocation(record, this.allocationIncarnationOf(record));
   }
 
-  private async statusForPhysical(
-    physical: PhysicalRecord,
+  private async statusForAllocation(
+    record: AllocationRecord,
     allocationIncarnation?: string
   ): Promise<SandboxControlStatus> {
     const connection = this.connectionState();
     const work = await this.workState();
     const runtime = this.readyWrapperRuntime();
+    const physical = legacyPhysicalState(record);
     return {
-      reported: projectReportedStatus({ physical: physical.state, connection, work }),
-      physical: physical.state,
+      reported: projectReportedStatus({ physical, connection, work }),
+      physical,
       connection,
       work,
-      ...(physical.state === 'running' && runtime?.wrapperInstanceId
+      ...(record.state.kind === 'allocated' && runtime?.wrapperInstanceId
         ? { wrapperInstanceId: runtime.wrapperInstanceId }
         : {}),
       ...(allocationIncarnation === undefined ? {} : { allocationIncarnation }),
@@ -2847,14 +2814,14 @@ export class SandboxControl extends DurableObject<Env> {
 
   /**
    * An acquisition that could not bind is not sendable even when the shared
-   * wrapper is healthy. The physical projection stays intact, but the ready
+   * wrapper is healthy. The allocated record stays intact, but the ready
    * connection and wrapper identity are withheld from this acquisition result
    * so the caller takes its bounded wait path instead of dispatching against an
    * allocation this session is still fenced from. The wrapper itself stays
    * healthy: only this result is downgraded.
    */
-  private async waitingAcquisitionStatus(physical: PhysicalRecord): Promise<SandboxControlStatus> {
-    const status = await this.statusForPhysical(physical);
+  private async waitingAcquisitionStatus(record: AllocationRecord): Promise<SandboxControlStatus> {
+    const status = await this.statusForAllocation(record);
     if (status.connection !== 'ready') return status;
     const connection = 'connected' as const;
     const { wrapperInstanceId: _withheld, ...rest } = status;
@@ -2894,16 +2861,16 @@ export class SandboxControl extends DurableObject<Env> {
       routes: [...routes.values()],
       connection: readSandboxControlConnection(
         this.ctx,
-        record ? this.projectPhysical(record).providerRef : null,
+        record ? canonicalProviderRefOf(record) : null,
         wrapperRuntime
       ),
       now: Date.now(),
     });
   }
 
-  async getPhysicalRecord(): Promise<PhysicalRecord> {
+  async getAllocationRecord(): Promise<AllocationRecord> {
     await this.ensureOperationalInitialized();
-    return this.projectPhysical(await this.readCanonicalAllocation());
+    return this.readCanonicalAllocation();
   }
 
   async getTransitionLog(): Promise<TransitionRow[]> {
@@ -2911,17 +2878,19 @@ export class SandboxControl extends DurableObject<Env> {
     return loadTransitionLog(this.ctx.storage);
   }
 
-  async beginStop(reason: string): Promise<PhysicalRecord> {
+  async beginStop(reason: string): Promise<AllocationRecord> {
     await this.ensureOperationalInitialized();
     const record = await this.readCanonicalAllocation();
-    return this.projectPhysical(await this.driveCanonicalStop(record, reason));
+    return this.driveCanonicalStop(record, reason);
   }
 
-  async recordStopAttempt(): Promise<PhysicalRecord> {
+  async recordStopAttempt(): Promise<AllocationRecord> {
     await this.ensureOperationalInitialized();
     const record = await this.readCanonicalAllocation();
-    const physical = this.projectPhysical(record);
-    if (this.stopAttemptInFlight && sameAllocation(this.stopAttemptInFlight.physical, physical)) {
+    if (
+      this.stopAttemptInFlight &&
+      sameCanonicalAllocation(this.stopAttemptInFlight.record, record)
+    ) {
       this.logDiagnostic('stop_coalesced', {
         allocationId:
           record.state.kind === 'stopped' ? undefined : record.state.createIntent?.intentId,
@@ -2930,8 +2899,8 @@ export class SandboxControl extends DurableObject<Env> {
       return this.stopAttemptInFlight.promise;
     }
     const pending = {
-      physical,
-      promise: this.driveCanonicalStop(record).then(after => this.projectPhysical(after)),
+      record,
+      promise: this.driveCanonicalStop(record),
     };
     this.stopAttemptInFlight = pending;
     try {
@@ -2963,24 +2932,24 @@ export class SandboxControl extends DurableObject<Env> {
     return after;
   }
 
-  async confirmStopped(): Promise<PhysicalRecord> {
+  async confirmStopped(): Promise<AllocationRecord> {
     await this.ensureOperationalInitialized();
     const record = await this.readCanonicalAllocation();
-    return this.projectPhysical(await this.driveCanonicalStop(record));
+    return this.driveCanonicalStop(record);
   }
 
-  async markFailed(): Promise<PhysicalRecord> {
+  async markFailed(): Promise<AllocationRecord> {
     await this.ensureOperationalInitialized();
     const before = await this.readCanonicalAllocation();
     const after = await this.driveCanonicalStop(before, 'environment_failed');
     await this.ctx.storage.put(DIAGNOSTIC_BUNDLE_KEY, {
       at: Date.now(),
-      from: this.projectPhysical(before).state,
-      to: this.projectPhysical(after).state,
+      from: legacyPhysicalState(before),
+      to: legacyPhysicalState(after),
       connection: this.connectionState(),
       logTail: (await loadTransitionLog(this.ctx.storage)).slice(-20),
     });
-    return this.projectPhysical(after);
+    return after;
   }
 
   async eraseRecord(options?: { preserveAcquisitionReceipts: true }): Promise<void> {
@@ -3112,16 +3081,33 @@ export class SandboxControl extends DurableObject<Env> {
 
   private createProviderAdapter(
     kind: AgentSandboxProvider,
-    physical?: PhysicalRecord
+    record?: AllocationRecord
   ): ProviderAdapter {
-    const allocationName = physical?.createIntent?.allocationName ?? this.sandboxId;
+    const state = record?.state;
+    const allocationName =
+      state !== undefined && state.kind !== 'stopped'
+        ? (state.target?.allocationName ?? this.sandboxId)
+        : this.sandboxId;
     if (kind === 'vercel') {
-      const locator = physical?.state === 'stopped' ? undefined : this.vercelLocator;
-      const persisted = physical?.createIntent?.vercel;
-      const resources = persisted?.resources ?? this.vercelResources;
+      const locator = state?.kind === 'stopped' ? undefined : this.vercelLocator;
+      const persisted =
+        state !== undefined && state.kind !== 'stopped' ? state.target?.vercel : undefined;
+      const persistedResources =
+        persisted?.resources === undefined
+          ? undefined
+          : vercelSandboxResourcesSchema.parse(persisted.resources);
+      const resources = persistedResources ?? this.vercelResources;
       const configuration =
         persisted !== undefined
-          ? { ...persisted, ...(resources === undefined ? {} : { resources }) }
+          ? {
+              ...(persisted.projectId === undefined ? {} : { projectId: persisted.projectId }),
+              ...(persisted.snapshotId === undefined ? {} : { snapshotId: persisted.snapshotId }),
+              ...(persisted.runtimeBuildId === undefined
+                ? {}
+                : { runtimeBuildId: persisted.runtimeBuildId }),
+              ...(persisted.runtime === undefined ? {} : { runtime: persisted.runtime }),
+              ...(resources === undefined ? {} : { resources }),
+            }
           : locator === undefined
             ? undefined
             : { ...locator, ...(resources === undefined ? {} : { resources }) };
@@ -3206,7 +3192,7 @@ export class SandboxControl extends DurableObject<Env> {
       configuration.provider === 'vercel' ? configuration.resources : undefined;
     this.provider = this.createProviderAdapter(
       configuration.provider,
-      await this.readFlatProjection(this.ctx.storage)
+      await this.readCanonicalAllocation()
     );
   }
 
@@ -3275,61 +3261,6 @@ export class SandboxControl extends DurableObject<Env> {
       wrapperInstanceId: launchEnv.CONTROL_WRAPPER_INSTANCE_ID,
     });
     return launchEnv;
-  }
-
-  private matchesProviderReference(physical: PhysicalRecord, providerRef: string): boolean {
-    if (physical.providerRef !== null && physical.providerRef !== providerRef) return false;
-    const allocationName = physical.createIntent?.allocationName ?? this.sandboxId;
-    if (this.providerKind === 'vercel') {
-      return decodeVercelProviderRef(providerRef)?.sandboxName === allocationName;
-    }
-    const native = decodeCloudflareProviderRef(providerRef);
-    const containment = physical.createIntent?.containment ?? physical.containment;
-    return (
-      native?.sandboxId === allocationName &&
-      containment !== undefined &&
-      native.containment === (containment.kilocode || containment.github) &&
-      (!physical.createIntent || native.instanceId === physical.createIntent.intentId)
-    );
-  }
-
-  private matchesWorktreeContainment(physical: PhysicalRecord): boolean {
-    const containment =
-      physical.state === 'creating' ? physical.createIntent?.containment : physical.containment;
-    return (
-      containment?.worktreeScoped === true &&
-      containment.kilocode === containment.github &&
-      this.matchesContainment(physical, containment)
-    );
-  }
-
-  private matchesContainment(
-    physical: PhysicalRecord,
-    requiredContainment: CredentialContainmentRequirements
-  ): boolean {
-    if (physical.stopTombstone) return false;
-    if (physical.state === 'creating') {
-      const containment = physical.createIntent?.containment;
-      return (
-        containment !== undefined &&
-        containment.kilocode === requiredContainment.kilocode &&
-        containment.github === requiredContainment.github &&
-        containment.worktreeScoped === requiredContainment.worktreeScoped
-      );
-    }
-    if (physical.state !== 'running' || physical.providerRef === null) {
-      return false;
-    }
-    const referenceMatches = this.matchesProviderReference(physical, physical.providerRef);
-    const containment = physical.containment;
-    return (
-      referenceMatches &&
-      containment !== undefined &&
-      containment.providerRef === physical.providerRef &&
-      containment.kilocode === requiredContainment.kilocode &&
-      containment.github === requiredContainment.github &&
-      containment.worktreeScoped === requiredContainment.worktreeScoped
-    );
   }
 
   /**
@@ -3655,7 +3586,7 @@ export class SandboxControl extends DurableObject<Env> {
     const diagnostic = {
       ...diagnosticConnection(identity),
       allocationId: state.kind === 'stopped' ? undefined : state.createIntent?.intentId,
-      physicalState: this.projectPhysical(record).state,
+      physicalState: legacyPhysicalState(record),
       hasTombstone: state.kind === 'stopping' || state.kind === 'unknown',
       requestedLeaseMs: leaseAtLeastMs(),
     };
@@ -3872,9 +3803,9 @@ export class SandboxControl extends DurableObject<Env> {
     const deadlineAt = sessionOperationExpiresAt(authorization);
     const current = () => this.isCurrentConnection(connection) && Date.now() < deadlineAt;
     if (!current()) return undefined;
-    const [table, physical, ownerId] = await Promise.all([
+    const [table, allocation, ownerId] = await Promise.all([
       loadRouteTable(this.ctx.storage),
-      this.readFlatProjection(this.ctx.storage),
+      this.readCanonicalAllocation(),
       this.readOwner(),
     ]);
     const route = getRouteBySessionId(table, session.sessionId);
@@ -3890,9 +3821,9 @@ export class SandboxControl extends DurableObject<Env> {
     )
       throw new SandboxControlConnectionError('Operation result route is not current', false);
     if (
-      physical.state === 'stopped' ||
-      physical.providerRef !== connection.providerInstanceId ||
-      !this.matchesWorktreeContainment(physical) ||
+      allocation.state.kind === 'stopped' ||
+      canonicalProviderRefOf(allocation) !== connection.providerInstanceId ||
+      !this.matchesCanonicalWorktreeContainment(allocation) ||
       !current()
     )
       throw new SandboxControlConnectionError('Operation result runtime is not current', false);
@@ -3937,9 +3868,9 @@ export class SandboxControl extends DurableObject<Env> {
           const assertCurrent = async () => {
             if (!current() || Date.now() >= forwardDeadlineAt)
               throw new SandboxControlConnectionError('Operation result forwarding expired', false);
-            const [routes, nextPhysical] = await Promise.all([
+            const [routes, nextAllocation] = await Promise.all([
               loadRouteTable(this.ctx.storage),
-              this.readFlatProjection(this.ctx.storage),
+              this.readCanonicalAllocation(),
             ]);
             const nextRoute = routes.get(route.sessionId);
             if (
@@ -3950,10 +3881,10 @@ export class SandboxControl extends DurableObject<Env> {
               nextRoute.directory !== session.directory ||
               nextRoute.worktreeId !== route.worktreeId ||
               Date.now() >= forwardDeadlineAt ||
-              !sameAllocation(nextPhysical, physical) ||
-              nextPhysical.state === 'stopped' ||
-              nextPhysical.providerRef !== connection.providerInstanceId ||
-              !this.matchesWorktreeContainment(nextPhysical) ||
+              !sameCanonicalAllocation(nextAllocation, allocation) ||
+              nextAllocation.state.kind === 'stopped' ||
+              canonicalProviderRefOf(nextAllocation) !== connection.providerInstanceId ||
+              !this.matchesCanonicalWorktreeContainment(nextAllocation) ||
               this.runtimeDeleted ||
               this.exclusiveDeletionWorktreeId !== undefined ||
               (nextRoute.worktreeId !== undefined &&
@@ -4063,7 +3994,7 @@ export class SandboxControl extends DurableObject<Env> {
     forward: (
       route: SessionRoute,
       diagnostic: ControlDiagnosticFields,
-      physical: PhysicalRecord,
+      allocation: AllocationRecord,
       deadlineAt: number
     ) => Promise<SandboxControlEventResult>
   ): Promise<SandboxControlEventResult> {
@@ -4134,12 +4065,12 @@ export class SandboxControl extends DurableObject<Env> {
             });
             return { applied: false, retryable: true };
           }
-          const physical = await this.readFlatProjection(this.ctx.storage);
+          const allocation = await this.readCanonicalAllocation();
           if (
-            physical.state !== 'running' ||
-            physical.stopTombstone ||
-            physical.providerRef !== connection.providerInstanceId ||
-            !this.matchesWorktreeContainment(physical) ||
+            allocation.state.kind !== 'allocated' ||
+            canonicalStopIntent(allocation) !== null ||
+            canonicalProviderRefOf(allocation) !== connection.providerInstanceId ||
+            !this.matchesCanonicalWorktreeContainment(allocation) ||
             !this.isCurrentConnection(connection)
           ) {
             this.recordForwardDrop('runtime_not_current', {
@@ -4151,7 +4082,7 @@ export class SandboxControl extends DurableObject<Env> {
           return await forward(
             route,
             { ...fields, sessionId: route.sessionId },
-            physical,
+            allocation,
             forwardDeadlineAt
           );
         } finally {
@@ -4190,12 +4121,12 @@ export class SandboxControl extends DurableObject<Env> {
   private async isCurrentSessionForward(
     route: SessionRoute,
     connection: SandboxControlConnectionIdentity,
-    expectedPhysical: PhysicalRecord
+    expectedAllocation: AllocationRecord
   ): Promise<boolean> {
     if (!this.isCurrentConnection(connection)) return false;
-    const [routes, physical] = await Promise.all([
+    const [routes, allocation] = await Promise.all([
       loadRouteTable(this.ctx.storage),
-      this.readFlatProjection(this.ctx.storage),
+      this.readCanonicalAllocation(),
     ]);
     const current = routes.get(route.sessionId);
     return (
@@ -4204,11 +4135,11 @@ export class SandboxControl extends DurableObject<Env> {
       current.directory === route.directory &&
       current.worktreeId === route.worktreeId &&
       current.nativeRuntimeId === route.nativeRuntimeId &&
-      sameAllocation(physical, expectedPhysical) &&
-      physical.state === 'running' &&
-      !physical.stopTombstone &&
-      physical.providerRef === connection.providerInstanceId &&
-      this.matchesWorktreeContainment(physical) &&
+      sameCanonicalAllocation(allocation, expectedAllocation) &&
+      allocation.state.kind === 'allocated' &&
+      canonicalStopIntent(allocation) === null &&
+      canonicalProviderRefOf(allocation) === connection.providerInstanceId &&
+      this.matchesCanonicalWorktreeContainment(allocation) &&
       !this.runtimeDeleted &&
       !this.exclusiveDeletionWorktreeId &&
       !(route.worktreeId && this.deletingWorktrees.has(route.worktreeId)) &&
@@ -4218,7 +4149,7 @@ export class SandboxControl extends DurableObject<Env> {
 
   private async forwardSessionFrame(
     route: SessionRoute,
-    physical: PhysicalRecord,
+    allocation: AllocationRecord,
     connection: SandboxControlConnectionIdentity,
     diagnostic: ControlDiagnosticFields,
     operation:
@@ -4231,7 +4162,7 @@ export class SandboxControl extends DurableObject<Env> {
     requireApplied: boolean,
     forwardDeadlineAt: number
   ): Promise<SandboxControlEventResult> {
-    if (!(await this.isCurrentSessionForward(route, connection, physical))) {
+    if (!(await this.isCurrentSessionForward(route, connection, allocation))) {
       this.recordForwardDrop('stale_before_send', diagnostic);
       return { applied: false, retryable: true };
     }
@@ -4262,7 +4193,7 @@ export class SandboxControl extends DurableObject<Env> {
           throw new SandboxControlConnectionError('Forwarding deadline expired', false);
         let currentSession: boolean;
         try {
-          currentSession = await this.isCurrentSessionForward(route, connection, physical);
+          currentSession = await this.isCurrentSessionForward(route, connection, allocation);
         } catch (error) {
           if (Date.now() >= forwardDeadlineAt)
             throw new SandboxControlConnectionError('Forwarding deadline expired', false);
@@ -4286,7 +4217,7 @@ export class SandboxControl extends DurableObject<Env> {
         }
         let stillCurrent: boolean;
         try {
-          stillCurrent = await this.isCurrentSessionForward(route, connection, physical);
+          stillCurrent = await this.isCurrentSessionForward(route, connection, allocation);
         } catch (error) {
           if (Date.now() >= forwardDeadlineAt)
             throw new SandboxControlConnectionError('Forwarding deadline expired', false);
@@ -4394,7 +4325,7 @@ export class SandboxControl extends DurableObject<Env> {
     this.logDiagnostic('provider_observation', {
       allocationId: state.kind === 'stopped' ? undefined : state.createIntent?.intentId,
       physicalSandboxId: target?.allocationName,
-      physicalState: this.projectPhysical(record).state,
+      physicalState: legacyPhysicalState(record),
       observation: result.status,
       result: timedOut ? 'timed_out' : failed ? 'failed' : 'completed',
       stale,
@@ -4472,14 +4403,15 @@ export class SandboxControl extends DurableObject<Env> {
   // socket is gone, so it is the discriminator between a warmed runtime and a
   // `running` record that only committed `confirmInstance` before launch.
   private establishedWrapperForAllocation(
-    physical: PhysicalRecord
+    record: AllocationRecord
   ): SandboxControlConnectionIdentity | null {
     const connection = this.activeConnection;
+    const providerRef = canonicalProviderRefOf(record);
     if (
       !connection ||
       !connection.wrapperInstanceId ||
-      physical.providerRef === null ||
-      connection.providerInstanceId !== physical.providerRef
+      providerRef === null ||
+      connection.providerInstanceId !== providerRef
     ) {
       return null;
     }
@@ -4588,10 +4520,10 @@ export class SandboxControl extends DurableObject<Env> {
       return { allowed: false, reason: 'invalid_terminal_access' };
     }
 
-    const [ownerId, routes, physical, grants] = await Promise.all([
+    const [ownerId, routes, allocation, grants] = await Promise.all([
       this.readOwner(),
       loadRouteTable(this.ctx.storage),
-      this.readFlatProjection(this.ctx.storage),
+      this.readCanonicalAllocation(),
       loadSessionCredentialGrants(this.ctx.storage),
     ]);
     if (ownerId !== input.ownerId) return { allowed: false, reason: 'owner_mismatch' };
@@ -4607,10 +4539,14 @@ export class SandboxControl extends DurableObject<Env> {
     ) {
       return { allowed: false, reason: 'worktree_deleting' };
     }
-    if (physical.state !== 'running' || physical.stopTombstone || physical.providerRef === null) {
+    if (
+      allocation.state.kind !== 'allocated' ||
+      canonicalStopIntent(allocation) !== null ||
+      canonicalProviderRefOf(allocation) === null
+    ) {
       return { allowed: false, reason: 'runtime_not_running' };
     }
-    if (!this.matchesWorktreeContainment(physical)) {
+    if (!this.matchesCanonicalWorktreeContainment(allocation)) {
       return { allowed: false, reason: 'credential_containment_unavailable' };
     }
     const grant = grants.find(
@@ -4629,8 +4565,8 @@ export class SandboxControl extends DurableObject<Env> {
     );
     if (
       !grant ||
-      !this.matchesContainment(
-        physical,
+      !this.matchesCanonicalContainment(
+        allocation,
         getWorktreeCredentialContainment(grant.containmentEnabled !== false)
       )
     ) {
@@ -4646,7 +4582,14 @@ export class SandboxControl extends DurableObject<Env> {
       return { allowed: false, reason: 'wrapper_instance_mismatch' };
     }
 
-    return { allowed: true, connection, physical, provider: this.providerKind, route, grant };
+    return {
+      allowed: true,
+      connection,
+      physical: allocation,
+      provider: this.providerKind,
+      route,
+      grant,
+    };
   }
 
   private connectionState(): ConnectionState {
@@ -4899,7 +4842,9 @@ export class SandboxControl extends DurableObject<Env> {
    * `createdAt`; the target supplies the identity fields the lossy legacy schema
    * dropped.
    */
-  private async controlCreateIntentFor(target: AllocationTarget): Promise<CreateIntent | null> {
+  private async controlCreateIntentFor(
+    target: AllocationTarget
+  ): Promise<ProviderAllocationIntent | null> {
     const state = (await this.readCanonicalAllocation()).state;
     if (state.kind === 'stopped') return null;
     const createIntent = state.createIntent;
@@ -4922,7 +4867,7 @@ export class SandboxControl extends DurableObject<Env> {
    * build. Only a target without a persisted block (e.g. a legacy record)
    * falls back to the pinned environment.
    */
-  private vercelCreateIntent(target: AllocationTarget): CreateIntent['vercel'] {
+  private vercelCreateIntent(target: AllocationTarget): ProviderAllocationIntent['vercel'] {
     const persisted = target.vercel;
     if (persisted === undefined) return this.controlVercelIntentConfig();
     const resources = vercelSandboxResourcesSchema
@@ -4952,7 +4897,7 @@ export class SandboxControl extends DurableObject<Env> {
    * the live `claimCreate` does, from the pinned environment configuration
    * rather than the lossy canonical target (whose Vercel fields are optional).
    */
-  private controlVercelIntentConfig(): CreateIntent['vercel'] {
+  private controlVercelIntentConfig(): ProviderAllocationIntent['vercel'] {
     if (this.providerKind !== 'vercel') return undefined;
     const vercel = parseVercelSandboxRuntimeConfig(this.env);
     if (vercel === undefined) return undefined;

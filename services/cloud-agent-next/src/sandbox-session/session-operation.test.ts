@@ -15,6 +15,7 @@ import {
   applySessionOperationResult,
   createSessionMessageRecord,
   recordSessionOperationDispatch,
+  recordSessionOperationExecutionDeadline,
   type SessionMessageRecord,
 } from './session-message-queue.js';
 import {
@@ -57,6 +58,12 @@ function messages(): SessionMessageRecord[] {
       wrapperInstanceId: authorization.wrapperInstanceId,
     },
   ];
+}
+
+const RUNTIME_A = '11111111-1111-4111-8111-111111111111';
+
+function queuedMessage(messageId: string, wrapperInstanceId: string): SessionMessageRecord {
+  return { messageId, state: 'queued', wrapperInstanceId };
 }
 
 describe('dispatchSessionOperation', () => {
@@ -662,6 +669,61 @@ describe('dispatchSessionOperation', () => {
     });
     expect(acknowledgement).toMatchObject({ disposition: 'applied', resultHash: hash });
     expect(commitDepth).toBe(1);
+  });
+});
+
+describe('execution deadline persistence', () => {
+  const dispatchAuthorization = (): SessionOperationAuthorization => ({
+    operation: 'session.prompt',
+    operationId: 'message-a',
+    messageId: 'message-a',
+    session: { sessionId: 'workspace-a', kiloSessionId: 'kilo-a', directory: '/workspace/a' },
+    wrapperInstanceId: RUNTIME_A,
+    dispatchDeadlineAt: 31_000,
+  });
+
+  it('does not replace the execution bound with a later dispatch attempt after reconstruction', () => {
+    const first = recordSessionOperationDispatch(
+      [queuedMessage('message-a', RUNTIME_A)],
+      dispatchAuthorization()
+    );
+    if (!first) throw new Error('Initial dispatch proof was not recorded');
+
+    const replayed = recordSessionOperationDispatch(
+      structuredClone(first),
+      dispatchAuthorization()
+    );
+
+    expect(replayed?.[0]).toMatchObject({ executionDeadlineAt: 3_631_000 });
+    expect(replayed?.[0]?.operations?.prompt).toMatchObject({ executionDeadlineAt: 3_631_000 });
+  });
+
+  it('replaces the dispatch ceiling once with the original wrapper execution boundary', () => {
+    const dispatched = recordSessionOperationDispatch(
+      [queuedMessage('message-a', RUNTIME_A)],
+      dispatchAuthorization()
+    );
+    if (!dispatched) throw new Error('Initial dispatch proof was not recorded');
+
+    const started = recordSessionOperationExecutionDeadline(
+      dispatched,
+      dispatchAuthorization(),
+      3_600_500
+    );
+    if (!started) throw new Error('Wrapper execution boundary was not recorded');
+    const replayedBoundary = recordSessionOperationExecutionDeadline(
+      started,
+      dispatchAuthorization(),
+      3_700_000
+    );
+    if (!replayedBoundary) throw new Error('Stored execution boundary was not preserved');
+    const recovered = recordSessionOperationDispatch(
+      structuredClone(replayedBoundary),
+      dispatchAuthorization()
+    );
+
+    expect(recovered).toMatchObject([{ executionDeadlineAt: 3_600_500 }]);
+    expect(recovered?.[0]?.operations?.prompt).toMatchObject({ executionDeadlineAt: 3_600_500 });
   });
 });
 

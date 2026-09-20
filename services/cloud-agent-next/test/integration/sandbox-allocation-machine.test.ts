@@ -83,7 +83,7 @@ describe('sandbox allocation machine (live wiring)', () => {
       expect((await readState(state.storage))?.state.kind).toBe('allocated');
 
       const stopped = await instance.beginStop('test');
-      expect(stopped.state).toBe('stopped');
+      expect(stopped.state.kind).toBe('stopped');
       expect((await readState(state.storage))?.state.kind).toBe('stopped');
     });
   });
@@ -151,7 +151,7 @@ describe('sandbox allocation machine (live wiring)', () => {
 
       // The provider reports absence only when the explicit CHECK observes it.
       const settled = await instance.confirmStopped();
-      expect(settled.state).toBe('stopped');
+      expect(settled.state.kind).toBe('stopped');
       expect((await readState(state.storage))?.state.kind).toBe('stopped');
     });
   });
