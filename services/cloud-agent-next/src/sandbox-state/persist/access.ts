@@ -44,10 +44,6 @@ export type SyncRecordWriter = {
   put(key: string, value: unknown): void;
 };
 
-export type SyncRecordEraser = {
-  delete(key: string): unknown;
-};
-
 export type SeedRecords = Map<string, unknown> | Record<string, unknown>;
 
 export type StoredEntry = {
@@ -64,10 +60,6 @@ export function isSessionMessagesKey(key: string): boolean {
 }
 
 // --- allocation, canonical envelope (async) ---
-
-export function isCanonicalAllocationKey(key: string): boolean {
-  return key === CANONICAL_ALLOCATION_KEY;
-}
 
 export async function readCanonicalAllocationRecord(storage: AsyncRecordReader): Promise<unknown> {
   return await storage.get(CANONICAL_ALLOCATION_KEY);
@@ -137,10 +129,6 @@ export function writeSessionValueSync(storage: SyncRecordWriter, value: unknown)
   storage.put(SESSION_MESSAGES_KEY, value);
 }
 
-export function eraseSessionMessages(storage: SyncRecordEraser): void {
-  storage.delete(SESSION_MESSAGES_KEY);
-}
-
 // --- session, raw value (async) ---
 
 export async function readSessionEntry(
@@ -158,10 +146,6 @@ export async function readSessionValue<T = unknown>(
 
 export async function writeSessionValue(storage: AsyncRecordWriter, value: unknown): Promise<void> {
   await storage.put(SESSION_MESSAGES_KEY, value);
-}
-
-export async function eraseSessionValue(storage: AsyncRecordEraser): Promise<void> {
-  await storage.delete([SESSION_MESSAGES_KEY]);
 }
 
 // --- fixtures backed by a plain Map or object ---
@@ -189,17 +173,9 @@ export function seedCanonicalAllocationRecord<T extends SeedRecords>(
   return records;
 }
 
-export function readCanonicalAllocationRecordFrom(records: SeedRecords): unknown {
-  return readSeeded(records, CANONICAL_ALLOCATION_KEY);
-}
-
 export function seedSessionValue<T extends SeedRecords>(records: T, value: unknown): T {
   seedInto(records, SESSION_MESSAGES_KEY, value);
   return records;
-}
-
-export function readAllocationRecordFrom<T = unknown>(records: SeedRecords): T | undefined {
-  return readSeeded(records, ALLOCATION_RECORD_KEY) as T | undefined;
 }
 
 export function readSessionValueFrom(records: SeedRecords): unknown {

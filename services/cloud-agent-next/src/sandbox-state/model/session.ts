@@ -99,8 +99,6 @@ export const legacyFreeformIntentSchema = z
   })
   .strict();
 
-export type LegacyFreeformIntent = z.infer<typeof legacyFreeformIntentSchema>;
-
 export const runtimeHandleSchema = z
   .object({
     incarnation: z.string().min(1).max(256),
@@ -161,8 +159,6 @@ export const sessionOperationResultSchema = z.discriminatedUnion('ok', [
   z.object({ ok: z.literal(true), result: z.unknown() }).strict(),
   z.object({ ok: z.literal(false), error: controlErrorSchema }).strict(),
 ]);
-
-export type SessionOperationResult = z.infer<typeof sessionOperationResultSchema>;
 
 export const sessionOperationDecisionSchema = z
   .object({
@@ -351,7 +347,6 @@ export const messageStateSchema = z
 
 export type QueuedMessageState = z.infer<typeof queuedMessageStateSchema>;
 export type AcceptedMessageState = z.infer<typeof acceptedMessageStateSchema>;
-export type CompletedMessageState = z.infer<typeof completedMessageStateSchema>;
 export type FailedMessageState = z.infer<typeof failedMessageStateSchema>;
 export type CancelledMessageState = z.infer<typeof cancelledMessageStateSchema>;
 
@@ -404,16 +399,10 @@ export const sessionEnvelopeSchema = z
 
 export type SessionEnvelope = z.infer<typeof sessionEnvelopeSchema>;
 
-export const SESSION_INITIAL_STATE = 'unbound' as const;
-
 export function emptySessionAggregate(): SessionAggregate {
   return { binding: { kind: 'unbound' }, messages: [] };
 }
 
 export function unbound(): Binding {
   return { kind: 'unbound' };
-}
-
-export function unresolvedBinding(): Binding {
-  return { kind: 'unresolved' };
 }

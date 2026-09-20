@@ -46,8 +46,6 @@ export type AllocationIdentity = { kind: 'intent' | 'provider'; id: string };
 /** A session's acquisition demand: one request id, one delivery deadline. */
 export type AllocationAcquisition = { id: string; deadlineAt: number };
 
-export type AcquisitionReceipt = AllocationAcquisition & { allocation: AllocationIdentity };
-
 const acquisitionReceiptsSchema = z.array(
   z.object({
     id: z.string().min(1).max(128),

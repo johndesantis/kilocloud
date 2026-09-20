@@ -107,14 +107,6 @@ export type Command =
   | NotifySessionCommand
   | AcquireCommand;
 
-export type CommandResult =
-  | { operationId: OperationId; ok: true }
-  | { operationId: OperationId; ok: false; reason: string; retryable?: boolean };
-
-export interface CommandRunner {
-  run(command: Command): Promise<CommandResult>;
-}
-
 export type Decision<T> = {
   state: T;
   commands: Command[];

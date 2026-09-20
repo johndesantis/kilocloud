@@ -97,7 +97,8 @@ const LOG_FIELD_KEYS = [
   'reportedSessions',
   'activeKiloSessions',
   'inputWaitingRoutes',
-  // Recovery-outcome fields emitted by `emitRecoveryOutcome`.
+  // Legacy recovery-outcome fields. `emitRecoveryOutcome` was removed by the
+  // canonical cutover; the keys remain so a pre-cutover record still parses.
   'outcome',
   'committedAt',
   // Per-session heartbeat payload fields emitted by `heartbeatSessionFields`.

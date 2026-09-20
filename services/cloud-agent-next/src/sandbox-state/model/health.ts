@@ -114,8 +114,6 @@ export type HealthyHealth = z.infer<typeof healthyHealthSchema>;
 export type RecoveringHealth = z.infer<typeof recoveringHealthSchema>;
 export type UnhealthyHealth = z.infer<typeof unhealthyHealthSchema>;
 
-export const HEALTH_INITIAL_KIND = 'connecting' as const;
-
 /**
  * Health-owned constructors. The allocation counter must not build health states
  * inline, so the incarnation/deadline pairing stays in one place.

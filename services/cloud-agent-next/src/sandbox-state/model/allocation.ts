@@ -14,7 +14,6 @@ import { healthStateSchema, type ConnectingHealth } from './health.js';
 const timestamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
 export const allocationProviderSchema = z.enum(['cloudflare', 'vercel']);
-export type AllocationProvider = z.infer<typeof allocationProviderSchema>;
 
 export const vercelAllocationConfigSchema = z
   .object({
@@ -137,8 +136,6 @@ export const allocationStoppedSummarySchema = z
   })
   .strict();
 
-export type AllocationStoppedSummary = z.infer<typeof allocationStoppedSummarySchema>;
-
 export const stoppedAllocationStateSchema = z
   .object({
     kind: z.literal('stopped'),
@@ -167,9 +164,6 @@ export const allocatedAllocationStateSchema = z
     idleAt: timestamp.nullable(),
   })
   .strict();
-
-export const allocationStopStepSchema = z.enum(['destroying', 'check_required']);
-export type AllocationStopStep = z.infer<typeof allocationStopStepSchema>;
 
 const stoppingBase = {
   kind: z.literal('stopping'),
@@ -223,13 +217,11 @@ export const allocationStateSchema = z.union([
 ]);
 
 export type AllocationState = z.infer<typeof allocationStateSchema>;
-export type StoppedAllocation = z.infer<typeof stoppedAllocationStateSchema>;
 export type CreatingAllocation = z.infer<typeof creatingAllocationStateSchema>;
 export type AllocatedAllocation = z.infer<typeof allocatedAllocationStateSchema>;
 export type StoppingAllocation = z.infer<typeof stoppingAllocationStateSchema>;
 export type StoppingDestroying = z.infer<typeof stoppingDestroyingStateSchema>;
 export type StoppingCheckRequired = z.infer<typeof stoppingCheckRequiredStateSchema>;
-export type UnknownAllocation = z.infer<typeof unknownAllocationStateSchema>;
 
 export const allocationRecordSchema = z
   .object({
@@ -240,8 +232,6 @@ export const allocationRecordSchema = z
   .strict();
 
 export type AllocationRecord = z.infer<typeof allocationRecordSchema>;
-
-export const ALLOCATION_INITIAL_KIND = 'stopped' as const;
 
 /** Stop-vs-destroy policy (plan §4): persistent providers are never destroyed. */
 export function allocationEffect(capabilities: ProviderCapabilities): 'stop' | 'destroy' {

@@ -29,8 +29,6 @@ import type {
   SessionMessageTerminalSource,
 } from './model/session.js';
 
-export type CancelScope = 'message' | 'recovery' | 'allocation';
-
 export type AllocationCancelEvent = {
   type: 'CANCEL';
   scope: 'allocation';
@@ -54,9 +52,6 @@ export type SessionCancelEvent = {
   /** When an ambiguous dispatch must be reconciled by; derived when absent. */
   deadlineAt?: number;
 };
-
-/** Any `CANCEL` event; the scope selects the owning machine. */
-export type CancelEvent = AllocationCancelEvent | HealthCancelEvent | SessionCancelEvent;
 
 /** Uniform fence for an allocation result event. */
 export type ResultFence = {
@@ -241,8 +236,6 @@ export type SessionEvent =
   | SessionCancelEvent
   | StoppedEvent
   | { type: 'DEADLINE' };
-
-export type SandboxStateEvent = AllocationInputEvent | SessionEvent;
 
 /**
  * True when the event is owned by the health submachine, not the allocation.
