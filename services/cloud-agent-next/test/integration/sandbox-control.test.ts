@@ -5949,11 +5949,7 @@ describe('SandboxControl acquisition receipts', () => {
             wrapperInstanceId: string,
             confirmed: boolean
           ) => Promise<boolean>;
-          afterCanonicalCommit: (
-            from: AllocationRecord,
-            to: AllocationRecord,
-            cause: string
-          ) => Promise<void>;
+          afterCanonicalCommit: (from: AllocationRecord, to: AllocationRecord) => Promise<void>;
         };
         vi.spyOn(target, 'invalidateTerminalRuntime').mockImplementation(
           async (wrapperInstanceId, confirmed) => {
@@ -5961,7 +5957,7 @@ describe('SandboxControl acquisition receipts', () => {
             return true;
           }
         );
-        await target.afterCanonicalCommit(allocated, to, 'commit-test');
+        await target.afterCanonicalCommit(allocated, to);
         return seen;
       });
 

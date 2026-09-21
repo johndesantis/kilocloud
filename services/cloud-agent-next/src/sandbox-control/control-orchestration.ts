@@ -16,6 +16,7 @@ import {
   type AllocationController,
   type AllocationDecision,
 } from './allocation-controller.js';
+import type { AllocationTransition } from './allocation-transition.js';
 import { runCommands, type ControlEffectPort } from './control-effects.js';
 
 export type ControlOrchestratorDeps = {
@@ -32,6 +33,8 @@ export type ControlOrchestratorDeps = {
   shouldDeferRecovery?: () => boolean;
   /** Bound on dispatch→run cycles; guards a reducer/runner that re-emits forever. */
   maxSteps?: number;
+  /** Optional sink for each committed, non-no-op transition the controller reports. */
+  onTransition?: (transition: AllocationTransition) => void;
 };
 
 export type ControlOrchestrator = {
@@ -60,6 +63,7 @@ export function createControlOrchestrator(deps: ControlOrchestratorDeps): Contro
     storage: deps.storage,
     now: deps.now,
     resumable: deps.resumable,
+    onTransition: deps.onTransition,
   });
   const maxSteps = deps.maxSteps ?? DEFAULT_MAX_STEPS;
 

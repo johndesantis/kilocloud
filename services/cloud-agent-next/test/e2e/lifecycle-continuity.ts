@@ -74,6 +74,7 @@ import {
 import {
   readIdleStopEvidence,
   readWorkerLogSnapshot,
+  resolveOwnedIdleStopAllocation,
   waitForWorkerLogEvidence,
   type LogRecord,
 } from './idle-stop-evidence.js';
@@ -350,7 +351,14 @@ function describeRecord(record: LogRecord | undefined): string {
   if (!record) return 'none';
   const fields = [
     'diagnosticEvent',
-    'deadlineId',
+    'aggregate',
+    'from',
+    'to',
+    'event',
+    'deadline',
+    'reason',
+    'incarnation',
+    'allocationId',
     'deadlineAt',
     'latenessMs',
     'connectionId',
@@ -363,14 +371,8 @@ function describeRecord(record: LogRecord | undefined): string {
     'lastReceivedHeartbeatAt',
     'armedAt',
     'armedExpiryAt',
-    'cause',
-    'outcome',
-    'committedAt',
     'sessionState',
     'sessionWaitingOn',
-    'stopCause',
-    'fromState',
-    'toState',
   ];
   return fields
     .filter(field => record[field] !== undefined)
@@ -423,9 +425,7 @@ async function captureConnectionIdentity(
       record.sandboxId === sandboxId &&
       typeof record.connectionId === 'string' &&
       typeof record.wrapperInstanceId === 'string' &&
-      (record.diagnosticEvent === 'handshake_committed' ||
-        record.diagnosticEvent === 'heartbeat' ||
-        record.diagnosticEvent === 'recovery_outcome'),
+      (record.diagnosticEvent === 'handshake_committed' || record.diagnosticEvent === 'heartbeat'),
   });
   if (records.length === 0) {
     throw new Error(
@@ -475,21 +475,34 @@ export type FaultClassification = {
 };
 
 /**
- * Classify the induced fault from framed worker records for one identity using
- * the chunk-1b recovery chain. The FIRST committed `recovery_outcome`
- * (`outcome=started`) in the injection window decides:
+ * Classify the induced fault from framed worker records for one identity. The
+ * FIRST committed recovery start — an `allocation_transition` into
+ * `allocated.recovering` that did not start from `allocated.recovering` — decides:
  *
- * - `cause=heartbeat_expired` additionally requires a preceding identity-matched
- *   `deadline_fired deadlineId=heartbeatExpiry`;
- * - `cause=control_disconnected` is a disconnect (a preceding heartbeatExpiry
- *   `deadline_fired` that committed nothing does not change that).
+ * - `from === 'allocated.healthy'` with `event=deadline` is a heartbeat expiry
+ *   (the alarm's `DEADLINE`);
+ * - `from === 'allocated.healthy'` with `event=health_observed` is a disconnect
+ *   (the socket-closed `HEALTH_OBSERVED`);
+ * - any other `from` or `event` is ambiguous.
  *
- * When the window holds no identity-matched `recovery_outcome` and no matched
- * heartbeatExpiry `deadline_fired` the result is `none` (no failure observed).
- * Any other missing/ambiguous chain, a heartbeat start without a preceding
- * matched deadline, or an unclassified cause is `inconclusive`. There is no
- * timestamp-only fallback.
+ * When the window holds no identity-matched recovery evidence at all the result
+ * is `none` (no failure observed); recovery evidence with no start is
+ * `inconclusive`. The first start decides, so an earlier ambiguous start cannot
+ * be skipped in favour of a later classifiable one. There is no timestamp-only
+ * fallback.
  */
+function isRecoveringRecord(record: LogRecord): boolean {
+  return (
+    record.diagnosticEvent === 'allocation_transition' &&
+    record.aggregate === 'allocation' &&
+    record.to === 'allocated.recovering'
+  );
+}
+
+function isRecoveryStart(record: LogRecord): boolean {
+  return isRecoveringRecord(record) && record.from !== 'allocated.recovering';
+}
+
 export function classifyFault(
   records: LogRecord[],
   identity: ConnectionIdentity
@@ -497,51 +510,37 @@ export function classifyFault(
   const matched = records.filter(
     record => isControlRecord(record) && matchesConnection(record, identity)
   );
-  const hasFailureEvidence = matched.some(
-    record =>
-      record.diagnosticEvent === 'recovery_outcome' ||
-      (record.diagnosticEvent === 'deadline_fired' && record.deadlineId === 'heartbeatExpiry')
-  );
-  if (!hasFailureEvidence) {
-    return {
-      kind: 'none',
-      summary: 'no identity-matched failure evidence in the injection window',
-    };
-  }
-  const firstStartedIndex = matched.findIndex(
-    record => record.diagnosticEvent === 'recovery_outcome' && record.outcome === 'started'
-  );
-  if (firstStartedIndex === -1) {
-    return {
-      kind: 'inconclusive',
-      summary:
-        'identity-matched failure evidence exists but no recovery_outcome outcome=started in the injection window',
-    };
-  }
-  const started = matched[firstStartedIndex] as LogRecord;
-  const cause = typeof started.cause === 'string' ? started.cause : 'unknown';
-  if (cause === 'heartbeat_expired') {
-    const deadlineIndex = matched.findIndex(
-      record =>
-        record.diagnosticEvent === 'deadline_fired' && record.deadlineId === 'heartbeatExpiry'
-    );
-    if (deadlineIndex === -1 || deadlineIndex > firstStartedIndex) {
+  const starts = matched.filter(isRecoveryStart);
+  if (starts.length === 0) {
+    if (!matched.some(isRecoveringRecord)) {
       return {
-        kind: 'inconclusive',
-        summary: `heartbeat_expired recovery_outcome started without a preceding matched heartbeatExpiry deadline_fired; ${describeRecord(started)}`,
+        kind: 'none',
+        summary: 'no identity-matched failure evidence in the injection window',
       };
     }
     return {
-      kind: 'heartbeat_expiry',
-      summary: `${describeRecord(matched[deadlineIndex])} followed by ${describeRecord(started)}`,
+      kind: 'inconclusive',
+      summary:
+        'identity-matched recovery evidence exists but no recovery start in the injection window',
     };
   }
-  if (cause === 'control_disconnected') {
+  const started = starts[0];
+  const from = typeof started.from === 'string' ? started.from : 'unknown';
+  if (from !== 'allocated.healthy') {
+    return {
+      kind: 'inconclusive',
+      summary: `first recovery start from=${from} is not a classified fault; ${describeRecord(started)}`,
+    };
+  }
+  if (started.event === 'deadline') {
+    return { kind: 'heartbeat_expiry', summary: describeRecord(started) };
+  }
+  if (started.event === 'health_observed') {
     return { kind: 'disconnect', summary: describeRecord(started) };
   }
   return {
     kind: 'inconclusive',
-    summary: `first committed recovery_outcome cause=${cause} is not a classified fault; ${describeRecord(started)}`,
+    summary: `first recovery start from=allocated.healthy event=${String(started.event)} is not a classified fault; ${describeRecord(started)}`,
   };
 }
 
@@ -576,15 +575,14 @@ async function waitForEngagedFault(
       ),
       match: record =>
         isControlRecord(record) &&
-        record.diagnosticEvent === 'recovery_outcome' &&
-        record.outcome === 'started' &&
+        isRecoveryStart(record) &&
         matchesConnection(record, input.connection),
     });
     if (late) {
-      // The first snapshot can predate a deadline/recovery pair that both
-      // committed during the extra wait. Reread the whole framed window so the
-      // complete ordered chain is classified, not just the late outcome
-      // appended after the old records.
+      // The first snapshot can predate a recovery start that committed during
+      // the extra wait. Reread the whole framed window so the complete ordered
+      // chain is classified, not just the late start appended after the old
+      // records.
       records = await readWorkerLogSnapshot({
         fromByte: input.fromByte,
         match: isControlRecord,
@@ -612,20 +610,29 @@ async function waitForAutomaticIdleStop(
 ): Promise<{ evidence: IdleEvidence; cursor: { fromByte: number; capturedAt: number } }> {
   const cursor = await captureLogCursor();
   const budgetMs = Math.min(input.budgetMs, remainingMs(resources, 'automatic idle stop'));
-  const [evidence, absent] = await resources.within('automatic idle stop', () =>
-    Promise.all([
+  const [evidence, absent] = await resources.within('automatic idle stop', async () => {
+    const startedAt = Date.now();
+    const allocation = await resolveOwnedIdleStopAllocation({
+      sandboxId: input.sandboxId,
+      fromByte: cursor.fromByte,
+      budgetMs,
+    });
+    const remainingBudgetMs = Math.max(1, budgetMs - (Date.now() - startedAt));
+    return Promise.all([
       resources.within('idle-stop log evidence', () =>
         readIdleStopEvidence({
           allocationId: input.sandboxId,
           sandboxId: input.sandboxId,
+          ...(allocation ? { allocationName: allocation.allocationName } : {}),
+          ...(allocation?.provider !== undefined ? { provider: allocation.provider } : {}),
           fromByte: cursor.fromByte,
-          budgetMs,
+          budgetMs: remainingBudgetMs,
           cursorCapturedAt: cursor.capturedAt,
         })
       ),
-      waitForSandboxPrimaryGone(input.ownedSandbox, budgetMs),
-    ])
-  );
+      waitForSandboxPrimaryGone(input.ownedSandbox, remainingBudgetMs),
+    ]);
+  });
   if (!absent) {
     throw new Error(
       `owned container ${input.ownedSandbox.id} did not stop after automatic idle stop`
@@ -1439,7 +1446,7 @@ export async function lifecycleQuestionIdleResume(args: LifecycleArgs): Promise<
         budgetMs: COLD_IDLE_BUDGET_MS,
       });
       idleLogCursor = idle.cursor.fromByte;
-      idleStartAt = idle.evidence.physicalCommittedAt;
+      idleStartAt = idle.evidence.stopInitiatedAt;
       containerDeathAt = idle.evidence.providerStopAt;
     } catch (error) {
       idleObserved = false;
@@ -2545,9 +2552,9 @@ async function assertSandboxContainerAlive(
 
 /**
  * Require the identity-matched heartbeat-expiry chain before the stop: a
- * `deadline_fired deadlineId=heartbeatExpiry` followed by a
- * `recovery_outcome cause=heartbeat_expired outcome=started`. Any other
- * classification (disconnect, none, inconclusive) fails the scenario.
+ * recovery start `allocated.healthy -> allocated.recovering` with
+ * `event=deadline`. Any other classification (disconnect, none, inconclusive)
+ * fails the scenario.
  */
 async function requireHeartbeatExpiryFault(
   resources: ScenarioResources,
@@ -2567,20 +2574,20 @@ async function requireHeartbeatExpiryFault(
 
 /**
  * The one record that proves a settled reap for this sandbox: the
- * `running -> stopping` `physical_committed` transition, with the canonical
- * unhealthy-stop reason in BOTH `cause` and `stopCause`. A later `stop_attempt`
- * does not re-state it.
+ * `allocated.* -> stopping.destroying` `allocation_transition` carrying the
+ * canonical unhealthy-stop reason. A later stop attempt does not re-state it.
  */
 export function isSettledReapStopRecord(record: LogRecord, sandboxId: string): boolean {
   const reason = SETTLED_REAP_REASON;
   return (
     isControlRecord(record) &&
-    record.diagnosticEvent === 'physical_committed' &&
+    record.diagnosticEvent === 'allocation_transition' &&
+    record.aggregate === 'allocation' &&
     record.sandboxId === sandboxId &&
-    record.fromState === 'running' &&
-    record.toState === 'stopping' &&
-    record.cause === reason &&
-    record.stopCause === reason
+    typeof record.from === 'string' &&
+    record.from.startsWith('allocated.') &&
+    record.to === 'stopping.destroying' &&
+    record.reason === reason
   );
 }
 
@@ -2600,7 +2607,7 @@ async function waitForSettledReapStop(
   );
   if (!record) {
     throw new Error(
-      `${input.label}: no physical_committed cause/stopCause=${SETTLED_REAP_REASON} for sandbox ${input.sandboxId}`
+      `${input.label}: no allocation_transition reason=${SETTLED_REAP_REASON} for sandbox ${input.sandboxId}`
     );
   }
   return record;

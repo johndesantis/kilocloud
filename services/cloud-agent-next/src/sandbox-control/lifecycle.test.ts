@@ -548,9 +548,11 @@ describe('SandboxControl lifecycle boundaries', () => {
       );
       expect(fields).toHaveBeenCalledWith(
         expect.objectContaining({
-          diagnosticEvent: 'physical_committed',
+          diagnosticEvent: 'allocation_transition',
+          aggregate: 'allocation',
           sandboxId: SANDBOX_ID,
-          physicalSandboxId: canonicalAllocationName(physical),
+          from: 'stopped',
+          to: 'creating',
         })
       );
       await h.control.beginStop('idle');
@@ -1496,55 +1498,61 @@ describe('SandboxControl lifecycle boundaries', () => {
 
     it('applies exactly one loss commit under overlapping terminal probes', async () => {
       const { h, original, runtime } = await killedRuntime();
-      const probes: { promise: Promise<boolean>; resolve: (value: boolean) => void }[] = [];
-      const enteredA = deferred<void>();
-      const enteredB = deferred<void>();
-      runtime.isContainerRunning.mockImplementation(() => {
-        const probe = deferred<boolean>();
-        probes.push(probe);
-        if (probes.length === 1) enteredA.resolve();
-        if (probes.length === 2) enteredB.resolve();
-        return probe.promise;
-      });
+      const fields = vi.spyOn(logger, 'withFields').mockReturnValue(logger);
+      const lossCommits = () =>
+        fields.mock.calls
+          .map(([record]) => record)
+          .filter(
+            record =>
+              record.diagnosticEvent === 'allocation_transition' &&
+              record.aggregate === 'allocation' &&
+              typeof record.from === 'string' &&
+              record.from.startsWith('allocated.') &&
+              record.to === 'stopped'
+          );
+      try {
+        const probes: { promise: Promise<boolean>; resolve: (value: boolean) => void }[] = [];
+        const enteredA = deferred<void>();
+        const enteredB = deferred<void>();
+        runtime.isContainerRunning.mockImplementation(() => {
+          const probe = deferred<boolean>();
+          probes.push(probe);
+          if (probes.length === 1) enteredA.resolve();
+          if (probes.length === 2) enteredB.resolve();
+          return probe.promise;
+        });
 
-      const attemptA = { id: 'attempt_a', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
-      const attemptB = { id: 'attempt_b', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
-      const acquiringA = h.acquire(attemptA);
-      await enteredA.promise;
-      const acquiringB = h.acquire(attemptB);
-      await enteredB.promise;
-      expect(probes).toHaveLength(2);
+        const attemptA = { id: 'attempt_a', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
+        const attemptB = { id: 'attempt_b', deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
+        const acquiringA = h.acquire(attemptA);
+        await enteredA.promise;
+        const acquiringB = h.acquire(attemptB);
+        await enteredB.promise;
+        expect(probes).toHaveLength(2);
 
-      // A provider-terminal observation settles the allocation straight to
-      // `stopped`; the dead runtime needs no destroy.
-      probes[0].resolve(false);
-      await drainMicrotasks();
-      const first = await h.control.getTransitionLog();
-      expect(
-        first.filter(
-          row => row.kind === 'physical' && row.from === 'running' && row.to === 'stopped'
-        )
-      ).toHaveLength(1);
-      expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
-      expect(runtime.destroy).not.toHaveBeenCalled();
+        // A provider-terminal observation settles the allocation straight to
+        // `stopped`; the dead runtime needs no destroy.
+        probes[0].resolve(false);
+        await drainMicrotasks();
+        expect(lossCommits()).toHaveLength(1);
+        expect((await h.control.getAllocationRecord()).state.kind).toBe('stopped');
+        expect(runtime.destroy).not.toHaveBeenCalled();
 
-      // The overlapping second probe observes the same (now settled) record and
-      // must not apply a duplicate commit.
-      probes[1].resolve(false);
-      await drainMicrotasks();
-      const second = await h.control.getTransitionLog();
-      expect(
-        second.filter(
-          row => row.kind === 'physical' && row.from === 'running' && row.to === 'stopped'
-        )
-      ).toHaveLength(1);
+        // The overlapping second probe observes the same (now settled) record and
+        // must not apply a duplicate commit.
+        probes[1].resolve(false);
+        await drainMicrotasks();
+        expect(lossCommits()).toHaveLength(1);
 
-      await Promise.allSettled([acquiringA, acquiringB]);
+        await Promise.allSettled([acquiringA, acquiringB]);
 
-      await h.acquire({ ...attemptA, id: 'attempt_c' });
-      const replacement = await h.ready();
-      expect(replacement.providerInstanceId).not.toBe(original.providerInstanceId);
-      expect(mocks.providerCreate).toHaveBeenCalledTimes(2);
+        await h.acquire({ ...attemptA, id: 'attempt_c' });
+        const replacement = await h.ready();
+        expect(replacement.providerInstanceId).not.toBe(original.providerInstanceId);
+        expect(mocks.providerCreate).toHaveBeenCalledTimes(2);
+      } finally {
+        fields.mockRestore();
+      }
     });
 
     it('does not probe while a ready wrapper is reused', async () => {

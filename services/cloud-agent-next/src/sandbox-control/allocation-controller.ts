@@ -22,6 +22,11 @@ import { decideAllocation } from '../sandbox-state/allocation/reduce.js';
 import { loadAllocation } from '../sandbox-state/persist/load.js';
 import { storeAllocation, type CanonicalStorage } from '../sandbox-state/persist/store.js';
 import { SandboxAcquisitionLostError } from '../shared/sandbox-control-protocol.js';
+import {
+  allocationTransitionChanged,
+  buildAllocationTransition,
+  type AllocationTransition,
+} from './allocation-transition.js';
 
 /** Receipt key used by the live DO today; kept identical for the cutover. */
 export const ACQUISITION_RECEIPTS_KEY = 'acquisition_receipts';
@@ -88,6 +93,12 @@ export type AllocationControllerDeps = {
    * recovery-opening event that lacks one. Defaults to `crypto.randomUUID`.
    */
   mintEpisodeId?: () => string;
+  /**
+   * Optional sink for a committed, non-no-op transition. Called after the store.
+   * Assertion-free: a failure inside the predicate, the builder or this callback
+   * must never block the committed decision's commands.
+   */
+  onTransition?: (transition: AllocationTransition) => void;
 };
 
 export type AllocationDecision = {
@@ -157,6 +168,28 @@ function withEpisodeId(event: AllocationInputEvent, mint: () => string): Allocat
   }
 }
 
+/**
+ * Report one committed decision. The predicate, the builder and the injected
+ * callback all run inside the guard: a comparison, build or callback failure
+ * must never block the commands the stored decision already committed.
+ */
+function reportAllocationTransition(
+  deps: AllocationControllerDeps,
+  from: AllocationRecord,
+  decision: AllocationDecision,
+  event: AllocationInputEvent,
+  at: number
+): void {
+  const onTransition = deps.onTransition;
+  if (onTransition === undefined) return;
+  try {
+    if (!allocationTransitionChanged(from, decision.state, decision.commands)) return;
+    onTransition(buildAllocationTransition(from, decision.state, event, decision.deadlineAt, at));
+  } catch {
+    return;
+  }
+}
+
 export function createAllocationController(deps: AllocationControllerDeps): AllocationController {
   const clock = deps.now ?? (() => Date.now());
   const receiptsKey = deps.receiptsKey ?? ACQUISITION_RECEIPTS_KEY;
@@ -175,9 +208,11 @@ export function createAllocationController(deps: AllocationControllerDeps): Allo
     async dispatch(event, now) {
       const at = now ?? clock();
       const record = await load();
-      const decision = decideAllocation(record, withEpisodeId(event, mintEpisodeId), at);
+      const effectiveEvent = withEpisodeId(event, mintEpisodeId);
+      const decision = decideAllocation(record, effectiveEvent, at);
       if (decision === undefined) return undefined;
       await storeAllocation(deps.storage, decision.state);
+      reportAllocationTransition(deps, record, decision, effectiveEvent, at);
       return {
         state: decision.state,
         commands: decision.commands,

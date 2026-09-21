@@ -4,7 +4,7 @@ import type { AttachSessionInput, SandboxControl } from '../../src/persistence/S
 import { getSandboxSessionStub } from '../../src/sandbox-session/session-stub.js';
 import { createMemoryProviderAdapter } from '../../src/sandbox-control/provider.js';
 import { encodeCloudflareProviderRef } from '../../src/sandbox-control/cloudflare-provider.js';
-import { loadTransitionLog } from '../../src/sandbox-control/durable-state.js';
+import { ALLOCATION_TRANSITION_EVENT } from '../../src/sandbox-control/allocation-transition.js';
 import { readCanonicalAllocationRecord } from '../../src/sandbox-state/persist/access.js';
 import type { AllocationRecord } from '../../src/sandbox-state/model/allocation.js';
 import { seedCanonicalRunning } from './canonical-allocation-fixtures.js';
@@ -15,6 +15,24 @@ const kiloToken = 'allocation-machine-kilo-token';
 
 async function readState(storage: Parameters<typeof readCanonicalAllocationRecord>[0]) {
   return (await readCanonicalAllocationRecord(storage)) as AllocationRecord | undefined;
+}
+
+/**
+ * Capture the canonical transitions reported from the single dispatch boundary
+ * by shadowing the DO's private `logDiagnostic` with a direct assignment (the
+ * same pattern the stale-fence test uses for `controller.dispatch`).
+ */
+function captureAllocationTransitions(instance: SandboxControl): Array<Record<string, unknown>> {
+  const emissions: Array<Record<string, unknown>> = [];
+  const target = instance as unknown as {
+    logDiagnostic(event: string, fields: Record<string, unknown>, level?: 'info' | 'warn'): void;
+  };
+  const original = target.logDiagnostic.bind(instance);
+  target.logDiagnostic = (event, fields, level) => {
+    if (event === ALLOCATION_TRANSITION_EVENT) emissions.push(fields);
+    original(event, fields, level);
+  };
+  return emissions;
 }
 
 function installMemoryProvider(
@@ -92,6 +110,7 @@ describe('sandbox allocation machine (live wiring)', () => {
     const stub = env.SANDBOX_CONTROL.getByName(`ses-${crypto.randomUUID().replaceAll('-', '')}`);
     await runInDurableObject(stub, async (instance, state) => {
       const provider = installMemoryProvider(instance);
+      const emissions = captureAllocationTransitions(instance);
       const providerRef = encodeCloudflareProviderRef({
         sandboxId: instance.sandboxId,
         containment: true,
@@ -112,14 +131,7 @@ describe('sandbox allocation machine (live wiring)', () => {
 
       await instance.alarm();
       expect((await readState(state.storage))?.state.kind).toBe('stopped');
-      const log = await loadTransitionLog(state.storage);
-      const idleStops = log.filter(
-        row =>
-          row.kind === 'physical' &&
-          row.from === 'running' &&
-          row.to === 'stopped' &&
-          row.cause === 'deadline'
-      );
+      const idleStops = emissions.filter(fields => fields.to === 'stopped');
       expect(idleStops).toHaveLength(1);
       expect(provider.lastLeaseMs).toBeDefined();
     });
@@ -160,6 +172,7 @@ describe('sandbox allocation machine (live wiring)', () => {
     const stub = env.SANDBOX_CONTROL.getByName(`ses-${crypto.randomUUID().replaceAll('-', '')}`);
     await runInDurableObject(stub, async (instance, state) => {
       installMemoryProvider(instance);
+      const emissions = captureAllocationTransitions(instance);
       const sessionId = `workspace_${crypto.randomUUID()}`;
       const kiloSessionId = `ses_${crypto.randomUUID().replaceAll('-', '').slice(0, 26)}`;
       await instance.initializeOwner(ownerId);
@@ -224,22 +237,22 @@ describe('sandbox allocation machine (live wiring)', () => {
       if (replacement?.state.kind !== 'stopping') return;
       expect(replacement.state.step).toBe('destroying');
 
-      const stoppedRows = async () =>
-        (await loadTransitionLog(state.storage)).filter(
-          row => row.kind === 'physical' && row.to === 'stopped'
-        ).length;
-      const before = await stoppedRows();
+      const stoppedEmissions = () => emissions.filter(fields => fields.to === 'stopped').length;
+      const before = stoppedEmissions();
+      // The first allocation's `confirmStopped` must have produced the terminal
+      // emission, so the stale-fence check below is not vacuous.
+      expect(before).toBeGreaterThanOrEqual(1);
 
       // The old allocation's real confirmation must be fenced out: unchanged
       // replacement state and no second terminalization.
       await controller.dispatch(staleConfirmation);
       expect(await readState(state.storage)).toEqual(replacement);
-      expect(await stoppedRows()).toBe(before);
+      expect(stoppedEmissions()).toBe(before);
 
       // A duplicate stale result must not terminalize either.
       await controller.dispatch(staleConfirmation);
       expect(await readState(state.storage)).toEqual(replacement);
-      expect(await stoppedRows()).toBe(before);
+      expect(stoppedEmissions()).toBe(before);
     });
   });
 });

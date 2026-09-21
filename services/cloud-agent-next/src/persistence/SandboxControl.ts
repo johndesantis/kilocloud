@@ -153,11 +153,15 @@ import {
   connectionTransition,
   credentialTransition,
   deadlineTransition,
-  physicalTransition,
   routeTransition,
   sessionStateTransition,
   type TransitionRow,
 } from '../sandbox-control/transition-log.js';
+import {
+  ALLOCATION_TRANSITION_EVENT,
+  allocationTransitionFields,
+  type AllocationTransition,
+} from '../sandbox-control/allocation-transition.js';
 import {
   eraseSandboxRecord,
   loadAllocation,
@@ -187,7 +191,6 @@ import { verifyRuntimeCredentialProxyHandle } from '../runtime-credential-proxy.
 import {
   CONTROL_DIAGNOSTIC_STRING_CHARSET,
   CONTROL_DIAGNOSTIC_STRING_MAX_LENGTH,
-  diagnosticCause,
   diagnosticConnection,
   diagnosticEventType,
   logControlDiagnostic,
@@ -297,12 +300,6 @@ function canonicalStopWrapperInstanceId(record: AllocationRecord): string | unde
   return canonicalStopIntent(record)?.wrapperInstanceId;
 }
 
-/** Stop cleanup attempts already spent, only when a canonical stop intent is attached. */
-function canonicalStopAttempts(record: AllocationRecord): number | undefined {
-  const state = record.state;
-  if (state.kind === 'stopping') return state.attempts;
-  return state.kind === 'unknown' && state.stopIntent !== null ? state.attempts : undefined;
-}
 /** The legacy flat allocation label for a canonical record (public status only). */
 function legacyPhysicalState(record: AllocationRecord): PhysicalState {
   const state = record.state;
@@ -380,10 +377,6 @@ function canonicalStopEvent(
   }
   if (state.kind === 'creating' || state.kind === 'unknown') return { type: 'DEADLINE' };
   return undefined;
-}
-
-function canonicalStopCause(record: AllocationRecord): string {
-  return record.state.kind === 'stopping' ? record.state.stopIntent.reason : 'stop attempt';
 }
 
 type PersistedWrapperRuntime = SandboxControlConnectionIdentity & {
@@ -586,6 +579,7 @@ export class SandboxControl extends DurableObject<Env> {
       }),
       resumable: this.provider.resumable,
       shouldDeferRecovery: () => this.shouldDeferRecovery(),
+      onTransition: transition => this.recordAllocationTransition(transition),
     });
     this.healthController = createHealthController({
       dispatch: (event, now) => this.allocationOrchestrator.dispatch(event, now),
@@ -595,6 +589,14 @@ export class SandboxControl extends DurableObject<Env> {
   /** The canonical allocation machine: the single dispatcher for allocation and health. */
   private get allocationController(): AllocationController {
     return this.allocationOrchestrator.controller;
+  }
+
+  /** One structured line per committed, non-no-op allocation/health transition. */
+  private recordAllocationTransition(transition: AllocationTransition): void {
+    this.logDiagnostic(ALLOCATION_TRANSITION_EVENT, {
+      ...allocationTransitionFields(transition),
+      ...diagnosticConnection(this.activeConnection),
+    });
   }
 
   /**
@@ -619,7 +621,7 @@ export class SandboxControl extends DurableObject<Env> {
     const decision = await this.healthController.observe(observation);
     if (decision !== undefined) {
       await this.allocationOrchestrator.run(decision.commands);
-      await this.afterCanonicalCommit(before, await this.readCanonicalAllocation(), 'health');
+      await this.afterCanonicalCommit(before, await this.readCanonicalAllocation());
     }
     await this.scheduleAlarm();
   }
@@ -767,7 +769,7 @@ export class SandboxControl extends DurableObject<Env> {
     const decision = await this.allocationOrchestrator.dispatch({ type: 'DEADLINE' }, now);
     if (decision === undefined) return;
     await this.allocationOrchestrator.run(decision.commands, now);
-    await this.afterCanonicalCommit(record, await this.readCanonicalAllocation(), 'deadline');
+    await this.afterCanonicalCommit(record, await this.readCanonicalAllocation());
   }
 
   async setWrapperCredentialHash(hash: string): Promise<void> {
@@ -1074,7 +1076,7 @@ export class SandboxControl extends DurableObject<Env> {
         await this.scheduleAlarm();
         if (!isCurrent()) throw new Error('Sandbox wrapper runtime changed');
       });
-      if (pinned) await this.afterCanonicalCommit(pinned.from, pinned.to, 'demand');
+      if (pinned) await this.afterCanonicalCommit(pinned.from, pinned.to);
     }
     if (!usesMaintenanceChannel) await this.assertRequestWorktreeAdmission(input);
     if (recoveryInteraction) await this.assertRecoveryInteraction(input, runtime, allocation);
@@ -1778,11 +1780,11 @@ export class SandboxControl extends DurableObject<Env> {
       };
     });
     if (committed.action === 'create') {
-      await this.afterCanonicalCommit(committed.from, committed.record, 'demand');
+      await this.afterCanonicalCommit(committed.from, committed.record);
     } else if (committed.action === 'advance') {
       await this.allocationOrchestrator.run(committed.commands);
       const after = await this.readCanonicalAllocation();
-      await this.afterCanonicalCommit(committed.from, after, 'demand');
+      await this.afterCanonicalCommit(committed.from, after);
       return { action: 'wait', record: after };
     }
     return committed;
@@ -1809,7 +1811,7 @@ export class SandboxControl extends DurableObject<Env> {
       await this.scheduleAlarm();
       return { record: decision.state, from: record, commands: decision.commands };
     });
-    await this.afterCanonicalCommit(committed.from, committed.record, 'demand');
+    await this.afterCanonicalCommit(committed.from, committed.record);
     return { record: committed.record, commands: committed.commands };
   }
 
@@ -1819,7 +1821,7 @@ export class SandboxControl extends DurableObject<Env> {
     if (decision === undefined) return record;
     await this.allocationOrchestrator.run(decision.commands);
     const after = await this.readCanonicalAllocation();
-    await this.afterCanonicalCommit(record, after, 'observe_unknown');
+    await this.afterCanonicalCommit(record, after);
     return after;
   }
 
@@ -1847,7 +1849,7 @@ export class SandboxControl extends DurableObject<Env> {
     if (decision === undefined) return record;
     await this.allocationOrchestrator.run(decision.commands);
     const after = await this.readCanonicalAllocation();
-    await this.afterCanonicalCommit(record, after, 'demand');
+    await this.afterCanonicalCommit(record, after);
     return after;
   }
 
@@ -1860,7 +1862,7 @@ export class SandboxControl extends DurableObject<Env> {
     });
     if (decision === undefined) return;
     await this.allocationOrchestrator.run(decision.commands);
-    await this.afterCanonicalCommit(record, await this.readCanonicalAllocation(), reason);
+    await this.afterCanonicalCommit(record, await this.readCanonicalAllocation());
   }
 
   private async failCanonicalCreate(record: AllocationRecord, reason: string): Promise<void> {
@@ -1877,7 +1879,7 @@ export class SandboxControl extends DurableObject<Env> {
       at: Date.now(),
     });
     if (decision === undefined) return;
-    await this.afterCanonicalCommit(record, decision.state, reason);
+    await this.afterCanonicalCommit(record, decision.state);
   }
 
   /**
@@ -1903,7 +1905,7 @@ export class SandboxControl extends DurableObject<Env> {
       at: Date.now(),
     });
     if (decision === undefined) return;
-    await this.afterCanonicalCommit(record, decision.state, reason);
+    await this.afterCanonicalCommit(record, decision.state);
   }
 
   private async acquisitionStatusCanonical(
@@ -1926,21 +1928,11 @@ export class SandboxControl extends DurableObject<Env> {
 
   /**
    * Side effects of a canonical allocation commit: reset runtime metadata on a
-   * fresh create, emit the `physical_committed` diagnostic, tear down the socket
-   * for an unavailable target, and re-arm the control alarm.
+   * fresh create, tear down the socket for an unavailable target, and re-arm the
+   * control alarm. The committed transition itself is reported from the single
+   * dispatch boundary (`recordAllocationTransition`), not here.
    */
-  private async afterCanonicalCommit(
-    from: AllocationRecord,
-    to: AllocationRecord,
-    cause: string
-  ): Promise<void> {
-    const fromState = legacyPhysicalState(from);
-    const toState = legacyPhysicalState(to);
-    const fromStop = canonicalStopIntent(from);
-    const toStop = canonicalStopIntent(to);
-    // Diagnostics only. The compatibility labels may differ for the same
-    // canonical input; they must never gate a side effect.
-    const diagnosticChanged = fromState !== toState || (fromStop === null && toStop !== null);
+  private async afterCanonicalCommit(from: AllocationRecord, to: AllocationRecord): Promise<void> {
     const changed = canonicalAllocationChanged(from, to);
     const unavailable = to.state.kind !== 'creating' && to.state.kind !== 'allocated';
     const wrapperInstanceId =
@@ -1965,31 +1957,6 @@ export class SandboxControl extends DurableObject<Env> {
       // must not keep an alarm armed.
       await setControlAlarmAnchor(this.ctx.storage, 'credentialExpiry', null);
     }
-    if (diagnosticChanged) {
-      await this.appendLog(
-        physicalTransition(Date.now(), fromState, toState, cause, canonicalProviderRefOf(to))
-      );
-    }
-    const toIntentId = to.state.kind === 'stopped' ? undefined : to.state.createIntent?.intentId;
-    const fromIntentId =
-      from.state.kind === 'stopped' ? undefined : from.state.createIntent?.intentId;
-    const toAllocationName =
-      to.state.kind === 'stopped' ? undefined : to.state.target?.allocationName;
-    const fromAllocationName =
-      from.state.kind === 'stopped' ? undefined : from.state.target?.allocationName;
-    this.logDiagnostic('physical_committed', {
-      allocationId: toIntentId ?? fromIntentId,
-      physicalSandboxId: toAllocationName ?? fromAllocationName,
-      wrapperInstanceId,
-      fromState,
-      toState,
-      cause: diagnosticCause(cause),
-      stopCause: toStop ? diagnosticCause(toStop.reason) : undefined,
-      stopAttempts: canonicalStopAttempts(to) ?? canonicalStopAttempts(from),
-      cleanupAgeMs: fromStop ? Date.now() - fromStop.createdAt : undefined,
-      hasTombstone: toStop !== null,
-      ...this.forwarding,
-    });
     if (unavailable) {
       this.activeConnection = null;
       this.readyConnectionId = null;
@@ -2927,7 +2894,7 @@ export class SandboxControl extends DurableObject<Env> {
     if (decision === undefined) return this.readCanonicalAllocation();
     await this.allocationOrchestrator.run(decision.commands);
     const after = await this.readCanonicalAllocation();
-    await this.afterCanonicalCommit(record, after, reason ?? canonicalStopCause(after));
+    await this.afterCanonicalCommit(record, after);
     return after;
   }
 
@@ -4339,11 +4306,7 @@ export class SandboxControl extends DurableObject<Env> {
     });
     if (decision === undefined) return;
     await this.allocationOrchestrator.run(decision.commands);
-    await this.afterCanonicalCommit(
-      record,
-      await this.readCanonicalAllocation(),
-      'observe:terminal'
-    );
+    await this.afterCanonicalCommit(record, await this.readCanonicalAllocation());
   }
 
   private sameConnection(

@@ -16,15 +16,6 @@ export type TransitionKind =
 /** Infrastructure alarm anchors still recorded on the transition log. */
 export type DeadlineId = 'credentialExpiry' | 'socketHandshake';
 
-/** Legacy flat allocation labels; the transition log predates the canonical kinds. */
-export type FlatAllocationState =
-  | 'stopped'
-  | 'creating'
-  | 'running'
-  | 'stopping'
-  | 'failed'
-  | 'unknown';
-
 export type DeadlineAction = 'armed' | 'cancelled' | 'fired';
 
 export type TransitionRow = {
@@ -56,16 +47,6 @@ export function trimTransitionLog(log: TransitionRow[], now: number): Transition
   const aged = log.filter(row => row.at >= minAt);
   if (aged.length <= TRANSITION_LOG_MAX_ROWS) return aged;
   return aged.slice(aged.length - TRANSITION_LOG_MAX_ROWS);
-}
-
-export function physicalTransition(
-  at: number,
-  from: FlatAllocationState,
-  to: FlatAllocationState,
-  cause: string,
-  providerRef: string | null
-): TransitionRow {
-  return { at, kind: 'physical', from, to, cause, providerRef };
 }
 
 export function connectionTransition(

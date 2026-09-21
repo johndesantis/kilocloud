@@ -4,6 +4,7 @@ import type { AcquireEvent, AllocationInputEvent } from '../sandbox-state/events
 import { ALLOCATION_KEY, type CanonicalStorage } from '../sandbox-state/persist/store.js';
 import type { ControlEffectPort } from './control-effects.js';
 import { createControlOrchestrator } from './control-orchestration.js';
+import type { AllocationTransition } from './allocation-transition.js';
 
 const NOW = 1_000_000;
 const INTENT_ID = 'intent-1';
@@ -153,5 +154,30 @@ describe('control orchestration — run step', () => {
 
     expect(calls).toContain('destroy');
     expect(read()?.state.kind).toBe('stopped');
+  });
+
+  it('reports each intermediate drain transition in order', async () => {
+    const { storage } = memoryStorage(undefined);
+    const calls: string[] = [];
+    const transitions: AllocationTransition[] = [];
+    const orchestrator = createControlOrchestrator({
+      storage,
+      effects: fakePort(calls),
+      now: () => NOW,
+      onTransition: transition => transitions.push(transition),
+    });
+
+    const decision = await orchestrator.dispatch(ACQUIRE, NOW);
+    await orchestrator.run(decision?.commands ?? [], NOW);
+
+    expect(calls).toEqual(['create', 'launch']);
+    expect(transitions.map(transition => `${transition.from}->${transition.to}`)).toEqual([
+      'stopped->creating',
+      'creating->allocated.connecting',
+    ]);
+    expect(transitions.map(transition => transition.event)).toEqual([
+      'acquire',
+      'create_confirmed',
+    ]);
   });
 });

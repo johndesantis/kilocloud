@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { Command } from '../sandbox-state/commands.js';
+import type { AllocationInputEvent } from '../sandbox-state/events.js';
 import { decideAllocation } from '../sandbox-state/allocation/reduce.js';
 import type { AllocationRecord, AllocationTarget } from '../sandbox-state/model/allocation.js';
 import { allocationRecordSchema } from '../sandbox-state/model/allocation.js';
@@ -11,6 +13,41 @@ import {
   MAX_ACQUISITION_CLEANUP_REOPENS,
   createAllocationController,
 } from './allocation-controller.js';
+import type { AllocationTransition } from './allocation-transition.js';
+
+type AllocationTransitionChanged = (
+  from: AllocationRecord,
+  to: AllocationRecord,
+  commands: readonly Command[]
+) => boolean;
+
+type BuildAllocationTransition = (
+  from: AllocationRecord,
+  to: AllocationRecord,
+  event: AllocationInputEvent,
+  deadlineAt: number | null,
+  at: number
+) => AllocationTransition;
+
+const transitionFaults = vi.hoisted(() => ({ comparisonThrows: false, buildThrows: false }));
+
+vi.mock('./allocation-transition.js', async () => {
+  const actual = (await vi.importActual('./allocation-transition.js')) as {
+    allocationTransitionChanged: AllocationTransitionChanged;
+    buildAllocationTransition: BuildAllocationTransition;
+  };
+  return {
+    ...actual,
+    allocationTransitionChanged: ((from, to, commands) => {
+      if (transitionFaults.comparisonThrows) throw new Error('comparison failed');
+      return actual.allocationTransitionChanged(from, to, commands);
+    }) satisfies AllocationTransitionChanged,
+    buildAllocationTransition: ((from, to, event, deadlineAt, at) => {
+      if (transitionFaults.buildThrows) throw new Error('build failed');
+      return actual.buildAllocationTransition(from, to, event, deadlineAt, at);
+    }) satisfies BuildAllocationTransition,
+  };
+});
 
 const NOW = 1_000_000;
 const INC = 'inc-1';
@@ -83,10 +120,26 @@ function stoppingCheckRequiredRecord(): AllocationRecord {
   };
 }
 
+function creatingRecord(): AllocationRecord {
+  return {
+    v: 2,
+    resumable: true,
+    state: {
+      kind: 'creating',
+      requestId: 'req-1',
+      target: TARGET,
+      createIntent: CREATE_INTENT,
+      attempt: 1,
+      deadlineAt: NOW + POLICY.createDeadlineMs,
+    },
+  };
+}
+
 function controllerFor(
   record: AllocationRecord | null,
   now = NOW,
-  mintEpisodeId: () => string = () => EPISODE_ID
+  mintEpisodeId: () => string = () => EPISODE_ID,
+  onTransition?: (transition: AllocationTransition) => void
 ) {
   const data = new Map<string, unknown>();
   if (record) data.set(ALLOCATION_KEY, record);
@@ -94,7 +147,12 @@ function controllerFor(
   return {
     data,
     storage,
-    controller: createAllocationController({ storage, now: () => now, mintEpisodeId }),
+    controller: createAllocationController({
+      storage,
+      now: () => now,
+      mintEpisodeId,
+      onTransition,
+    }),
   };
 }
 
@@ -284,5 +342,152 @@ describe('allocation controller — cleanup reopen ledger', () => {
     expect(refilled).toHaveLength(MAX_ACQUISITION_CLEANUP_REOPENS);
     expect(refilled.some(marker => marker.id === 'acq-33')).toBe(true);
     expect(refilled.some(marker => marker.id === 'acq-0')).toBe(false);
+  });
+});
+
+describe('allocation controller — transition emission', () => {
+  afterEach(() => {
+    transitionFaults.comparisonThrows = false;
+    transitionFaults.buildThrows = false;
+  });
+
+  it('reports one committed transition after the store', async () => {
+    const data = new Map<string, unknown>();
+    const storage = seededStorage(data);
+    const transitions: AllocationTransition[] = [];
+    let persistedAtCall: unknown;
+    const controller = createAllocationController({
+      storage,
+      now: () => NOW,
+      mintEpisodeId: () => EPISODE_ID,
+      onTransition: transition => {
+        persistedAtCall = data.get(ALLOCATION_KEY);
+        transitions.push(transition);
+      },
+    });
+
+    const decision = await controller.dispatch(
+      { type: 'DEMAND', requestId: 'req-1', target: TARGET, createIntent: CREATE_INTENT },
+      NOW
+    );
+
+    expect(transitions).toHaveLength(1);
+    expect(transitions[0]).toMatchObject({
+      aggregate: 'allocation',
+      from: 'stopped',
+      to: 'creating',
+      event: 'demand',
+      deadline: NOW + POLICY.createDeadlineMs,
+      at: NOW,
+      allocationId: CREATE_INTENT.intentId,
+    });
+    expect(persistedAtCall).toEqual(decision?.state);
+  });
+
+  it('does not report a rejected dispatch', async () => {
+    const onTransition = vi.fn();
+    const { controller } = controllerFor(creatingRecord(), NOW, () => EPISODE_ID, onTransition);
+
+    const decision = await controller.dispatch({ type: 'IDLE', idleAt: NOW }, NOW);
+
+    expect(decision).toBeUndefined();
+    expect(onTransition).not.toHaveBeenCalled();
+  });
+
+  it('does not report an early-DEADLINE no-op', async () => {
+    const onTransition = vi.fn();
+    const { controller } = controllerFor(creatingRecord(), NOW, () => EPISODE_ID, onTransition);
+
+    const decision = await controller.dispatch({ type: 'DEADLINE' }, NOW);
+
+    expect(decision?.commands).toEqual([]);
+    expect(onTransition).not.toHaveBeenCalled();
+  });
+
+  it('reports DEADLINE at or after the deadline', async () => {
+    const onTransition = vi.fn();
+    const record = creatingRecord();
+    const deadline = record.state.kind === 'creating' ? record.state.deadlineAt : NOW;
+    const { controller } = controllerFor(record, deadline, () => EPISODE_ID, onTransition);
+
+    await controller.dispatch({ type: 'DEADLINE' }, deadline);
+
+    expect(onTransition).toHaveBeenCalledTimes(1);
+    expect(onTransition.mock.calls[0]?.[0]).toMatchObject({
+      from: 'creating',
+      to: 'unknown',
+      event: 'deadline',
+      at: deadline,
+    });
+  });
+
+  it('reports nothing when the store rejects the decision', async () => {
+    const onTransition = vi.fn();
+    const storage: CanonicalStorage = {
+      get: async () => undefined,
+      put: async () => {
+        throw new Error('store failed');
+      },
+    };
+    const controller = createAllocationController({ storage, now: () => NOW, onTransition });
+
+    await expect(
+      controller.dispatch(
+        { type: 'DEMAND', requestId: 'req-1', target: TARGET, createIntent: CREATE_INTENT },
+        NOW
+      )
+    ).rejects.toThrow('store failed');
+    expect(onTransition).not.toHaveBeenCalled();
+  });
+
+  it('still returns the decision and commands when the callback throws', async () => {
+    const data = new Map<string, unknown>();
+    const storage = seededStorage(data);
+    const controller = createAllocationController({
+      storage,
+      now: () => NOW,
+      mintEpisodeId: () => EPISODE_ID,
+      onTransition: () => {
+        throw new Error('callback failed');
+      },
+    });
+
+    const decision = await controller.dispatch(
+      { type: 'DEMAND', requestId: 'req-1', target: TARGET, createIntent: CREATE_INTENT },
+      NOW
+    );
+
+    expect(decision?.commands.map(command => command.kind)).toEqual(['Create']);
+    expect(allocationRecordSchema.parse(data.get(ALLOCATION_KEY))).toEqual(decision?.state);
+  });
+
+  it('still returns the decision and commands when the comparison throws', async () => {
+    transitionFaults.comparisonThrows = true;
+    const onTransition = vi.fn();
+    const { controller, data } = controllerFor(null, NOW, () => EPISODE_ID, onTransition);
+
+    const decision = await controller.dispatch(
+      { type: 'DEMAND', requestId: 'req-1', target: TARGET, createIntent: CREATE_INTENT },
+      NOW
+    );
+
+    expect(decision?.commands.map(command => command.kind)).toEqual(['Create']);
+    expect(onTransition).not.toHaveBeenCalled();
+    expect(allocationRecordSchema.parse(data.get(ALLOCATION_KEY))).toEqual(decision?.state);
+  });
+
+  it('still returns the decision and commands when the builder throws', async () => {
+    transitionFaults.buildThrows = true;
+    const onTransition = vi.fn();
+    const { controller, data } = controllerFor(null, NOW, () => EPISODE_ID, onTransition);
+
+    const decision = await controller.dispatch(
+      { type: 'DEMAND', requestId: 'req-1', target: TARGET, createIntent: CREATE_INTENT },
+      NOW
+    );
+
+    expect(decision?.commands.map(command => command.kind)).toEqual(['Create']);
+    expect(onTransition).not.toHaveBeenCalled();
+    expect(allocationRecordSchema.parse(data.get(ALLOCATION_KEY))).toEqual(decision?.state);
   });
 });

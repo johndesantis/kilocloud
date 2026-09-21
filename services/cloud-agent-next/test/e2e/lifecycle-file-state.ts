@@ -38,7 +38,11 @@ import {
   requireWorktreeGate,
   waitForOwnedCompletion,
 } from './worktree-support.js';
-import { readIdleStopEvidence, CLOUD_AGENT_LOG_PATH } from './idle-stop-evidence.js';
+import {
+  readIdleStopEvidence,
+  resolveOwnedIdleStopAllocation,
+  CLOUD_AGENT_LOG_PATH,
+} from './idle-stop-evidence.js';
 import { bestEffortExportDiagnostic } from './session-export-check.js';
 
 export const FILE_STATE_SCENARIO_TIMEOUT_MS = {
@@ -808,20 +812,29 @@ export async function lifecycleColdResume(args: LifecycleArgs): Promise<Lifecycl
     });
     if (!running) throw new Error(`pre-cold container ${oldContainerId} was not running`);
     const idleBudgetMs = Math.min(COLD_IDLE_BUDGET_MS, remaining(resources, 'idle stop'));
-    const [idleEvidence, absent] = await resources.within('automatic idle stop', () =>
-      Promise.all([
+    const [idleEvidence, absent] = await resources.within('automatic idle stop', async () => {
+      const startedAt = Date.now();
+      const allocation = await resolveOwnedIdleStopAllocation({
+        sandboxId: durableSandboxId,
+        fromByte: logCursor.fromByte,
+        budgetMs: idleBudgetMs,
+      });
+      const remainingBudgetMs = Math.max(1, idleBudgetMs - (Date.now() - startedAt));
+      return Promise.all([
         resources.within('idle-stop log evidence', () =>
           readIdleStopEvidence({
             allocationId: durableSandboxId,
             sandboxId: durableSandboxId,
+            ...(allocation ? { allocationName: allocation.allocationName } : {}),
+            ...(allocation?.provider !== undefined ? { provider: allocation.provider } : {}),
             fromByte: logCursor.fromByte,
-            budgetMs: idleBudgetMs,
+            budgetMs: remainingBudgetMs,
             cursorCapturedAt: logCursor.capturedAt,
           })
         ),
-        waitForSandboxPrimaryGone(ownedSandbox, idleBudgetMs),
-      ])
-    );
+        waitForSandboxPrimaryGone(ownedSandbox, remainingBudgetMs),
+      ]);
+    });
     if (!absent)
       throw new Error(`owned container ${oldContainerId} remained running after idle stop`);
     const remainingContainers = await resources.within('post-idle container absence check', () =>

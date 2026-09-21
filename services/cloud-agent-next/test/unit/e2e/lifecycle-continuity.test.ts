@@ -25,30 +25,33 @@ function heartbeat(sandboxId: string, connectionId: string, wrapperInstanceId: s
   return control({ diagnosticEvent: 'heartbeat', sandboxId, connectionId, wrapperInstanceId });
 }
 
-function deadline(sandboxId: string, connectionId: string, wrapperInstanceId: string): LogRecord {
-  return control({
-    diagnosticEvent: 'deadline_fired',
-    deadlineId: 'heartbeatExpiry',
-    sandboxId,
-    connectionId,
-    wrapperInstanceId,
-  });
-}
-
-function recovery(
+function transition(
   sandboxId: string,
   connectionId: string,
   wrapperInstanceId: string,
-  cause: string,
-  outcome: 'started' | 'skipped'
+  overrides: LogRecord = {}
 ): LogRecord {
   return control({
-    diagnosticEvent: 'recovery_outcome',
-    cause,
-    outcome,
+    diagnosticEvent: 'allocation_transition',
+    aggregate: 'allocation',
     sandboxId,
     connectionId,
     wrapperInstanceId,
+    ...overrides,
+  });
+}
+
+function recoveryStart(
+  sandboxId: string,
+  connectionId: string,
+  wrapperInstanceId: string,
+  from: string,
+  event: string
+): LogRecord {
+  return transition(sandboxId, connectionId, wrapperInstanceId, {
+    from,
+    to: 'allocated.recovering',
+    event,
   });
 }
 
@@ -178,42 +181,31 @@ describe('matchesReconciliationIdentity', () => {
 describe('isSettledReapStopRecord', () => {
   const sandboxId = 'ses_target';
   const settledStop = (overrides: LogRecord = {}): LogRecord =>
-    control({
-      diagnosticEvent: 'physical_committed',
-      sandboxId,
-      fromState: 'running',
-      toState: 'stopping',
-      cause: healthUnhealthyReason('unresponsive'),
-      stopCause: healthUnhealthyReason('unresponsive'),
+    transition(sandboxId, 'conn_target', 'wrapper_target', {
+      from: 'allocated.healthy',
+      to: 'stopping.destroying',
+      reason: healthUnhealthyReason('unresponsive'),
       ...overrides,
     });
 
-  it('requires the tombstone reason in both cause and stopCause', () => {
+  it('requires the canonical unhealthy-stop reason', () => {
     expect(isSettledReapStopRecord(settledStop(), sandboxId)).toBe(true);
-    expect(isSettledReapStopRecord(settledStop({ stopCause: undefined }), sandboxId)).toBe(false);
-    expect(isSettledReapStopRecord(settledStop({ cause: undefined }), sandboxId)).toBe(false);
+    expect(isSettledReapStopRecord(settledStop({ reason: undefined }), sandboxId)).toBe(false);
     expect(
-      isSettledReapStopRecord(settledStop({ cause: healthUnhealthyReason('absent') }), sandboxId)
+      isSettledReapStopRecord(settledStop({ reason: healthUnhealthyReason('absent') }), sandboxId)
     ).toBe(false);
   });
 
-  it('requires the running -> stopping transition for this sandbox', () => {
-    expect(isSettledReapStopRecord(settledStop({ fromState: 'stopping' }), sandboxId)).toBe(false);
+  it('requires the allocated -> stopping.destroying transition for this sandbox', () => {
+    expect(isSettledReapStopRecord(settledStop({ from: 'stopping.destroying' }), sandboxId)).toBe(
+      false
+    );
+    expect(isSettledReapStopRecord(settledStop({ to: 'stopped' }), sandboxId)).toBe(false);
     expect(isSettledReapStopRecord(settledStop({ sandboxId: 'ses_other' }), sandboxId)).toBe(false);
-    expect(
-      isSettledReapStopRecord(
-        control({
-          diagnosticEvent: 'stop_attempt',
-          sandboxId,
-          stopCause: healthUnhealthyReason('unresponsive'),
-        }),
-        sandboxId
-      )
-    ).toBe(false);
   });
 });
 
-describe('classifyFault recovery-outcome chain', () => {
+describe('classifyFault recovery-start chain', () => {
   it('reports none when the window has no identity-matched failure evidence', () => {
     expect(classifyFault([], TARGET).kind).toBe('none');
     // Heartbeats are not failure evidence.
@@ -225,89 +217,126 @@ describe('classifyFault recovery-outcome chain', () => {
     ).toBe('none');
   });
 
-  it('does not classify an unrelated expiry as this session fault', () => {
-    // The unrelated session shares one identity field (connectionId) with the
-    // target but is a different sandbox and wrapper instance. A matcher that
-    // accepts any single shared field would wrongly attribute this expiry. For
-    // the target itself there is no failure evidence, so the result is `none`
-    // rather than an ambiguous `inconclusive`.
+  it('does not classify an unrelated recovery start as this session fault', () => {
     const records = [
       heartbeat(TARGET.sandboxId, TARGET.connectionId, TARGET.wrapperInstanceId),
-      deadline('ses_other', TARGET.connectionId, 'wrapper_other'),
-      recovery('ses_other', TARGET.connectionId, 'wrapper_other', 'heartbeat_expired', 'started'),
+      recoveryStart(
+        'ses_other',
+        TARGET.connectionId,
+        'wrapper_other',
+        'allocated.healthy',
+        'deadline'
+      ),
     ];
     const fault = classifyFault(records, TARGET);
     expect(fault.kind).not.toBe('heartbeat_expiry');
     expect(fault.kind).toBe('none');
   });
 
-  it('reports inconclusive when matched failure evidence has no committed outcome', () => {
-    // A matched heartbeatExpiry deadline with no started recovery is failure
-    // evidence whose chain is incomplete: it must not collapse to `none`
-    // (clean load) nor to a classified fault.
-    const records = [deadline(TARGET.sandboxId, TARGET.connectionId, TARGET.wrapperInstanceId)];
+  it('reports inconclusive when matched recovery evidence has no start', () => {
+    // A recovery retry stays in `allocated.recovering`: evidence exists, but no
+    // start decides the fault.
+    const records = [
+      transition(TARGET.sandboxId, TARGET.connectionId, TARGET.wrapperInstanceId, {
+        from: 'allocated.recovering',
+        to: 'allocated.recovering',
+        event: 'deadline',
+      }),
+    ];
     expect(classifyFault(records, TARGET).kind).toBe('inconclusive');
   });
 
-  it('classifies a matched heartbeatExpiry deadline followed by a started heartbeat recovery', () => {
+  it('classifies a healthy -> recovering deadline start as heartbeat expiry', () => {
     const records = [
-      deadline(TARGET.sandboxId, TARGET.connectionId, TARGET.wrapperInstanceId),
-      recovery(
+      recoveryStart(
         TARGET.sandboxId,
         TARGET.connectionId,
         TARGET.wrapperInstanceId,
-        'heartbeat_expired',
-        'started'
+        'allocated.healthy',
+        'deadline'
       ),
     ];
     expect(classifyFault(records, TARGET).kind).toBe('heartbeat_expiry');
   });
 
-  it('classifies skipped heartbeat then started disconnect as disconnect', () => {
+  it('classifies a healthy -> recovering health_observed start as disconnect', () => {
     const records = [
-      deadline(TARGET.sandboxId, TARGET.connectionId, TARGET.wrapperInstanceId),
-      recovery(
+      recoveryStart(
         TARGET.sandboxId,
         TARGET.connectionId,
         TARGET.wrapperInstanceId,
-        'heartbeat_expired',
-        'skipped'
-      ),
-      recovery(
-        TARGET.sandboxId,
-        TARGET.connectionId,
-        TARGET.wrapperInstanceId,
-        'control_disconnected',
-        'started'
+        'allocated.healthy',
+        'health_observed'
       ),
     ];
     expect(classifyFault(records, TARGET).kind).toBe('disconnect');
   });
 
-  it('is inconclusive when a heartbeat recovery starts without a preceding matched deadline', () => {
+  it('is inconclusive when the first recovery start is from a non-healthy state', () => {
     const records = [
-      recovery(
+      recoveryStart(
         TARGET.sandboxId,
         TARGET.connectionId,
         TARGET.wrapperInstanceId,
-        'heartbeat_expired',
-        'started'
+        'allocated.unhealthy',
+        'deadline'
       ),
     ];
     expect(classifyFault(records, TARGET).kind).toBe('inconclusive');
   });
 
-  it('is inconclusive when only a skipped outcome exists', () => {
+  it('is inconclusive when the first recovery start has an unclassified event', () => {
     const records = [
-      deadline(TARGET.sandboxId, TARGET.connectionId, TARGET.wrapperInstanceId),
-      recovery(
+      recoveryStart(
         TARGET.sandboxId,
         TARGET.connectionId,
         TARGET.wrapperInstanceId,
-        'heartbeat_expired',
-        'skipped'
+        'allocated.healthy',
+        'create_confirmed'
       ),
     ];
     expect(classifyFault(records, TARGET).kind).toBe('inconclusive');
+  });
+
+  it('classifies by the FIRST start even when a later start is classifiable', () => {
+    // An earlier ambiguous start must not be skipped in favour of a later
+    // healthy one: the ordered sequence is the evidence.
+    const records = [
+      recoveryStart(
+        TARGET.sandboxId,
+        TARGET.connectionId,
+        TARGET.wrapperInstanceId,
+        'allocated.unhealthy',
+        'health_observed'
+      ),
+      recoveryStart(
+        TARGET.sandboxId,
+        TARGET.connectionId,
+        TARGET.wrapperInstanceId,
+        'allocated.healthy',
+        'deadline'
+      ),
+    ];
+    expect(classifyFault(records, TARGET).kind).toBe('inconclusive');
+  });
+
+  it('classifies a classifiable first start even when a later start is ambiguous', () => {
+    const records = [
+      recoveryStart(
+        TARGET.sandboxId,
+        TARGET.connectionId,
+        TARGET.wrapperInstanceId,
+        'allocated.healthy',
+        'deadline'
+      ),
+      recoveryStart(
+        TARGET.sandboxId,
+        TARGET.connectionId,
+        TARGET.wrapperInstanceId,
+        'allocated.unhealthy',
+        'health_observed'
+      ),
+    ];
+    expect(classifyFault(records, TARGET).kind).toBe('heartbeat_expiry');
   });
 });
