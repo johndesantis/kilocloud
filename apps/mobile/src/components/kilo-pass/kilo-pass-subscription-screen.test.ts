@@ -709,6 +709,59 @@ describe('KiloPassSubscriptionScreen', () => {
     renderer.unmount();
   });
 
+  it('shows one error surface and one retry when Play is unavailable and the ownership lookup failed', async () => {
+    setAndroidNativeIapPresentation();
+    mocks.nativeIap.products = [];
+    mocks.nativeIap.errorMessage =
+      'Could not connect to Google Play. Check your connection and try again.';
+    mocks.nativeIap.ownershipCheckFailed = true;
+
+    const renderer = await renderScreen();
+
+    expect(allText(renderer)).toContain('Google Play products unavailable');
+    expect(allText(renderer)).not.toContain('Could not connect to Google Play');
+
+    const buttons = renderer.root.findAll(node => String(node.type) === 'Button');
+    expect(buttons).toHaveLength(1);
+
+    await press(first(buttons));
+
+    expect(mocks.nativeIap.productsRefetch).toHaveBeenCalledTimes(1);
+    expect(mocks.nativeIap.retryOwnershipCheck).toHaveBeenCalledTimes(1);
+
+    renderer.unmount();
+  });
+
+  it('keeps the ownership error inline when the products are available', async () => {
+    setNativeIapPresentation();
+    mocks.nativeIap.products = [product];
+    mocks.nativeIap.errorMessage =
+      'Could not connect to the App Store. Check your connection and try again.';
+    mocks.nativeIap.ownershipCheckFailed = true;
+
+    const renderer = await renderScreen();
+
+    expect(allText(renderer)).toContain(
+      'Could not connect to the App Store. Check your connection and try again.'
+    );
+
+    renderer.unmount();
+  });
+
+  it('keeps a failed restore visible while the products-unavailable card is shown', async () => {
+    setAndroidNativeIapPresentation();
+    mocks.nativeIap.products = [];
+    mocks.nativeIap.errorMessage = 'Failed to restore purchases. Try again.';
+    mocks.nativeIap.ownershipCheckFailed = true;
+
+    const renderer = await renderScreen();
+
+    expect(allText(renderer)).toContain('Google Play products unavailable');
+    expect(allText(renderer)).toContain('Failed to restore purchases. Try again.');
+
+    renderer.unmount();
+  });
+
   it('does not start the purchase when the screen unmounts during preflight', async () => {
     setNativeIapPresentation();
     mocks.nativeIap.products = [product];
