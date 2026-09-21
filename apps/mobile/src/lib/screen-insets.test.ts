@@ -38,10 +38,36 @@ const PROFILE_SCREEN = '../components/profile-screen.tsx';
 /**
  * The Android sign-out confirmation deliberately renders an in-app dialog
  * instead of the native alert (see `profile-screen.signout.mounted.test.tsx`).
- * That fork is not on the insets alignment path, so it is excluded before the
- * platform check below; every other line of the screen must stay neutral.
+ * Its `Platform.OS` fork sits outside the alignment path scanned below, so the
+ * confirmation is held to its feature here: losing it must not pass silently.
  */
 const SIGN_OUT_CONFIRMATION = /const confirmSignOut = \(\) => \{[\s\S]*?\n {2}\};/;
+
+/**
+ * The Profile screen's alignment path: from the line that reads
+ * `useScreenSideInsets` through the line that first applies a side inset. Only
+ * this path must stay free of per-platform branches. A fork elsewhere in the
+ * screen — the Android sign-out confirmation, for example — is not on the
+ * insets path and must not fail the guard.
+ */
+function alignmentPath(profileSource: string): string {
+  const lines = profileSource.split('\n');
+  const start = lines.findIndex(line => line.includes('useScreenSideInsets()'));
+  if (start === -1) {
+    throw new Error(`${PROFILE_SCREEN} does not read its side insets from ${ENTRY_POINT}`);
+  }
+  const end = lines.findIndex(
+    (line, index) => index >= start && /margin(?:Left|Right|Start|End)/.test(line)
+  );
+  if (end === -1) {
+    // Naming the insets differently, or applying them as padding, would shrink
+    // the scanned path to its first line and leave the guard passing on nothing.
+    throw new Error(
+      `${PROFILE_SCREEN} applies its side insets without a margin declaration; update this guard`
+    );
+  }
+  return lines.slice(start, end + 1).join('\n');
+}
 
 describe('screen side insets: one implementation for both platforms', () => {
   it('reads the native safe-area module only in the entry point, with no platform branch', () => {
@@ -60,8 +86,8 @@ describe('screen side insets: one implementation for both platforms', () => {
       SIGN_OUT_CONFIRMATION
     );
     expect(
-      profile.replace(SIGN_OUT_CONFIRMATION, ''),
-      `${PROFILE_SCREEN} carries a per-platform branch`
+      alignmentPath(profile),
+      `${PROFILE_SCREEN}'s alignment path carries a per-platform branch`
     ).not.toMatch(PLATFORM_BRANCH);
   });
 });
