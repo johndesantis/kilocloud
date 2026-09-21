@@ -179,6 +179,16 @@ export async function loadPhysicalRecord(
   return stored ?? initialPhysicalRecord(resumable);
 }
 
+export function loadPhysicalRecordSync(
+  storage: {
+    get<T = unknown>(key: string): T | undefined;
+  },
+  resumable = false
+): PhysicalRecord {
+  const stored = storage.get<PhysicalRecord>(PHYSICAL_KEY);
+  return stored ?? initialPhysicalRecord(resumable);
+}
+
 export async function savePhysicalRecord(
   storage: ControlStorage,
   record: PhysicalRecord

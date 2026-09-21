@@ -3,6 +3,7 @@ import {
   eraseSandboxRecord,
   loadDeadlines,
   loadPhysicalRecord,
+  loadPhysicalRecordSync,
   initialRuntimeMetadata,
   loadRuntimeMetadata,
   saveRuntimeMetadata,
@@ -17,6 +18,7 @@ import {
   saveSessionCredentialGrants,
   saveSessionReferences,
   saveTransitionLog,
+  PHYSICAL_KEY,
   SESSION_REFERENCES_KEY,
 } from './durable-state.js';
 import {
@@ -147,6 +149,33 @@ describe('sandbox control durable state', () => {
 
   it('loads no credential grants from a pre-worktree record', async () => {
     expect(await loadSessionCredentialGrants(memoryStorage())).toEqual([]);
+  });
+
+  it('reads the stored physical record synchronously and falls back when absent', () => {
+    const values = new Map<string, unknown>();
+    const storage = {
+      get<T = unknown>(key: string): T | undefined {
+        return structuredClone(values.get(key)) as T | undefined;
+      },
+    };
+    const running = confirmRunning(
+      claimCreate(
+        initialPhysicalRecord(false),
+        'intent_1',
+        1000,
+        undefined,
+        WORKTREE_CREDENTIAL_CONTAINMENT
+      ),
+      'ref_1',
+      1001
+    );
+
+    values.set(PHYSICAL_KEY, running);
+    expect(loadPhysicalRecordSync(storage)).toStrictEqual(running);
+
+    values.delete(PHYSICAL_KEY);
+    expect(loadPhysicalRecordSync(storage)).toStrictEqual(initialPhysicalRecord(false));
+    expect(loadPhysicalRecordSync(storage, true)).toStrictEqual(initialPhysicalRecord(true));
   });
 
   it('round-trips multiple roots in a worktree grant alongside a legacy session-scoped grant', async () => {
