@@ -8,6 +8,7 @@ import {
   type KiloPassNativeIapContextValue,
   KiloPassNativeIapOwner,
 } from '@/components/kilo-pass/kilo-pass-native-iap-owner';
+import { i18n } from '@/i18n';
 import {
   createAppStoreKiloPassPurchaseActions,
   getKiloPassPurchaseErrorMessage,
@@ -1407,5 +1408,28 @@ describe('KiloPassNativeIapOwner', () => {
     expect(mockedReactQuery.invalidateQueries).toHaveBeenCalledWith({
       queryKey: ['purchase-presentation'],
     });
+  });
+
+  it('clears the store-connection error once the ownership lookup succeeds', async () => {
+    mockedIap.connected = true;
+    mockedIap.getAvailablePurchases.mockRejectedValue(
+      new Error('Play Store service is not connected')
+    );
+    const owner = renderKiloPassNativeIapOwner();
+    owner.render();
+    await flushPromises();
+
+    const failed = owner.render();
+    expect(failed.errorMessage).toBe(i18n.t('kiloPass.couldNotConnectToAppStore'));
+    expect(failed.ownershipCheckFailed).toBe(true);
+
+    mockedIap.getAvailablePurchases.mockResolvedValue(undefined);
+    owner.render().retryOwnershipCheck();
+    await flushPromises();
+
+    const recovered = owner.render();
+    expect(recovered.errorMessage).toBeNull();
+    expect(recovered.ownershipCheckFailed).toBe(false);
+    expect(recovered.ownershipChecked).toBe(true);
   });
 });
