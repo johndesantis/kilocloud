@@ -551,6 +551,33 @@ describe('KiloPassSubscriptionScreen', () => {
     renderer.unmount();
   });
 
+  it('e7: the products-unavailable retry shows a busy state and keeps the card mounted while retrying', async () => {
+    setAndroidNativeIapPresentation();
+    mocks.nativeIap.products = [];
+    mocks.nativeIap.productsIsRefetching = true;
+
+    const renderer = await renderScreen();
+
+    // The card stays the one error surface, with the retry's busy label.
+    expect(allText(renderer)).toContain('Google Play products unavailable');
+    expect(allText(renderer)).toContain('Trying again...');
+
+    const retry = renderer.root.find(
+      node =>
+        String(node.type) === 'Button' &&
+        (node.props as Record<string, unknown>).accessibilityLabel ===
+          'Try loading Kilo Pass products again'
+    );
+    expect((retry.props as { disabled?: boolean }).disabled).toBe(true);
+    expect((retry.props as { loading?: boolean }).loading).toBe(true);
+    expect(
+      (retry.props as { accessibilityState?: { busy?: boolean; disabled?: boolean } })
+        .accessibilityState
+    ).toEqual({ busy: true, disabled: true });
+
+    renderer.unmount();
+  });
+
   it('does not mount the IAP owner (single useIAP call site) on Android', async () => {
     mockedPlatform.OS = 'android';
     mocks.presentation.data = { kind: 'unavailable', webUrl: null };

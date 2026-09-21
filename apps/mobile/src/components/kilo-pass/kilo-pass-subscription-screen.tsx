@@ -416,6 +416,7 @@ function KiloPassNativeIapContent() {
                 }}
                 className="self-start"
                 disabled={isRetryDisabled}
+                loading={productsIsRefetching}
                 onPress={() => {
                   if (ownershipCheckFailed) {
                     retryOwnershipCheck();
