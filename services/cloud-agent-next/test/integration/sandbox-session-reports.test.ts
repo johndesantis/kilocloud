@@ -25,7 +25,10 @@ import {
 
 import { writeSessionMessages } from '../../src/sandbox-state/persist/access.js';
 import { readRawSessionMessages } from '../../src/sandbox-state/persist/load.js';
-import { terminalState, acceptedState } from '../../src/sandbox-session/session-state.test-helpers.js';
+import {
+  terminalState,
+  acceptedState,
+} from '../../src/sandbox-session/session-state.test-helpers.js';
 const ownerId = 'report-owner';
 const kiloSessionId = 'ses_12345678901234567890123456';
 const agent = { mode: 'code' as const, model: 'anthropic/claude-sonnet-4' };
@@ -310,7 +313,12 @@ describe('control-plane run-state reporting', () => {
               scope?: 'message' | 'runtime'
             ) => Promise<void>;
           }
-        ).failDelivery(messageId, 'preparation_timeout', policy?.state.wrapperInstanceId, 'message');
+        ).failDelivery(
+          messageId,
+          'preparation_timeout',
+          policy?.state.wrapperInstanceId,
+          'message'
+        );
         await instance.alarm();
         return { policyState, policyFailedReports };
       }

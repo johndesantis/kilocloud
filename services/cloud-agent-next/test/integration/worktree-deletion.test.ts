@@ -1074,7 +1074,9 @@ describe('worktree deletion in Durable Objects', () => {
         const blocked = await loadSessionReferences(state.storage);
         expect(blocked.reconciled).toBe(false);
         expect(blocked.overflowed).toBe(false);
-        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(created.providerRef);
+        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(
+          created.providerRef
+        );
 
         locator = { sandboxId: otherSandboxId, provider: 'cloudflare' };
         await expect(instance.deleteWorktreeResources(input)).resolves.toMatchObject({
@@ -1208,7 +1210,9 @@ describe('worktree deletion in Durable Objects', () => {
         ).resolves.toEqual({ deleted: true, sessionIds: [kiloId(0)] });
         expect(stop).not.toHaveBeenCalled();
         expect(await state.storage.get(RUNTIME_DELETED_KEY)).toBeUndefined();
-        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(created.providerRef);
+        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(
+          created.providerRef
+        );
         expect(ownership).not.toHaveBeenCalled();
       } finally {
         await state.storage.deleteAlarm();
@@ -1330,7 +1334,9 @@ describe('worktree deletion in Durable Objects', () => {
         ).resolves.toEqual({ deleted: true, sessionIds: [kiloId(0)] });
         expect(stop).not.toHaveBeenCalled();
         expect(await state.storage.get(RUNTIME_DELETED_KEY)).toBeUndefined();
-        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(created.providerRef);
+        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(
+          created.providerRef
+        );
         expect(await loadSessionReferences(state.storage)).toMatchObject({ reconciled: false });
       } finally {
         await state.storage.deleteAlarm();
@@ -1405,7 +1411,9 @@ describe('worktree deletion in Durable Objects', () => {
           destroyed: false,
           completed: false,
         });
-        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(created.providerRef);
+        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(
+          created.providerRef
+        );
         shared = true;
         await expect(
           instance.deleteWorktreeResources({
@@ -1416,7 +1424,9 @@ describe('worktree deletion in Durable Objects', () => {
         ).rejects.toThrow('worktree_teardown_in_progress');
         expect(await state.storage.get('exclusive_worktree_deletion')).toBe(worktreeId);
         await instance.alarm();
-        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(created.providerRef);
+        expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(
+          created.providerRef
+        );
         mayStop = true;
         await instance.deleteWorktreeResources(input);
         expect(await memory.observe(created.providerRef)).toMatchObject({ status: 'terminal' });
@@ -2191,7 +2201,9 @@ describe('worktree deletion in Durable Objects', () => {
             sessionIds: [kiloId(0)],
           };
           await expect(instance.deleteWorktreeResources(input)).rejects.toThrow('unconfirmed');
-          expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(created.providerRef);
+          expect(canonicalProviderRef(await instance.getAllocationRecord())).toBe(
+            created.providerRef
+          );
           expect(await state.storage.get('provider_locator')).toEqual(locator);
           expect(await state.storage.get('exclusive_worktree_deletion')).toBe(worktreeId);
           await expect(

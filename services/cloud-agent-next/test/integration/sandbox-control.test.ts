@@ -1272,10 +1272,7 @@ function fakeVercelRuntime(sandboxName: string, readPhysical: () => Promise<Allo
     get provider() {
       return createVercelProviderAdapter({ sandboxName, config, restClient: client });
     },
-    createAdapter: (
-      allocationName: string,
-      persisted?: VercelAllocationConfig
-    ) =>
+    createAdapter: (allocationName: string, persisted?: VercelAllocationConfig) =>
       createVercelProviderAdapter({
         sandboxName: allocationName,
         config: resolveVercelSandboxRuntimeConfig(VERCEL_ENV, persisted),
@@ -2094,7 +2091,9 @@ describe('SandboxControl Vercel network policy updates', () => {
       await expect(instance.updateNetworkPolicy(policyUpdateInput())).rejects.toThrow(
         'Sandbox instance changed during network policy update'
       );
-      await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped' },
+      });
     });
   });
 
@@ -2138,7 +2137,9 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       const physical = await control.getAllocationRecord();
       const clock = vi
         .spyOn(Date, 'now')
-        .mockReturnValue((canonicalCreateIntent(physical)?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1);
+        .mockReturnValue(
+          (canonicalCreateIntent(physical)?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1
+        );
       try {
         await expect(
           control.deleteWorktreeResources({
@@ -2216,7 +2217,9 @@ describe('SandboxControl contained Vercel lifecycle', () => {
       });
       const clock = vi
         .spyOn(Date, 'now')
-        .mockReturnValue((canonicalCreateIntent(uncertain)?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1);
+        .mockReturnValue(
+          (canonicalCreateIntent(uncertain)?.createdAt ?? 0) + DEADLINE_MS.createSettle + 1
+        );
       try {
         await fireControlDeadline(control, 'stopAttempt');
       } finally {
@@ -3823,7 +3826,9 @@ describe('SandboxControl mandatory worktree credentials', () => {
           method: 'POST',
         })
       ).resolves.toBeNull();
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'allocated' },
+      });
     }
   );
 
@@ -3991,7 +3996,9 @@ describe('SandboxControl mandatory worktree credentials', () => {
       await expect(async () =>
         control.ensureReady({ ...credentialInput(second), allowCreate: true })
       ).rejects.toThrow('Worktree credential scope mismatch');
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'allocated' },
+      });
       expect(await storedGrants(control)).toEqual(original);
     }
   );
@@ -5222,7 +5229,9 @@ describe('SandboxControl native worktree containment', () => {
         }
         const [firstGrant] = await storedGrants(control);
         if (!firstGrant?.scm) throw new Error('Missing first instance credentials');
-        const firstCreatedAt = canonicalCreateIntent(await control.getAllocationRecord())?.createdAt;
+        const firstCreatedAt = canonicalCreateIntent(
+          await control.getAllocationRecord()
+        )?.createdAt;
         if (firstCreatedAt === undefined) throw new Error('Missing first allocation intent');
         await control.markFailed();
         const clock = vi
@@ -5233,13 +5242,16 @@ describe('SandboxControl native worktree containment', () => {
         } finally {
           clock.mockRestore();
         }
-        await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+        await expect(control.getAllocationRecord()).resolves.toMatchObject({
+          state: { kind: 'stopped' },
+        });
         const replacement = await control.ensureReady(input);
         const attachment = replacement.attachment;
         if (!attachment?.kilo || !attachment.git?.token)
           throw new Error('Missing replacement credentials');
         const physical = await control.getAllocationRecord();
-        if (!canonicalProviderRef(physical)) throw new Error('Missing replacement provider reference');
+        if (!canonicalProviderRef(physical))
+          throw new Error('Missing replacement provider reference');
         expect(physical.state.kind).toBe('allocated');
         expect(canonicalProviderRef(physical)).not.toBe(firstRef);
         expect(attachment.kilo.token).not.toBe(firstGrant.kilo.alias);
@@ -5615,17 +5627,17 @@ describe('SandboxControl acquisition receipts', () => {
     for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
       await fireControlDeadline(control, 'stopAttempt');
     }
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({
-        state: { kind: 'stopping', attempts: 5 },
-      });
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopping', attempts: 5 },
+    });
 
     // Replaying the original, still-bound acquisition must wait: no provider
     // effect and no budget reset.
     const stopCalls = provider.stop.mock.calls.length;
     await expect(control.ensureReady(input)).resolves.toMatchObject({ physical: 'stopping' });
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({
-        state: { kind: 'stopping', attempts: 5 },
-      });
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopping', attempts: 5 },
+    });
     expect(provider.stop.mock.calls.length).toBe(stopCalls);
 
     // An expired request never advances the step.
@@ -5635,15 +5647,17 @@ describe('SandboxControl acquisition receipts', () => {
         acquisition: { id: crypto.randomUUID(), deadlineAt: Date.now() - 1 },
       })
     ).rejects.toThrow('Sandbox acquisition expired');
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({
-        state: { kind: 'stopping', attempts: 5 },
-      });
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopping', attempts: 5 },
+    });
 
     // A fresh acquisition advances the exhausted stop and settles it.
     provider.stop.mockResolvedValue('terminal');
     const fresh = { id: crypto.randomUUID(), deadlineAt: Date.now() + SESSION_DELIVERY_TIMEOUT_MS };
     await control.ensureReady({ ...input, acquisition: fresh });
-    await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopped' },
+    });
     expect(provider.stop.mock.calls.length).toBeGreaterThan(stopCalls);
 
     // The old acquisition cannot spend itself on a replacement.
@@ -5822,9 +5836,9 @@ describe('SandboxControl acquisition receipts', () => {
     for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
       await fireControlDeadline(control, 'stopAttempt');
     }
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({
-        state: { kind: 'stopping', attempts: 5 },
-      });
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopping', attempts: 5 },
+    });
 
     // Fill every reopen slot for this cleanup with a live marker.
     const now = Date.now();
@@ -6024,9 +6038,9 @@ describe('SandboxControl acquisition receipts', () => {
     for (let attempt = 0; attempt < DEADLINE_MS.stopAttemptLadder.length; attempt++) {
       await fireControlDeadline(control, 'stopAttempt');
     }
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({
-        state: { kind: 'stopping', attempts: 5 },
-      });
+    await expect(control.getAllocationRecord()).resolves.toMatchObject({
+      state: { kind: 'stopping', attempts: 5 },
+    });
 
     const dispatched: string[] = [];
     await runInDurableObject(control, async instance => {
@@ -6274,7 +6288,9 @@ describe('SandboxControl durable remainder', () => {
       const idleStop = await canonicalIdleAt(state);
       expect(idleStop).toBeGreaterThanOrEqual(detachedAt + DEADLINE_MS.idleStop);
       await expect(instance.listRoutes()).resolves.toEqual([]);
-      await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'allocated' },
+      });
 
       await expect(instance.detachSession(GRANT_SESSION_ID)).resolves.toEqual({
         existed: false,
@@ -6511,7 +6527,9 @@ describe('SandboxControl durable remainder', () => {
       await instance.eraseRecord();
       expect(await instance.getTransitionLog()).toEqual([]);
       await expect(instance.getOwner()).resolves.toBeNull();
-      await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+      await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'stopped' },
+      });
     });
   });
 
@@ -7071,12 +7089,12 @@ describe('SandboxControl passive status', () => {
     await runInDurableObject(session, (_instance, state) => {
       seedMessages(state.storage.kv, [
         {
-      messageId: 'msg_status_busy',
-      state: acceptedState({
-        acceptedAt: Date.now(),
-        wrapperInstanceId: runtime.wrapperInstanceId,
-      }),
-    } satisfies SessionMessage,
+          messageId: 'msg_status_busy',
+          state: acceptedState({
+            acceptedAt: Date.now(),
+            wrapperInstanceId: runtime.wrapperInstanceId,
+          }),
+        } satisfies SessionMessage,
       ]);
     });
     const routing = Promise.withResolvers<void>();
@@ -9789,11 +9807,11 @@ describe('SandboxSession control-plane regressions', () => {
     await runInDurableObject(session, (_instance, state) => {
       seedMessages(state.storage.kv, [
         {
-      messageId: 'msg_blocker',
-      state: acceptedState({
-        acceptedAt: Date.now(),
-      }),
-    },
+          messageId: 'msg_blocker',
+          state: acceptedState({
+            acceptedAt: Date.now(),
+          }),
+        },
       ] satisfies SessionMessage[]);
     });
     return { fixture, session };
@@ -10280,7 +10298,10 @@ describe('SandboxSession control-plane regressions', () => {
         });
       });
       expect((await admissionState(session)).messages).toMatchObject([
-        { messageId: 'msg_ffffffffffff00000000000005', state: expect.objectContaining({ kind: 'completed' }) },
+        {
+          messageId: 'msg_ffffffffffff00000000000005',
+          state: expect.objectContaining({ kind: 'completed' }),
+        },
         {
           messageId: 'msg_current_b',
           state: expect.objectContaining({
@@ -10367,8 +10388,14 @@ describe('SandboxSession control-plane regressions', () => {
         await session.markAsInterrupted();
         await expect(session.interruptExecution()).resolves.toMatchObject({ success: true });
         expect((await admissionState(session)).messages).toMatchObject([
-          { messageId: 'msg_ffffffffffff00000000000006', state: expect.objectContaining({ kind: 'cancelled' }) },
-          { messageId: 'msg_cancel_follower', state: expect.objectContaining({ kind: 'cancelled' }) },
+          {
+            messageId: 'msg_ffffffffffff00000000000006',
+            state: expect.objectContaining({ kind: 'cancelled' }),
+          },
+          {
+            messageId: 'msg_cancel_follower',
+            state: expect.objectContaining({ kind: 'cancelled' }),
+          },
         ]);
         // A session-scoped interrupt cancels messages only: the allocation machine
         // owns runtime teardown, so no `session.abort` is sent and the provider is
@@ -10871,9 +10898,9 @@ describe('SandboxSession control-plane regressions', () => {
         seedMessages(state.storage.kv, [
           ...messages,
           {
-      messageId: 'msg_legacy',
-      state: queuedState({ legacy: { prompt: 'retain old format on rejection' } }),
-    },
+            messageId: 'msg_legacy',
+            state: queuedState({ legacy: { prompt: 'retain old format on rejection' } }),
+          },
         ] satisfies SessionMessage[]);
       });
       const before = await admissionState(session);
@@ -11081,7 +11108,9 @@ describe('SandboxSession control-plane regressions', () => {
       validation.release();
       await expect(pending).resolves.toMatchObject({ success: false, code: 'BAD_REQUEST' });
       expect(await admissionState(session)).toEqual(terminal);
-      expect(terminal.messages.find(message => message.messageId === 'msg_terminal')?.state.kind).toBe('cancelled');
+      expect(
+        terminal.messages.find(message => message.messageId === 'msg_terminal')?.state.kind
+      ).toBe('cancelled');
     } finally {
       validation.release();
       await pending;
@@ -11191,9 +11220,9 @@ describe('SandboxSession control-plane regressions', () => {
       await runInDurableObject(session, (_instance, state) => {
         seedMessages(state.storage.kv, [
           {
-      messageId: 'msg_upgrade_a',
-      state: queuedState({ legacy: { prompt: 'old A' }, legacyInvalidIntent: undefined }),
-    },
+            messageId: 'msg_upgrade_a',
+            state: queuedState({ legacy: { prompt: 'old A' }, legacyInvalidIntent: undefined }),
+          },
         ] satisfies SessionMessage[]);
       });
       await runInDurableObject(control, instance => {
@@ -11515,7 +11544,9 @@ describe('SandboxSession control-plane regressions', () => {
             lastState: 'active',
           }),
         ]);
-        await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
+        await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+          state: { kind: 'allocated' },
+        });
         expect(await canonicalIdleAt(state)).toBeNull();
         expect(
           (await loadSessionCredentialGrants(state.storage)).flatMap(grant => grant.members)
@@ -11663,11 +11694,13 @@ describe('SandboxSession control-plane regressions', () => {
           })
         ).resolves.toEqual({ applied: true });
 
-        const messages = ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? [];
-      expect(messages).toEqual([accepted, queued]);
-      expect(
-        messages[0]?.state.kind === 'accepted' ? messages[0].state.lastActivityAt : undefined
-      ).toBe(2);
+        const messages =
+          ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+            ?.messages ?? [];
+        expect(messages).toEqual([accepted, queued]);
+        expect(
+          messages[0]?.state.kind === 'accepted' ? messages[0].state.lastActivityAt : undefined
+        ).toBe(2);
         await expect(instance.getCurrentMessageWork()).resolves.toEqual({
           messageId: accepted.messageId,
           status: 'running',
@@ -12444,7 +12477,9 @@ describe('SandboxControl terminal runtime coordination', () => {
         });
         await expect(replaced).resolves.toBe(4001);
         await waitFor(async () => {
-          await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+          await expect(control.getAllocationRecord()).resolves.toMatchObject({
+            state: { kind: 'stopped' },
+          });
           await runInDurableObject(session, (_instance, state) => {
             expect(state.storage.kv.get<{ state: string }>('terminal:pty_original')).toMatchObject({
               state: 'ended',
@@ -12521,7 +12556,9 @@ describe('SandboxControl terminal runtime coordination', () => {
           wrapperInstanceId: fixture.wrapperInstanceId ?? '',
         })
       ).resolves.toEqual({ allowed: false, reason: 'runtime_not_running' });
-      await expect(instance.recordStopAttempt()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+      await expect(instance.recordStopAttempt()).resolves.toMatchObject({
+        state: { kind: 'stopped' },
+      });
     });
     expect(provider.stop).toHaveBeenCalled();
     expect(provider.stop.mock.calls[0]?.[0]).toBe(cloudflareRef(fixture.sandboxId));
@@ -12548,7 +12585,9 @@ describe('SandboxControl terminal runtime coordination', () => {
 
     await runInDurableObject(control, async instance => {
       await instance.beginStop('test');
-      await expect(instance.confirmStopped()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+      await expect(instance.confirmStopped()).resolves.toMatchObject({
+        state: { kind: 'stopped' },
+      });
       expect(await instance.getStatus()).not.toHaveProperty('wrapperInstanceId');
     });
     await waitFor(async () => {
@@ -12640,7 +12679,9 @@ describe('SandboxControl terminal runtime coordination', () => {
 
         clock.mockReturnValue(now + 1_001);
         await expect(runDurableObjectAlarm(control)).resolves.toBe(true);
-        await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
+        await expect(control.getAllocationRecord()).resolves.toMatchObject({
+          state: { kind: 'allocated' },
+        });
         expect(provider.stop).not.toHaveBeenCalled();
         expect(provider.create).not.toHaveBeenCalled();
 
@@ -13395,7 +13436,10 @@ describe('SandboxSession worktree admission', () => {
           prompt: 'first grouped turn',
           turn: { type: 'prompt', prompt: 'first grouped turn' },
         });
-        expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+        expect(
+          ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+            ?.messages ?? []
+        ).toEqual([
           expect.objectContaining({
             messageId: INITIAL_MESSAGE_ID,
             state: expect.objectContaining({
@@ -13493,7 +13537,10 @@ describe('SandboxSession worktree admission', () => {
         prompt: '/compact --aggressive',
         turn: { type: 'command', command: 'compact', arguments: '--aggressive' },
       });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
         expect.objectContaining({
           state: expect.objectContaining({
             kind: 'queued',
@@ -13615,7 +13662,10 @@ describe('SandboxSession worktree admission', () => {
 
     const attach = JSON.parse(await incomingAttach) as WrapperRequest;
     await runInDurableObject(session, async (_instance, state) => {
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
         expect.objectContaining({
           state: expect.objectContaining({
             intent: {
@@ -14303,9 +14353,18 @@ describe('SandboxSession root-owned terminal events', () => {
           payload: { type: 'session.turn.close', properties: { sessionID: root } },
         })
       ).resolves.toEqual({ applied: false });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_active', state: expect.objectContaining({ kind: 'accepted' }) }),
-        expect.objectContaining({ messageId: 'msg_next', state: expect.objectContaining({ kind: 'queued' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_active',
+          state: expect.objectContaining({ kind: 'accepted' }),
+        }),
+        expect.objectContaining({
+          messageId: 'msg_next',
+          state: expect.objectContaining({ kind: 'queued' }),
+        }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14321,8 +14380,14 @@ describe('SandboxSession root-owned terminal events', () => {
           payload: { type: 'session.turn.close', properties: { sessionID: root } },
         })
       ).resolves.toEqual({ applied: false });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_sibling_active', state: expect.objectContaining({ kind: 'accepted' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_sibling_active',
+          state: expect.objectContaining({ kind: 'accepted' }),
+        }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14359,9 +14424,18 @@ describe('SandboxSession root-owned terminal events', () => {
           wrapperInstanceId: crypto.randomUUID(),
         })
       ).resolves.toEqual({ applied: false });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_active', state: expect.objectContaining({ kind: 'accepted' }) }),
-        expect.objectContaining({ messageId: 'msg_next', state: expect.objectContaining({ kind: 'queued' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_active',
+          state: expect.objectContaining({ kind: 'accepted' }),
+        }),
+        expect.objectContaining({
+          messageId: 'msg_next',
+          state: expect.objectContaining({ kind: 'queued' }),
+        }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14370,9 +14444,18 @@ describe('SandboxSession root-owned terminal events', () => {
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
       });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_active', state: expect.objectContaining({ kind: 'completed' }) }),
-        expect.objectContaining({ messageId: 'msg_next', state: expect.objectContaining({ kind: 'queued' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_active',
+          state: expect.objectContaining({ kind: 'completed' }),
+        }),
+        expect.objectContaining({
+          messageId: 'msg_next',
+          state: expect.objectContaining({ kind: 'queued' }),
+        }),
       ]);
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
@@ -14398,8 +14481,14 @@ describe('SandboxSession root-owned terminal events', () => {
     expect(terminalEvents.every(event => event.eventId > 0)).toBe(true);
 
     await runInDurableObject(sibling, async (_instance, state) => {
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_sibling_active', state: expect.objectContaining({ kind: 'accepted' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_sibling_active',
+          state: expect.objectContaining({ kind: 'accepted' }),
+        }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
     });
@@ -14469,8 +14558,14 @@ describe('SandboxSession root-owned terminal events', () => {
         wrapperInstanceId,
         payload: { type: 'session.error', properties: { sessionID: root } },
       });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_grouped_failed', state: expect.objectContaining({ kind: 'accepted' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_grouped_failed',
+          state: expect.objectContaining({ kind: 'accepted' }),
+        }),
       ]);
       expect(persistedSessionEvents(state, lifecycleTypes)).toEqual([]);
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
@@ -14479,8 +14574,14 @@ describe('SandboxSession root-owned terminal events', () => {
       await expect(instance.receiveSandboxControlEvent(terminalInput)).resolves.toEqual({
         applied: true,
       });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_grouped_failed', state: expect.objectContaining({ kind: 'failed' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_grouped_failed',
+          state: expect.objectContaining({ kind: 'failed' }),
+        }),
       ]);
       expect(
         persistedSessionEvents(state, lifecycleTypes).map(event => ({
@@ -14589,9 +14690,18 @@ describe('SandboxSession running stream state', () => {
       }),
     ]);
     await runInDurableObject(stub, async (_instance, state) => {
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: 'msg_running', state: expect.objectContaining({ kind: 'accepted' }) }),
-        expect.objectContaining({ messageId: 'msg_waiting', state: expect.objectContaining({ kind: 'queued' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: 'msg_running',
+          state: expect.objectContaining({ kind: 'accepted' }),
+        }),
+        expect.objectContaining({
+          messageId: 'msg_waiting',
+          state: expect.objectContaining({ kind: 'queued' }),
+        }),
       ]);
     });
     response.webSocket.close();
@@ -14769,8 +14879,14 @@ describe('SandboxSession root-scoped reconnect sync', () => {
         questions,
         permissions,
       });
-      expect(((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)?.messages ?? []).toEqual([
-        expect.objectContaining({ messageId: INITIAL_MESSAGE_ID, state: expect.objectContaining({ kind: 'accepted' }) }),
+      expect(
+        ((await readSessionValue(state.storage)) as { messages?: SessionMessage[] } | undefined)
+          ?.messages ?? []
+      ).toEqual([
+        expect.objectContaining({
+          messageId: INITIAL_MESSAGE_ID,
+          state: expect.objectContaining({ kind: 'accepted' }),
+        }),
       ]);
     });
     await runInDurableObject(control, async instance => {
@@ -15051,7 +15167,9 @@ describe('SandboxControl Vercel runtime identity', () => {
             });
           }
           await instance.alarm();
-          await expect(instance.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'stopped' } });
+          await expect(instance.getAllocationRecord()).resolves.toMatchObject({
+            state: { kind: 'stopped' },
+          });
           expect(await state.storage.get('provider_locator')).toEqual(originalLocator);
           expect(requests.map(url => url.pathname)).toEqual([
             ...(physicalState === 'creating'
@@ -15287,7 +15405,9 @@ describe('SandboxSession targeted deletion', () => {
       await expect(control.listRoutes()).resolves.toEqual(
         originalRoutes.filter(route => route.sessionId === siblingSessionId)
       );
-      await expect(control.getAllocationRecord()).resolves.toMatchObject({ state: { kind: 'allocated' } });
+      await expect(control.getAllocationRecord()).resolves.toMatchObject({
+        state: { kind: 'allocated' },
+      });
       await runInDurableObject(control, async (_instance, state) => {
         expect(await loadSessionCredentialGrants(state.storage)).toEqual(siblingGrants);
       });

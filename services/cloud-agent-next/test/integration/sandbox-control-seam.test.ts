@@ -14,7 +14,10 @@ import {
   writeSessionValueSync,
 } from '../../src/sandbox-state/persist/access.js';
 import { readRawSessionMessages } from '../../src/sandbox-state/persist/load.js';
-import { acceptedState, queuedState } from '../../src/sandbox-session/session-state.test-helpers.js';
+import {
+  acceptedState,
+  queuedState,
+} from '../../src/sandbox-session/session-state.test-helpers.js';
 import { seedCanonicalRunning } from './canonical-allocation-fixtures.js';
 
 const ownerId = 'user_control_seam';
@@ -504,7 +507,10 @@ describe('sandbox control seam (live wiring)', () => {
     const session = await registerSeamSession(ids);
     const authorization = legacyPromptAuthorization(ids, messageId);
     const executionDeadlineAt = Date.now() + 60_000;
-    await seedLegacyDispatchedPrompt(session, ids, messageId, { authorization, executionDeadlineAt });
+    await seedLegacyDispatchedPrompt(session, ids, messageId, {
+      authorization,
+      executionDeadlineAt,
+    });
 
     const { control, operations } = reconcileSessionControl(ids, {
       status: {
@@ -555,7 +561,10 @@ describe('sandbox control seam (live wiring)', () => {
     const session = await registerSeamSession(ids);
     const authorization = legacyPromptAuthorization(ids, messageId);
     const executionDeadlineAt = Date.now() + 1_000;
-    await seedLegacyDispatchedPrompt(session, ids, messageId, { authorization, executionDeadlineAt });
+    await seedLegacyDispatchedPrompt(session, ids, messageId, {
+      authorization,
+      executionDeadlineAt,
+    });
 
     // No wrapper is exposed, so the incarnation-less binding stays unresolved.
     const { control, operations } = reconcileSessionControl(ids, {
@@ -576,7 +585,9 @@ describe('sandbox control seam (live wiring)', () => {
 
     // The unresolved condition stays visible while the bound is still ahead.
     await runInDurableObject(session, async (_instance, state) => {
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'queued' } });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
+        state: { kind: 'queued' },
+      });
     });
 
     await new Promise(resolve => setTimeout(resolve, 1_100));
@@ -590,9 +601,9 @@ describe('sandbox control seam (live wiring)', () => {
       expect(row).toMatchObject({ state: { kind: 'failed', reason: 'prompt_exhausted' } });
       // It never failed before the execution bound; the alarm after the bound is
       // the one that terminalized it.
-      expect(
-        row?.state.kind === 'failed' ? row.state.at : undefined
-      ).toBeGreaterThanOrEqual(executionDeadlineAt);
+      expect(row?.state.kind === 'failed' ? row.state.at : undefined).toBeGreaterThanOrEqual(
+        executionDeadlineAt
+      );
       expect((readSessionValueSync(state.storage.kv) as { binding?: unknown }).binding).toEqual({
         kind: 'unbound',
       });
@@ -605,7 +616,10 @@ describe('sandbox control seam (live wiring)', () => {
     const session = await registerSeamSession(ids);
     const authorization = legacyPromptAuthorization(ids, messageId);
     const executionDeadlineAt = Date.now() + 60_000;
-    await seedLegacyDispatchedPrompt(session, ids, messageId, { authorization, executionDeadlineAt });
+    await seedLegacyDispatchedPrompt(session, ids, messageId, {
+      authorization,
+      executionDeadlineAt,
+    });
 
     // A live allocation exposing a different wrapper cannot adopt the legacy
     // head; the head settles instead of being re-dispatched.
@@ -818,7 +832,9 @@ describe('sandbox control seam (live wiring)', () => {
     });
 
     await runInDurableObject(session, async (_instance, state) => {
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
+        state: { kind: 'accepted' },
+      });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeDefined();
     });
   });
@@ -869,7 +885,7 @@ describe('sandbox control seam (live wiring)', () => {
       });
 
       await runInDurableObject(session, async (_instance, state) => {
-    writeSessionMessages(state.storage, { kind: 'unresolved' }, [acceptedRow(ids, messageId)]);
+        writeSessionMessages(state.storage, { kind: 'unresolved' }, [acceptedRow(ids, messageId)]);
         await state.storage.put(ATTACHED_SESSION_KEY, {
           ownerId,
           sessionId: ids.sessionId,
@@ -979,7 +995,9 @@ describe('sandbox control seam (live wiring)', () => {
 
       // The stale resolver result is discarded: the new binding is intact and
       // the accepted row was not terminalized.
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
+        state: { kind: 'accepted' },
+      });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toMatchObject({
         wrapperInstanceId: 'rebound-wrapper',
       });
@@ -1007,7 +1025,9 @@ describe('sandbox control seam (live wiring)', () => {
     );
     expect(first).toEqual({ outcome: 'failed', reason: 'stop_attachment_unresolved' });
     await runInDurableObject(session, async (_instance, state) => {
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
+        state: { kind: 'accepted' },
+      });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeDefined();
     });
 
@@ -1065,7 +1085,9 @@ describe('sandbox control seam (live wiring)', () => {
 
       // The proof is fenced by the current incarnation, so the fresh binding and
       // its accepted row are untouched.
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
+        state: { kind: 'accepted' },
+      });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toMatchObject({
         allocationIncarnation: 'new-incarnation',
       });
@@ -1143,7 +1165,9 @@ describe('sandbox control seam (live wiring)', () => {
       gate.resolve();
       await notified;
 
-      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({ state: { kind: 'accepted' } });
+      expect(readRawSessionMessages(state.storage.kv)[0]).toMatchObject({
+        state: { kind: 'accepted' },
+      });
       expect(await state.storage.get(ATTACHED_SESSION_KEY)).toBeUndefined();
     });
   });
