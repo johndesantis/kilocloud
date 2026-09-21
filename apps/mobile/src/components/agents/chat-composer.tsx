@@ -58,6 +58,7 @@ import {
   pasteTextIntoComposer,
 } from '@/components/agents/composer-paste-text';
 import {
+  alignComposerInputHeightToLines,
   COMPOSER_CHROME_HEIGHT,
   COMPOSER_INPUT_MAX_HEIGHT,
   COMPOSER_INPUT_PADDING_HORIZONTAL,
@@ -389,15 +390,24 @@ export function ChatComposer({
   const fontSize = TEXT_INPUT_FONT_SIZE * fontScale;
   const lineHeight = TEXT_INPUT_LINE_HEIGHT * fontScale;
   const inputMinHeight = lineHeight + TEXT_INPUT_VERTICAL_PADDING;
-  const inputMaxHeight = resolveComposerMaxHeight({
-    windowHeight,
-    safeAreaInsetTop: insets.top,
-    safeAreaInsetBottom: insets.bottom,
-    keyboardHeight,
-    sessionHeaderHeight: SESSION_HEADER_HEIGHT * fontScale,
-    composerChromeHeight: COMPOSER_CHROME_HEIGHT * fontScale,
+  const inputMaxHeight = alignComposerInputHeightToLines({
+    // A capped input must be a whole number of lines: Android's multiline
+    // TextInput scrolls to the caret by a partial line otherwise, which cuts
+    // the first visible line against the input's top edge. `resolveComposerMaxHeight`
+    // itself stays raw — the new-session prompt shares it and keeps its own cap.
+    height: resolveComposerMaxHeight({
+      windowHeight,
+      safeAreaInsetTop: insets.top,
+      safeAreaInsetBottom: insets.bottom,
+      keyboardHeight,
+      sessionHeaderHeight: SESSION_HEADER_HEIGHT * fontScale,
+      composerChromeHeight: COMPOSER_CHROME_HEIGHT * fontScale,
+      minHeight: inputMinHeight,
+      absoluteMaxHeight: COMPOSER_INPUT_MAX_HEIGHT * fontScale,
+    }),
+    lineHeight,
+    verticalPadding: TEXT_INPUT_VERTICAL_PADDING,
     minHeight: inputMinHeight,
-    absoluteMaxHeight: COMPOSER_INPUT_MAX_HEIGHT * fontScale,
   });
 
   // Track the keyboard's reported height so the remaining-space cap follows it.
