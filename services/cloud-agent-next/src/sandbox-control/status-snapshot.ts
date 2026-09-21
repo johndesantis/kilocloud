@@ -1,10 +1,8 @@
 /**
  * Compatibility projection from the canonical allocation/health aggregate into
  * the public `SandboxStatusSnapshot`. The route schema is unchanged; the public
- * label/detail pair is the canonical `projectStatus` output. The shared schema
- * already accepts `check_needed`; the worker still maps it to today's
- * `connection_unavailable` until a compatible web deployment is verified live
- * (C5 stage 2).
+ * label/detail pair is the canonical `projectStatus` output, including the
+ * `check_needed` detail.
  *
  * Runtime metadata, routes and the connection observation are folded in here so
  * `getSandboxStatus` no longer reads the stored flat/deadline state.
@@ -32,20 +30,6 @@ export type StatusSnapshotInput = {
 };
 
 type PublicPair = Pick<SandboxStatusSnapshot, 'status' | 'detailCode'>;
-
-/**
- * `check_needed` is a public detail code now; keep today's wire value until a
- * compatible web deployment is verified live (C5 stage 2).
- */
-function publicPair(projection: { status: string; detailCode: string }): PublicPair {
-  if (projection.detailCode === 'check_needed') {
-    return { status: 'unreachable', detailCode: 'connection_unavailable' };
-  }
-  return {
-    status: projection.status as PublicPair['status'],
-    detailCode: projection.detailCode as PublicPair['detailCode'],
-  };
-}
 
 function hasConsistentWorktrees(routes: readonly SessionRoute[]): boolean {
   const directories = new Map<string, string | undefined>();
@@ -125,12 +109,12 @@ export async function projectStatusSnapshot(
   const evidence = (pair: PublicPair): SandboxStatusSnapshot => ({ ...snapshot, ...pair });
 
   if (allocation.state.kind !== 'allocated') {
-    return evidence(publicPair(projectStatus({ allocation, ownerPresent: true, now })));
+    return evidence(projectStatus({ allocation, ownerPresent: true, now }));
   }
 
   const { health, target } = allocation.state;
   if (health.kind === 'unhealthy') {
-    return evidence(publicPair(projectStatus({ allocation, ownerPresent: true, now })));
+    return evidence(projectStatus({ allocation, ownerPresent: true, now }));
   }
   if (connection.state === 'unknown' || target.providerRef === null) {
     return evidence({ status: 'unknown', detailCode: 'insufficient_evidence' });
@@ -146,7 +130,7 @@ export async function projectStatusSnapshot(
     return evidence({ status: 'unreachable', detailCode: 'connection_unavailable' });
   }
 
-  const projected = publicPair(projectStatus({ allocation, ownerPresent: true, now }));
+  const projected = projectStatus({ allocation, ownerPresent: true, now });
   if (projected.detailCode !== 'sandbox_ready') return evidence(projected);
   if (!observation.ready) {
     return evidence({ status: 'starting', detailCode: 'sandbox_starting' });

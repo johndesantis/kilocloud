@@ -3,9 +3,7 @@
  * the canonical state, evidence and `now`. No I/O and no clock read.
  *
  * The label/detail unions mirror `shared/sandbox-status.ts`, including the
- * `check_needed` detail. The worker withholds that code until a compatible web
- * deployment is verified live (C5 stage 2); C3 maps this projection onto the
- * public snapshot.
+ * `check_needed` detail.
  */
 import type { AllocationRecord } from '../model/allocation.js';
 

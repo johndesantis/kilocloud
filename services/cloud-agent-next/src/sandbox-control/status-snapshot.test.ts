@@ -253,10 +253,10 @@ describe('status snapshot — valid public projection', () => {
     ).resolves.toMatchObject({ status: 'unreachable', detailCode: 'connection_unavailable' });
   });
 
-  it('maps canonical check_needed to today connection_unavailable', async () => {
+  it('emits canonical check_needed once the health deadline has passed', async () => {
     await expect(project(allocated(healthy({ deadlineAt: NOW - 1 })))).resolves.toMatchObject({
       status: 'unreachable',
-      detailCode: 'connection_unavailable',
+      detailCode: 'check_needed',
     });
   });
 
