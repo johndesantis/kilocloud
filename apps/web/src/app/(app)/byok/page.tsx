@@ -3,6 +3,7 @@
 import { useFeatureFlagEnabled } from 'posthog-js/react';
 import { PageLayout } from '@/components/PageLayout';
 import { BYOKKeysManager } from '@/components/organizations/byok/BYOKKeysManager';
+import { CustomProvidersManager } from '@/components/organizations/byok/CustomProvidersManager';
 import {
   OpenAiChatGptCard,
   OpenAiChatGptCardView,
@@ -25,6 +26,7 @@ export default function PersonalBYOKPage() {
           <OpenAiChatGptCardView status={undefined} />
         ) : null}
         <BYOKKeysManager />
+        <CustomProvidersManager />
       </div>
     </PageLayout>
   );

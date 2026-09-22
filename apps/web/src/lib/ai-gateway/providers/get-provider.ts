@@ -200,17 +200,18 @@ async function checkUserCustomProvider(
             eq(user_custom_providers.kilo_user_id, kiloUserId)
           )
     );
-  
+
   if (!row || !row.is_enabled) {
     return null;
   }
-  
+
   const decryptedKey = decryptApiKey(row.api_key_encrypted, BYOK_ENCRYPTION_KEY);
-  const resolvedProvider = {
-    ...row,
+  const resolvedProvider: ResolvedExperimentUpstream = {
+    internal_id: row.provider_id,
+    base_url: row.base_url,
     api_key: decryptedKey,
   };
-  
+
   return {
     kind: 'provider',
     provider: buildDirectProvider(
@@ -331,12 +332,12 @@ export async function getProvider(input: GetProviderInput): Promise<GetProviderR
      }
    }
 
-   if (!isAnonymousContext(user) && organizationId) {
-     const userCustomResult = await checkUserCustomProvider(requestedModel, organizationId, user.id);
-     if (userCustomResult) {
-       return userCustomResult;
-     }
-   }
+if (!isAnonymousContext(user)) {
+    const userCustomResult = await checkUserCustomProvider(requestedModel, organizationId, user.id);
+    if (userCustomResult) {
+      return userCustomResult;
+    }
+  }
 
    const eligibleForVercelRouting =
      !kiloExclusiveModel || kiloExclusiveModel.flags.includes('vercel-routing');

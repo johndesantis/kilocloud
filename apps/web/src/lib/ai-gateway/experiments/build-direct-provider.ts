@@ -26,7 +26,7 @@ export type ResolvedExperimentUpstream = CustomLlmApiConfig & { api_key: string 
  * pinning or kilo-exclusive model rewrites on top of this provider.
  */
 export function buildDirectProvider(
-  id: 'custom' | 'experiment',
+  id: 'custom' | 'experiment' | 'user-custom',
   supportedChatApis: ReadonlyArray<GatewayChatApiKind>,
   upstream: ResolvedExperimentUpstream,
   apiKeyHeader: 'x-api-key' | null
