@@ -3080,6 +3080,53 @@ export const custom_llm2 = pgTable('custom_llm2', {
 export type CustomLlm2 = typeof custom_llm2.$inferSelect;
 export type NewCustomLlm2 = typeof custom_llm2.$inferInsert;
 
+export const user_custom_providers = pgTable(
+  'user_custom_providers',
+  {
+    id: idPrimaryKeyColumn,
+    kilo_user_id: text()
+      .notNull()
+      .references(() => kilocode_users.id, { onDelete: 'cascade' }),
+    organization_id: uuid().references(() => organizations.id, {
+      onDelete: 'cascade',
+    }),
+    provider_id: text().notNull(),
+    display_name: text().notNull(),
+    base_url: text().notNull(),
+    api_key_encrypted: jsonb().$type<EncryptedData>().notNull(),
+    models: jsonb().$type<readonly string[]>().default([]).notNull(),
+    is_enabled: boolean().default(true).notNull(),
+    created_at: timestamp({ withTimezone: true, mode: 'string' }).defaultNow().notNull(),
+    updated_at: timestamp({ withTimezone: true, mode: 'string' })
+      .defaultNow()
+      .notNull()
+      .$onUpdateFn(() => sql`now()`),
+    created_by: text().notNull(),
+  },
+  table => [
+    unique('UQ_user_custom_providers_user_provider').on(
+      table.kilo_user_id,
+      table.provider_id
+    ),
+    unique('UQ_user_custom_providers_org_provider').on(
+      table.organization_id,
+      table.provider_id
+    ),
+    index('IDX_user_custom_providers_user_id').on(table.kilo_user_id),
+    index('IDX_user_custom_providers_org_id').on(table.organization_id),
+    check(
+      'user_custom_providers_owner_check',
+      sql`(
+        (${table.kilo_user_id} IS NOT NULL AND ${table.organization_id} IS NULL) OR
+        (${table.kilo_user_id} IS NULL AND ${table.organization_id} IS NOT NULL)
+      )`
+    ),
+  ]
+);
+
+export type UserCustomProvider = typeof user_custom_providers.$inferSelect;
+export type NewUserCustomProvider = typeof user_custom_providers.$inferInsert;
+
 export const user_admin_notes = pgTable(
   'user_admin_notes',
   {

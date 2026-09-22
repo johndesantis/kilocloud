@@ -21,6 +21,7 @@ export type ProviderId =
   | 'vercel'
   | 'openai-chatgpt'
   | 'custom'
+  | 'user-custom'
   | 'experiment'
   | 'dev-tools';
 

@@ -2262,6 +2262,50 @@ export const CustomLlmDefinitionSchema = z.object({
 
 export type CustomLlmDefinition = z.infer<typeof CustomLlmDefinitionSchema>;
 
+export const UserCustomProviderSchema = z.object({
+  id: z.string(),
+  display_name: z.string(),
+  base_url: z.string().url(),
+  api_key_encrypted: z.string(),
+  models: z.array(z.string()).default([]),
+  is_enabled: z.boolean(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  created_by: z.string(),
+});
+
+export type UserCustomProvider = z.infer<typeof UserCustomProviderSchema>;
+
+export const UserCustomProviderCreateSchema = z.object({
+  provider_id: z.string().min(1),
+  display_name: z.string().trim().min(1),
+  base_url: z.string().url(),
+  api_key: z.string().min(1),
+  models: z.array(z.string()).default([]),
+});
+
+export const UserCustomProviderUpdateSchema = z.object({
+  display_name: z.string().trim().min(1),
+  base_url: z.string().url(),
+  api_key: z.string().min(1).optional(),
+  models: z.array(z.string()).default([]),
+  is_enabled: z.boolean(),
+});
+
+export const UserCustomProviderListItemSchema = z.object({
+  id: z.string(),
+  provider_id: z.string(),
+  display_name: z.string(),
+  base_url: z.string(),
+  is_enabled: z.boolean(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+export type UserCustomProviderListItem = z.infer<
+  typeof UserCustomProviderListItemSchema
+>;
+
 // --- StoredModel ---
 
 export const ModelSchema = z.object({
