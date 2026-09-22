@@ -5,7 +5,7 @@ import {
   UserCustomProviderCreateSchema,
   UserCustomProviderUpdateSchema,
   UserCustomProviderListItemSchema,
-} from '@kilocode/db/schema-types';
+} from '@/lib/ai-gateway/byok/types';
 import { eq, and } from 'drizzle-orm';
 import { TRPCError } from '@trpc/server';
 import * as z from 'zod';
@@ -89,6 +89,7 @@ export const customProvidersRouter = createTRPCRouter({
           display_name: user_custom_providers.display_name,
           base_url: user_custom_providers.base_url,
           is_enabled: user_custom_providers.is_enabled,
+          models: user_custom_providers.models,
           created_at: user_custom_providers.created_at,
           updated_at: user_custom_providers.updated_at,
         })
@@ -99,14 +100,14 @@ export const customProvidersRouter = createTRPCRouter({
                 eq(user_custom_providers.organization_id, organizationId),
                 eq(user_custom_providers.is_enabled, true)
               )
-            : eq(user_custom_providers.kilo_user_id, ctx.user.id)
+            : and(
+                eq(user_custom_providers.kilo_user_id, ctx.user.id),
+                eq(user_custom_providers.is_enabled, true)
+              )
         )
         .orderBy(user_custom_providers.display_name);
 
-      return keys.map(key => ({
-        ...key,
-        models: (key as any).models || [],
-      }));
+      return keys;
     }),
 
   create: baseProcedure
@@ -141,6 +142,7 @@ export const customProvidersRouter = createTRPCRouter({
           display_name: user_custom_providers.display_name,
           base_url: user_custom_providers.base_url,
           is_enabled: user_custom_providers.is_enabled,
+          models: user_custom_providers.models,
           created_at: user_custom_providers.created_at,
           updated_at: user_custom_providers.updated_at,
         });
@@ -156,10 +158,7 @@ export const customProvidersRouter = createTRPCRouter({
         });
       }
 
-      return {
-        ...newKey,
-        models: models || [],
-      };
+      return newKey;
     }),
 
   update: baseProcedure
@@ -218,6 +217,7 @@ export const customProvidersRouter = createTRPCRouter({
           display_name: user_custom_providers.display_name,
           base_url: user_custom_providers.base_url,
           is_enabled: user_custom_providers.is_enabled,
+          models: user_custom_providers.models,
           created_at: user_custom_providers.created_at,
           updated_at: user_custom_providers.updated_at,
         });
@@ -233,10 +233,7 @@ export const customProvidersRouter = createTRPCRouter({
         });
       }
 
-      return {
-        ...updatedKey,
-        models: models || [],
-      };
+      return updatedKey;
     }),
 
   delete: baseProcedure

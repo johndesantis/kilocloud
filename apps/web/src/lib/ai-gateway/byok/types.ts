@@ -93,6 +93,7 @@ export const UserCustomProviderListItemSchema = z.object({
   display_name: z.string(),
   base_url: z.string(),
   is_enabled: z.boolean(),
+  models: z.array(z.string()).default([]),
   created_at: z.string(),
   updated_at: z.string(),
 });
