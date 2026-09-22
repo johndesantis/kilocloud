@@ -775,6 +775,59 @@ describe('KiloPassSubscriptionScreen', () => {
     renderer.unmount();
   });
 
+  it('keeps the Play ownership error inline with one retry when the products are available', async () => {
+    setAndroidNativeIapPresentation();
+    mocks.nativeIap.products = [product];
+    mocks.nativeIap.errorMessage =
+      'Could not connect to Google Play. Check your connection and try again.';
+    mocks.nativeIap.ownershipCheckFailed = true;
+
+    const renderer = await renderScreen();
+
+    // The card is absent, so nothing suppresses the still-true ownership
+    // failure: the store error stays inline and the retry stays reachable.
+    expect(allText(renderer)).toContain(
+      'Could not connect to Google Play. Check your connection and try again.'
+    );
+    expect(allText(renderer)).not.toContain('Google Play products unavailable');
+
+    const retry = renderer.root.findAll(
+      node =>
+        String(node.type) === 'Button' &&
+        (node.props as { accessibilityLabel?: string }).accessibilityLabel ===
+          'Retry loading Kilo Pass'
+    );
+    expect(retry).toHaveLength(1);
+
+    renderer.unmount();
+  });
+
+  it('keeps the Play store error beside its retry after the message was cleared', async () => {
+    setAndroidNativeIapPresentation();
+    mocks.nativeIap.products = [product];
+    mocks.nativeIap.errorMessage = null;
+    mocks.nativeIap.ownershipCheckFailed = true;
+
+    const renderer = await renderScreen();
+
+    // The retry renders from `ownershipCheckFailed`; the error must come from
+    // the same flag, so a cleared message can never leave the retry on its own.
+    expect(allText(renderer)).toContain(
+      'Could not connect to Google Play. Check your connection and try again.'
+    );
+    expect(allText(renderer)).not.toContain('Google Play products unavailable');
+
+    const retry = renderer.root.findAll(
+      node =>
+        String(node.type) === 'Button' &&
+        (node.props as { accessibilityLabel?: string }).accessibilityLabel ===
+          'Retry loading Kilo Pass'
+    );
+    expect(retry).toHaveLength(1);
+
+    renderer.unmount();
+  });
+
   it('keeps a failed restore visible while the products-unavailable card is shown', async () => {
     setAndroidNativeIapPresentation();
     mocks.nativeIap.products = [];

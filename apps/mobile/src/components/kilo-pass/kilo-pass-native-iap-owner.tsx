@@ -394,7 +394,17 @@ export function KiloPassNativeIapOwner({ children }: { children: ReactNode }) {
     setIsRestoringPurchases(true);
     setErrorMessage(null);
     try {
-      return await actions.restorePurchases();
+      const result = await actions.restorePurchases();
+      if (result !== 'failed') {
+        // A restore that answered proves the store is reachable, so the
+        // ownership lookup is no longer in doubt. Clear the failure or the
+        // screen keeps claiming the store is unreachable over its own
+        // "restored"/"no purchases" feedback and offers a retry that cannot
+        // fix anything.
+        setOwnershipChecked(true);
+        setOwnershipCheckFailed(false);
+      }
+      return result;
     } finally {
       setIsRestoringPurchases(false);
     }

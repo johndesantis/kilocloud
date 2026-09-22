@@ -213,14 +213,23 @@ function KiloPassNativeIapContent() {
   const productsUnavailable = !productsIsLoading && products.length === 0;
   const storeErrorMessageHidden =
     productsUnavailable && errorMessage === getStoreConnectionErrorMessage(isAndroid);
+  // The ownership retry below renders from `ownershipCheckFailed` alone, so its
+  // explanation must come from the same flag: when the screen has already cleared
+  // the message (its unmount clears it), a retry must not stand there with no
+  // error beside it.
+  const inlineErrorMessage =
+    errorMessage ??
+    (ownershipCheckFailed && !productsUnavailable
+      ? getStoreConnectionErrorMessage(isAndroid)
+      : null);
   let feedback: SubscriptionScreenFeedback | null = restoreFeedback;
   if (ownedByAnotherAccount) {
     feedback = {
       type: 'error',
       text: t(isAndroid ? 'kiloPass.otherAccountCopyPlay' : 'kiloPass.otherAccountCopy'),
     };
-  } else if (errorMessage && !storeErrorMessageHidden) {
-    feedback = { type: 'error', text: errorMessage };
+  } else if (inlineErrorMessage && !storeErrorMessageHidden) {
+    feedback = { type: 'error', text: inlineErrorMessage };
   } else if (preflightFailure) {
     feedback = { type: 'error', text: preflightFailure.message };
   }

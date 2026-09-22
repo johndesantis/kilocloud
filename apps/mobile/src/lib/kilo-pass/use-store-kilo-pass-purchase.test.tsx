@@ -1432,4 +1432,58 @@ describe('KiloPassNativeIapOwner', () => {
     expect(recovered.ownershipCheckFailed).toBe(false);
     expect(recovered.ownershipChecked).toBe(true);
   });
+
+  it('clears the ownership failure once a restore proves the store answered', async () => {
+    // The fake dispatcher re-runs effects on every render, so the ownership
+    // effect would re-derive the failure from a later successful lookup. Park
+    // it once the failure is established so the assertion observes the
+    // restore's own state change.
+    mockedIap.connected = true;
+    mockedIap.getAvailablePurchases.mockRejectedValue(
+      new Error('Play Store service is not connected')
+    );
+    const owner = renderKiloPassNativeIapOwner();
+    owner.render();
+    await flushPromises();
+
+    const failedValue = owner.render();
+    expect(failedValue.ownershipCheckFailed).toBe(true);
+    // Let that render's ownership effect settle before parking it, so no
+    // pending failure lands after the restore clears the message.
+    await flushPromises();
+
+    mockedIap.connected = false;
+    mockedIap.getAvailablePurchases.mockResolvedValue([]);
+    const result = await failedValue.restorePurchases();
+    await flushPromises();
+
+    expect(result).toBe('empty');
+    const restored = owner.render();
+    expect(restored.ownershipCheckFailed).toBe(false);
+    expect(restored.ownershipChecked).toBe(true);
+    // The store just answered, so its connection message cannot survive.
+    expect(restored.errorMessage).toBeNull();
+  });
+
+  it('keeps the ownership failure when the restore itself failed', async () => {
+    mockedIap.connected = true;
+    mockedIap.getAvailablePurchases.mockRejectedValue(
+      new Error('Play Store service is not connected')
+    );
+    const owner = renderKiloPassNativeIapOwner();
+    owner.render();
+    await flushPromises();
+
+    const failedValue = owner.render();
+    expect(failedValue.ownershipCheckFailed).toBe(true);
+
+    // Park the ownership effect: a restore that never reached the store must
+    // not clear the failure the screen is reporting.
+    mockedIap.connected = false;
+    const result = await failedValue.restorePurchases();
+    await flushPromises();
+
+    expect(result).toBe('failed');
+    expect(owner.render().ownershipCheckFailed).toBe(true);
+  });
 });
