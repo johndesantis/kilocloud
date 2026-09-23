@@ -124,29 +124,29 @@ create: baseProcedure
 
        const encrypted = encryptApiKey(api_key, BYOK_ENCRYPTION_KEY);
 
-       const [newKey] = await db
-         .insert(user_custom_providers)
-         .values({
-           organization_id: organizationId ?? null,
-           kilo_user_id: organizationId ? null : ctx.user.id,
-           provider_id,
-           display_name,
-           base_url,
-           api_key_encrypted: encrypted,
-           models: models || [],
-           is_enabled,
-           created_by: ctx.user.id,
-         })
-         .returning({
-           id: user_custom_providers.id,
-           provider_id: user_custom_providers.provider_id,
-           display_name: user_custom_providers.display_name,
-           base_url: user_custom_providers.base_url,
-           is_enabled: user_custom_providers.is_enabled,
-           models: user_custom_providers.models,
-           created_at: user_custom_providers.created_at,
-           updated_at: user_custom_providers.updated_at,
-         });
+const [newKey] = await db
+          .insert(user_custom_providers)
+          .values({
+            organization_id: organizationId ?? null,
+            kilo_user_id: organizationId ? null : ctx.user.id,
+            provider_id,
+            display_name,
+            base_url,
+            api_key_encrypted: encrypted,
+            models: models || [],
+            is_enabled,
+            created_by: ctx.user.id,
+          })
+          .returning({
+            id: user_custom_providers.id,
+            provider_id: user_custom_providers.provider_id,
+            display_name: user_custom_providers.display_name,
+            base_url: user_custom_providers.base_url,
+            is_enabled: user_custom_providers.is_enabled,
+            models: user_custom_providers.models,
+            created_at: user_custom_providers.created_at,
+            updated_at: user_custom_providers.updated_at,
+          });
 
        if (organizationId) {
          await createAuditLog({

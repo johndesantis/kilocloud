@@ -105,7 +105,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
         ...(organizationId ? { organizationId } : {}),
         display_name: current.display_name,
         base_url: current.base_url,
-        models: current.models ?? [],
+        models: current.models as string[] ?? [],
         is_enabled,
       },
       {
@@ -117,11 +117,10 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
   };
 
   const handleDelete = async (id: string, providerId: string) => {
-    const confirmed = await confirm({
+const confirmed = await confirm({
       title: 'Delete custom provider',
-      message: `Are you sure you want to delete "${providerId}"? This action cannot be undone.`,
+      description: `Are you sure you want to delete "${providerId}"? This action cannot be undone.`,
       confirmLabel: 'Delete',
-      variant: 'destructive',
     });
     if (!confirmed) return;
     deleteMutation.mutate(
@@ -146,7 +145,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
     } else {
       createMutation.mutate({
         ...(organizationId ? { organizationId } : {}),
-        ...values,
+        ...(values as z.infer<typeof UserCustomProviderCreateSchema>),
       });
     }
   };
@@ -234,11 +233,10 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
                         </div>
                       </td>
                       <td className={!key.is_enabled ? 'text-muted-foreground p-4' : 'p-4'}>
-                        <Switch
+                          <Switch
                           checked={key.is_enabled}
                           onCheckedChange={(checked) => handleToggleEnabled(key.id, checked)}
                           disabled={updateMutation.isPending}
-                          size="sm"
                         />
                       </td>
                       <td className={!key.is_enabled ? 'text-muted-foreground p-4' : 'p-4'}>
@@ -296,7 +294,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
           <CustomProviderForm
             initialData={
               dialogState.editingId
-                ? listedKeys.find((k) => k.id === dialogState.editingId)
+                ? listedKeys.find((k) => k.id === dialogState.editingId) ?? null
                 : null
             }
             onSubmit={handleSubmit}

@@ -50,6 +50,7 @@ function providerInput(requestedModel: string) {
     taskId: undefined,
     clientIp: null,
     machineId: null,
+    getRoutingProviderConfig: async () => undefined,
   };
 }
 
@@ -65,6 +66,7 @@ function responsesInput(requestedModel: string) {
     taskId: undefined,
     clientIp: null,
     machineId: null,
+    getRoutingProviderConfig: async () => undefined,
   };
 }
 

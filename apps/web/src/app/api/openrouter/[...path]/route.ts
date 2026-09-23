@@ -694,9 +694,10 @@ async function openRouterPost(request: NextRequest): Promise<NextResponseType<un
     const get = () => (accessCheck ??= resolveAccessCheck(modelId));
     return {
       get,
-      getRoutingProviderConfig: isAnonymousContext(user)
-        ? undefined
-        : async () => (await get()).effectiveProviderConfig,
+      getRoutingProviderConfig: async () =>
+        isAnonymousContext(user)
+          ? undefined
+          : (await get()).effectiveProviderConfig,
     };
   }
 
