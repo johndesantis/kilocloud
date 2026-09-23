@@ -22,7 +22,7 @@ import { VERCEL_AI_GATEWAY } from '@/lib/ai-gateway/providers/definitions/vercel
 import { getDirectByokModel } from '@/lib/ai-gateway/providers/direct-byok';
 import { checkOpenAiChatGptByok } from '@/lib/ai-gateway/openai-chatgpt/routing';
 import { CustomLlmCredentialsSchema, CustomLlmDefinitionSchema } from '@kilocode/db/schema-types';
-import { buildDirectProvider } from '@/lib/ai-gateway/experiments/build-direct-provider';
+import { buildDirectProvider, type ResolvedExperimentUpstream } from '@/lib/ai-gateway/experiments/build-direct-provider';
 import { isPublicIdExperimented } from '@/lib/ai-gateway/experiments/membership';
 import {
   pickModelExperimentVariant,
@@ -79,6 +79,17 @@ export type GetProviderResult =
   | { kind: 'not-found' }
   | { kind: 'unavailable' }
   | { kind: 'chatgpt-reconnect'; message: string };
+
+export type GetProviderInput = {
+  requestedModel: string;
+  request: GatewayRequest;
+  user: User | AnonymousUserContext;
+  organizationId: string | undefined;
+  taskId: string | undefined;
+  clientIp: string | null;
+  machineId: string | null;
+  getRoutingProviderConfig: () => Promise<OpenRouterProviderConfig | undefined>;
+};
 
 async function checkDirectBYOK(
   user: User | AnonymousUserContext,
@@ -223,6 +234,19 @@ async function checkUserCustomProvider(
     userByok: null,
     bypassAccessCheck: true,
   };
+}
+
+async function checkVercelBYOK(
+  user: User | AnonymousUserContext,
+  requestedModel: string,
+  organizationId: string | undefined
+): Promise<BYOKResult[] | null> {
+  if (isAnonymousContext(user)) return null;
+  const modelProviders = await getModelUserByokProviders(requestedModel);
+  if (modelProviders.length === 0) return null;
+  return organizationId
+    ? getBYOKforOrganization(readDb, organizationId, modelProviders)
+    : getBYOKforUser(readDb, user.id, modelProviders);
 }
 
 export async function getProvider(input: GetProviderInput): Promise<GetProviderResult> {
