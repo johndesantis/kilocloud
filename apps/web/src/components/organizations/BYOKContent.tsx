@@ -6,6 +6,7 @@ import { OrganizationPageHeader } from './OrganizationPageHeader';
 import { OrganizationContextProvider } from './OrganizationContext';
 import { useRoleTesting } from '@/contexts/RoleTestingContext';
 import { BYOKKeysManager } from './byok/BYOKKeysManager';
+import { CustomProvidersManager } from './byok/CustomProvidersManager';
 import { OpenAiChatGptCard, OpenAiChatGptCardView } from './byok/OpenAiChatGptCard';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { AlertCircle } from 'lucide-react';
@@ -53,6 +54,7 @@ export function BYOKContent({
           <div className="space-y-4">
             {chatGptCard}
             <BYOKKeysManager organizationId={organizationId} />
+            <CustomProvidersManager organizationId={organizationId} />
           </div>
         ) : chatGptEnabled !== false ? (
           <div className="space-y-4">{chatGptCard}</div>
