@@ -184,6 +184,7 @@ create: baseProcedure
         .select({
           organization_id: user_custom_providers.organization_id,
           kilo_user_id: user_custom_providers.kilo_user_id,
+          provider_id: user_custom_providers.provider_id,
         })
         .from(user_custom_providers)
         .where(eq(user_custom_providers.id, id));
