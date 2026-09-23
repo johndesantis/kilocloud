@@ -77,6 +77,7 @@ export const UserCustomProviderCreateSchema = z.object({
   base_url: z.string().url(),
   api_key: z.string().min(1),
   models: z.array(z.string()).default([]),
+  is_enabled: z.boolean().default(true),
 });
 
 export const UserCustomProviderUpdateSchema = z.object({

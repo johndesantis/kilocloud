@@ -110,56 +110,57 @@ export const customProvidersRouter = createTRPCRouter({
       return keys;
     }),
 
-  create: baseProcedure
-    .input(UserCustomProviderCreateSchema.extend({
-      organizationId: z.string().uuid().optional(),
-    }))
-    .output(UserCustomProviderListItemSchema)
-    .mutation(async ({ input, ctx }) => {
-      const { organizationId, provider_id, display_name, base_url, api_key, models } = input;
+create: baseProcedure
+     .input(UserCustomProviderCreateSchema.extend({
+       organizationId: z.string().uuid().optional(),
+     }))
+     .output(UserCustomProviderListItemSchema)
+     .mutation(async ({ input, ctx }) => {
+       const { organizationId, provider_id, display_name, base_url, api_key, models, is_enabled } = input;
 
-      if (organizationId) {
-        await ensureOrganizationAccess(ctx, organizationId, ORGANIZATION_BILLING_ROLES);
-      }
+       if (organizationId) {
+         await ensureOrganizationAccess(ctx, organizationId, ORGANIZATION_BILLING_ROLES);
+       }
 
-      const encrypted = encryptApiKey(api_key, BYOK_ENCRYPTION_KEY);
+       const encrypted = encryptApiKey(api_key, BYOK_ENCRYPTION_KEY);
 
-      const [newKey] = await db
-        .insert(user_custom_providers)
-        .values({
-          organization_id: organizationId ?? null,
-          kilo_user_id: organizationId ? null : ctx.user.id,
-          provider_id,
-          display_name,
-          base_url,
-          api_key_encrypted: encrypted,
-          models: models || [],
-          created_by: ctx.user.id,
-        })
-        .returning({
-          id: user_custom_providers.id,
-          provider_id: user_custom_providers.provider_id,
-          display_name: user_custom_providers.display_name,
-          base_url: user_custom_providers.base_url,
-          is_enabled: user_custom_providers.is_enabled,
-          models: user_custom_providers.models,
-          created_at: user_custom_providers.created_at,
-          updated_at: user_custom_providers.updated_at,
-        });
+       const [newKey] = await db
+         .insert(user_custom_providers)
+         .values({
+           organization_id: organizationId ?? null,
+           kilo_user_id: organizationId ? null : ctx.user.id,
+           provider_id,
+           display_name,
+           base_url,
+           api_key_encrypted: encrypted,
+           models: models || [],
+           is_enabled,
+           created_by: ctx.user.id,
+         })
+         .returning({
+           id: user_custom_providers.id,
+           provider_id: user_custom_providers.provider_id,
+           display_name: user_custom_providers.display_name,
+           base_url: user_custom_providers.base_url,
+           is_enabled: user_custom_providers.is_enabled,
+           models: user_custom_providers.models,
+           created_at: user_custom_providers.created_at,
+           updated_at: user_custom_providers.updated_at,
+         });
 
-      if (organizationId) {
-        await createAuditLog({
-          action: 'organization.custom_provider.create',
-          actor_email: ctx.user.google_user_email,
-          actor_id: ctx.user.id,
-          actor_name: ctx.user.google_user_name,
-          message: `Added custom provider: ${provider_id}`,
-          organization_id: organizationId,
-        });
-      }
+       if (organizationId) {
+         await createAuditLog({
+           action: 'organization.custom_provider.create',
+           actor_email: ctx.user.google_user_email,
+           actor_id: ctx.user.id,
+           actor_name: ctx.user.google_user_name,
+           message: `Added custom provider: ${provider_id}`,
+           organization_id: organizationId,
+         });
+       }
 
-      return newKey;
-    }),
+       return newKey;
+     }),
 
   update: baseProcedure
     .input(z.object({

@@ -134,7 +134,9 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
     );
   };
 
-  const handleSubmit = (values: z.infer<typeof UserCustomProviderCreateSchema>) => {
+  const handleSubmit = (
+    values: z.infer<typeof UserCustomProviderCreateSchema> | z.infer<typeof UserCustomProviderUpdateSchema>
+  ) => {
     if (dialogState.editingId) {
       updateMutation.mutate({
         id: dialogState.editingId,
@@ -309,7 +311,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
 
 type CustomProviderFormProps = {
   initialData: UserCustomProviderListItem | null;
-  onSubmit: (values: z.infer<typeof UserCustomProviderCreateSchema>) => void;
+  onSubmit: (values: z.infer<typeof UserCustomProviderCreateSchema> | z.infer<typeof UserCustomProviderUpdateSchema>) => void;
   onCancel: () => void;
   isSubmitting: boolean;
 };
@@ -340,16 +342,25 @@ function CustomProviderForm({
     setErrors(newErrors);
     if (Object.keys(newErrors).length > 0) return;
 
+    const isEditing = !!initialData;
     try {
-      const parsed = UserCustomProviderCreateSchema.parse({
-        provider_id: providerId.trim(),
-        display_name: displayName.trim(),
-        base_url: baseUrl.trim(),
-        api_key: apiKey || initialData?.api_key ?? 'dummy',
-        models: models ? models.split(',').map((m) => m.trim()).filter(Boolean) : [],
-        is_enabled: isEnabled,
-      });
-      onSubmit(parsed);
+      const result = isEditing
+        ? UserCustomProviderUpdateSchema.parse({
+            display_name: displayName.trim(),
+            base_url: baseUrl.trim(),
+            api_key: apiKey.trim() || undefined,
+            models: models ? models.split(',').map((m) => m.trim()).filter(Boolean) : [],
+            is_enabled: isEnabled,
+          })
+        : UserCustomProviderCreateSchema.parse({
+            provider_id: providerId.trim(),
+            display_name: displayName.trim(),
+            base_url: baseUrl.trim(),
+            api_key: apiKey.trim(),
+            models: models ? models.split(',').map((m) => m.trim()).filter(Boolean) : [],
+            is_enabled: isEnabled,
+          });
+      onSubmit(result);
     } catch (err) {
       if (err instanceof z.ZodError) {
         const fieldErrors: Record<string, string> = {};
