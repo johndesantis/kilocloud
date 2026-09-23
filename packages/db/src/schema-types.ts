@@ -1218,6 +1218,9 @@ export const AuditLogAction = z.enum([
   'organization.mode.create', // ✅
   'organization.mode.update', // ✅
   'organization.mode.delete', // ✅
+  'organization.custom_provider.create',
+  'organization.custom_provider.update',
+  'organization.custom_provider.delete',
   'organization.group.create',
   'organization.group.update',
   'organization.group.delete',

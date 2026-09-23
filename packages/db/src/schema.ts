@@ -3080,6 +3080,13 @@ export const custom_llm2 = pgTable('custom_llm2', {
 export type CustomLlm2 = typeof custom_llm2.$inferSelect;
 export type NewCustomLlm2 = typeof custom_llm2.$inferInsert;
 
+// any table with a primary key will not support incremental syncing to posthog so just add it even
+// if a natural key makes more sense
+const idPrimaryKeyColumn = uuid()
+  .default(sql`pg_catalog.gen_random_uuid()`)
+  .primaryKey()
+  .notNull();
+
 export const user_custom_providers = pgTable(
   'user_custom_providers',
   {
@@ -3266,13 +3273,6 @@ export const referral_code_usages = pgTable(
     ),
   ]
 );
-
-// any table with a primary key will not support incremental syncing to posthog so just add it even
-// if a natural key makes more sense
-const idPrimaryKeyColumn = uuid()
-  .default(sql`pg_catalog.gen_random_uuid()`)
-  .primaryKey()
-  .notNull();
 
 export const organizations = pgTable(
   'organizations',
