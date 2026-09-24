@@ -4,24 +4,13 @@ import { useState } from 'react';
 import { useTRPC } from '@/lib/trpc/utils';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/Button';
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { useConfirm } from '@/components/ui/confirm';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
-import {
-  Trash2,
-  Edit,
-  Plus,
-  Info,
-  Lock,
-} from 'lucide-react';
+import { Trash2, Edit, Plus, Info, Lock } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   UserCustomProviderCreateSchema,
@@ -64,7 +53,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
         setDialogState(INITIAL_DIALOG_STATE);
         toast.success('Custom provider added');
       },
-      onError: (err) => {
+      onError: err => {
         toast.error(err.message ?? 'Failed to add custom provider');
       },
     }),
@@ -77,7 +66,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
         setDialogState(INITIAL_DIALOG_STATE);
         toast.success('Custom provider updated');
       },
-      onError: (err) => {
+      onError: err => {
         toast.error(err.message ?? 'Failed to update custom provider');
       },
     }),
@@ -89,14 +78,14 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
         queryClient.invalidateQueries({ queryKey: trpc.customProviders.list.queryKey(listInput) });
         toast.success('Custom provider deleted');
       },
-      onError: (err) => {
+      onError: err => {
         toast.error(err.message ?? 'Failed to delete custom provider');
       },
     }),
   });
 
   const handleToggleEnabled = (id: string, is_enabled: boolean) => {
-    const current = keys?.find((key) => key.id === id);
+    const current = keys?.find(key => key.id === id);
     if (!current) return;
 
     updateMutation.mutate(
@@ -105,7 +94,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
         ...(organizationId ? { organizationId } : {}),
         display_name: current.display_name,
         base_url: current.base_url,
-        models: current.models as string[] ?? [],
+        models: (current.models as string[]) ?? [],
         is_enabled,
       },
       {
@@ -117,7 +106,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
   };
 
   const handleDelete = async (id: string, providerId: string) => {
-const confirmed = await confirm({
+    const confirmed = await confirm({
       title: 'Delete custom provider',
       description: `Are you sure you want to delete "${providerId}"? This action cannot be undone.`,
       confirmLabel: 'Delete',
@@ -134,7 +123,9 @@ const confirmed = await confirm({
   };
 
   const handleSubmit = (
-    values: z.infer<typeof UserCustomProviderCreateSchema> | z.infer<typeof UserCustomProviderUpdateSchema>
+    values:
+      | z.infer<typeof UserCustomProviderCreateSchema>
+      | z.infer<typeof UserCustomProviderUpdateSchema>
   ) => {
     if (dialogState.editingId) {
       updateMutation.mutate({
@@ -180,12 +171,7 @@ const confirmed = await confirm({
           <div className="flex flex-col gap-2">
             <CardTitle>Custom AI Providers</CardTitle>
           </div>
-          <Button
-            onClick={() =>
-              setDialogState({ isOpen: true, editingId: null })
-            }
-            size="sm"
-          >
+          <Button onClick={() => setDialogState({ isOpen: true, editingId: null })} size="sm">
             <Plus className="mr-2 size-4" />
             Add Provider
           </Button>
@@ -208,7 +194,9 @@ const confirmed = await confirm({
                     <tr
                       key={key.id}
                       className={
-                        !key.is_enabled ? 'bg-muted/20 border-b last:border-0' : 'border-b last:border-0'
+                        !key.is_enabled
+                          ? 'bg-muted/20 border-b last:border-0'
+                          : 'border-b last:border-0'
                       }
                     >
                       <td className={!key.is_enabled ? 'text-muted-foreground p-4' : 'p-4'}>
@@ -216,11 +204,13 @@ const confirmed = await confirm({
                         <div className="text-muted-foreground text-xs">{key.provider_id}</div>
                       </td>
                       <td className={!key.is_enabled ? 'text-muted-foreground p-4' : 'p-4'}>
-                        <div className="text-sm font-mono max-w-[200px] truncate">{key.base_url}</div>
+                        <div className="text-sm font-mono max-w-[200px] truncate">
+                          {key.base_url}
+                        </div>
                       </td>
                       <td className={!key.is_enabled ? 'text-muted-foreground p-4' : 'p-4'}>
                         <div className="flex flex-wrap gap-1">
-                          {key.models?.slice(0, 3).map((m) => (
+                          {key.models?.slice(0, 3).map(m => (
                             <span key={m} className="text-xs bg-muted rounded px-1.5 py-0.5">
                               {m}
                             </span>
@@ -233,9 +223,9 @@ const confirmed = await confirm({
                         </div>
                       </td>
                       <td className={!key.is_enabled ? 'text-muted-foreground p-4' : 'p-4'}>
-                          <Switch
+                        <Switch
                           checked={key.is_enabled}
-                          onCheckedChange={(checked) => handleToggleEnabled(key.id, checked)}
+                          onCheckedChange={checked => handleToggleEnabled(key.id, checked)}
                           disabled={updateMutation.isPending}
                         />
                       </td>
@@ -281,7 +271,7 @@ const confirmed = await confirm({
 
       <Dialog
         open={dialogState.isOpen}
-        onOpenChange={(open) =>
+        onOpenChange={open =>
           setDialogState({ isOpen: open, editingId: open ? dialogState.editingId : null })
         }
       >
@@ -294,7 +284,7 @@ const confirmed = await confirm({
           <CustomProviderForm
             initialData={
               dialogState.editingId
-                ? listedKeys.find((k) => k.id === dialogState.editingId) ?? null
+                ? (listedKeys.find(k => k.id === dialogState.editingId) ?? null)
                 : null
             }
             onSubmit={handleSubmit}
@@ -309,7 +299,11 @@ const confirmed = await confirm({
 
 type CustomProviderFormProps = {
   initialData: UserCustomProviderListItem | null;
-  onSubmit: (values: z.infer<typeof UserCustomProviderCreateSchema> | z.infer<typeof UserCustomProviderUpdateSchema>) => void;
+  onSubmit: (
+    values:
+      | z.infer<typeof UserCustomProviderCreateSchema>
+      | z.infer<typeof UserCustomProviderUpdateSchema>
+  ) => void;
   onCancel: () => void;
   isSubmitting: boolean;
 };
@@ -324,9 +318,7 @@ function CustomProviderForm({
   const [displayName, setDisplayName] = useState(initialData?.display_name ?? '');
   const [baseUrl, setBaseUrl] = useState(initialData?.base_url ?? '');
   const [apiKey, setApiKey] = useState('');
-  const [models, setModels] = useState(
-    initialData?.models?.join(', ') ?? ''
-  );
+  const [models, setModels] = useState(initialData?.models?.join(', ') ?? '');
   const [isEnabled, setIsEnabled] = useState(initialData?.is_enabled ?? true);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -347,7 +339,12 @@ function CustomProviderForm({
             display_name: displayName.trim(),
             base_url: baseUrl.trim(),
             api_key: apiKey.trim() || undefined,
-            models: models ? models.split(',').map((m) => m.trim()).filter(Boolean) : [],
+            models: models
+              ? models
+                  .split(',')
+                  .map(m => m.trim())
+                  .filter(Boolean)
+              : [],
             is_enabled: isEnabled,
           })
         : UserCustomProviderCreateSchema.parse({
@@ -355,7 +352,12 @@ function CustomProviderForm({
             display_name: displayName.trim(),
             base_url: baseUrl.trim(),
             api_key: apiKey.trim(),
-            models: models ? models.split(',').map((m) => m.trim()).filter(Boolean) : [],
+            models: models
+              ? models
+                  .split(',')
+                  .map(m => m.trim())
+                  .filter(Boolean)
+              : [],
             is_enabled: isEnabled,
           });
       onSubmit(result);
@@ -377,7 +379,7 @@ function CustomProviderForm({
         <Input
           id="providerId"
           value={providerId}
-          onChange={(e) => setProviderId(e.target.value)}
+          onChange={e => setProviderId(e.target.value)}
           placeholder="my-custom-model"
           className={errors.providerId ? 'border-destructive' : ''}
         />
@@ -388,7 +390,7 @@ function CustomProviderForm({
         <Input
           id="displayName"
           value={displayName}
-          onChange={(e) => setDisplayName(e.target.value)}
+          onChange={e => setDisplayName(e.target.value)}
           placeholder="My Custom Provider"
           className={errors.displayName ? 'border-destructive' : ''}
         />
@@ -400,7 +402,7 @@ function CustomProviderForm({
           id="baseUrl"
           type="url"
           value={baseUrl}
-          onChange={(e) => setBaseUrl(e.target.value)}
+          onChange={e => setBaseUrl(e.target.value)}
           placeholder="https://api.example.com/v1"
           className={errors.baseUrl ? 'border-destructive' : ''}
         />
@@ -412,15 +414,13 @@ function CustomProviderForm({
           id="apiKey"
           type="password"
           value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
+          onChange={e => setApiKey(e.target.value)}
           placeholder="sk-..."
           className={errors.apiKey ? 'border-destructive' : ''}
         />
         {errors.apiKey && <p className="text-xs text-destructive">{errors.apiKey}</p>}
         {initialData && (
-          <p className="text-xs text-muted-foreground">
-            Leave blank to keep existing key
-          </p>
+          <p className="text-xs text-muted-foreground">Leave blank to keep existing key</p>
         )}
       </div>
       <div className="space-y-2">
@@ -428,7 +428,7 @@ function CustomProviderForm({
         <Input
           id="models"
           value={models}
-          onChange={(e) => setModels(e.target.value)}
+          onChange={e => setModels(e.target.value)}
           placeholder="gpt-4, claude-3"
         />
       </div>

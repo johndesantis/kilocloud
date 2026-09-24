@@ -99,9 +99,7 @@ export const UserCustomProviderListItemSchema = z.object({
   updated_at: z.string(),
 });
 
-export type UserCustomProviderListItem = z.infer<
-  typeof UserCustomProviderListItemSchema
->;
+export type UserCustomProviderListItem = z.infer<typeof UserCustomProviderListItemSchema>;
 
 export const UserCustomProviderTestSchema = z.object({
   provider_id: z.string().min(1),

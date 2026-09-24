@@ -695,9 +695,7 @@ async function openRouterPost(request: NextRequest): Promise<NextResponseType<un
     return {
       get,
       getRoutingProviderConfig: async () =>
-        isAnonymousContext(user)
-          ? undefined
-          : (await get()).effectiveProviderConfig,
+        isAnonymousContext(user) ? undefined : (await get()).effectiveProviderConfig,
     };
   }
 

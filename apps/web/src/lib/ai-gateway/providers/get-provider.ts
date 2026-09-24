@@ -22,7 +22,10 @@ import { VERCEL_AI_GATEWAY } from '@/lib/ai-gateway/providers/definitions/vercel
 import { getDirectByokModel } from '@/lib/ai-gateway/providers/direct-byok';
 import { checkOpenAiChatGptByok } from '@/lib/ai-gateway/openai-chatgpt/routing';
 import { CustomLlmCredentialsSchema, CustomLlmDefinitionSchema } from '@kilocode/db/schema-types';
-import { buildDirectProvider, type ResolvedExperimentUpstream } from '@/lib/ai-gateway/experiments/build-direct-provider';
+import {
+  buildDirectProvider,
+  type ResolvedExperimentUpstream,
+} from '@/lib/ai-gateway/experiments/build-direct-provider';
 import { isPublicIdExperimented } from '@/lib/ai-gateway/experiments/membership';
 import {
   pickModelExperimentVariant,
@@ -225,12 +228,7 @@ async function checkUserCustomProvider(
 
   return {
     kind: 'provider',
-    provider: buildDirectProvider(
-      'user-custom',
-      ['chat_completions'],
-      resolvedProvider,
-      null
-    ),
+    provider: buildDirectProvider('user-custom', ['chat_completions'], resolvedProvider, null),
     userByok: null,
     bypassAccessCheck: true,
   };
@@ -349,22 +347,22 @@ export async function getProvider(input: GetProviderInput): Promise<GetProviderR
     // this id. Fall through to non-experiment routing.
   }
 
-   if (requestedModel.startsWith(CUSTOM_LLM_PREFIX) && organizationId && !isAnonymousContext(user)) {
-     const customLlmResult = await checkCustomLlm(requestedModel, organizationId, user.id);
-     if (customLlmResult) {
-       return customLlmResult;
-     }
-   }
+  if (requestedModel.startsWith(CUSTOM_LLM_PREFIX) && organizationId && !isAnonymousContext(user)) {
+    const customLlmResult = await checkCustomLlm(requestedModel, organizationId, user.id);
+    if (customLlmResult) {
+      return customLlmResult;
+    }
+  }
 
-if (!isAnonymousContext(user)) {
+  if (!isAnonymousContext(user)) {
     const userCustomResult = await checkUserCustomProvider(requestedModel, organizationId, user.id);
     if (userCustomResult) {
       return userCustomResult;
     }
   }
 
-   const eligibleForVercelRouting =
-     !kiloExclusiveModel || kiloExclusiveModel.flags.includes('vercel-routing');
+  const eligibleForVercelRouting =
+    !kiloExclusiveModel || kiloExclusiveModel.flags.includes('vercel-routing');
   const resolveRoutingProviderConfig = async () =>
     (await getRoutingProviderConfig?.()) ?? request.body.provider;
 

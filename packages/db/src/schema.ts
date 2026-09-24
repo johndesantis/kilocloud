@@ -3091,9 +3091,9 @@ export const user_custom_providers = pgTable(
   'user_custom_providers',
   {
     id: idPrimaryKeyColumn,
-    kilo_user_id: text()
-      .notNull()
-      .references(() => kilocode_users.id, { onDelete: 'cascade' }),
+    kilo_user_id: text().references(() => kilocode_users.id, {
+      onDelete: 'cascade',
+    }),
     organization_id: uuid().references(() => organizations.id, {
       onDelete: 'cascade',
     }),
@@ -3111,14 +3111,8 @@ export const user_custom_providers = pgTable(
     created_by: text().notNull(),
   },
   table => [
-    unique('UQ_user_custom_providers_user_provider').on(
-      table.kilo_user_id,
-      table.provider_id
-    ),
-    unique('UQ_user_custom_providers_org_provider').on(
-      table.organization_id,
-      table.provider_id
-    ),
+    unique('UQ_user_custom_providers_user_provider').on(table.kilo_user_id, table.provider_id),
+    unique('UQ_user_custom_providers_org_provider').on(table.organization_id, table.provider_id),
     index('IDX_user_custom_providers_user_id').on(table.kilo_user_id),
     index('IDX_user_custom_providers_org_id').on(table.organization_id),
     check(
