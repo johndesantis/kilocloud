@@ -9,13 +9,11 @@ import {
 import { eq, and } from 'drizzle-orm';
 import { TRPCError } from '@trpc/server';
 import * as z from 'zod';
-import { encryptApiKey, decryptApiKey } from '@/lib/ai-gateway/byok/encryption';
+import { encryptApiKey } from '@/lib/ai-gateway/byok/encryption';
 import { BYOK_ENCRYPTION_KEY } from '@/lib/config.server';
 import { ensureOrganizationAccess } from '@/routers/organizations/utils';
 import { ORGANIZATION_BILLING_ROLES } from '@kilocode/app-shared/organizations';
 import { createAuditLog } from '@/lib/organizations/organization-audit-logs';
-
-const GENERIC_TEST_FAILURE_MESSAGE = 'API key test failed. Check the credential and try again.';
 
 const ListUserCustomProvidersInputSchema = z.object({
   organizationId: z.string().uuid().optional(),
@@ -88,6 +86,7 @@ export const customProvidersRouter = createTRPCRouter({
           provider_id: user_custom_providers.provider_id,
           display_name: user_custom_providers.display_name,
           base_url: user_custom_providers.base_url,
+          provider_api: user_custom_providers.provider_api,
           is_enabled: user_custom_providers.is_enabled,
           models: user_custom_providers.models,
           created_at: user_custom_providers.created_at,
@@ -118,7 +117,7 @@ export const customProvidersRouter = createTRPCRouter({
     )
     .output(UserCustomProviderListItemSchema)
     .mutation(async ({ input, ctx }) => {
-      const { organizationId, provider_id, display_name, base_url, api_key, models, is_enabled } =
+      const { organizationId, provider_id, display_name, base_url, provider_api, api_key, models, is_enabled } =
         input;
 
       if (organizationId) {
@@ -135,6 +134,7 @@ export const customProvidersRouter = createTRPCRouter({
           provider_id,
           display_name,
           base_url,
+          provider_api: provider_api ?? 'openai-compatible',
           api_key_encrypted: encrypted,
           models: models || [],
           is_enabled,
@@ -145,6 +145,7 @@ export const customProvidersRouter = createTRPCRouter({
           provider_id: user_custom_providers.provider_id,
           display_name: user_custom_providers.display_name,
           base_url: user_custom_providers.base_url,
+          provider_api: user_custom_providers.provider_api,
           is_enabled: user_custom_providers.is_enabled,
           models: user_custom_providers.models,
           created_at: user_custom_providers.created_at,
@@ -172,6 +173,7 @@ export const customProvidersRouter = createTRPCRouter({
         organizationId: z.string().uuid().optional(),
         display_name: z.string().trim().min(1),
         base_url: z.string().url(),
+        provider_api: z.string().optional(),
         api_key: z.string().min(1).optional(),
         models: z.array(z.string()).default([]),
         is_enabled: z.boolean(),
@@ -179,7 +181,7 @@ export const customProvidersRouter = createTRPCRouter({
     )
     .output(UserCustomProviderListItemSchema)
     .mutation(async ({ input, ctx }) => {
-      const { id, organizationId, display_name, base_url, api_key, models, is_enabled } = input;
+      const { id, organizationId, display_name, base_url, provider_api, api_key, models, is_enabled } = input;
 
       if (organizationId) {
         await ensureOrganizationAccess(ctx, organizationId, ORGANIZATION_BILLING_ROLES);
@@ -210,6 +212,10 @@ export const customProvidersRouter = createTRPCRouter({
 
       const updateData: Record<string, any> = { display_name, base_url, models, is_enabled };
 
+      if (provider_api) {
+        updateData.provider_api = provider_api;
+      }
+
       if (api_key) {
         updateData.api_key_encrypted = encryptApiKey(api_key, BYOK_ENCRYPTION_KEY);
       }
@@ -223,6 +229,7 @@ export const customProvidersRouter = createTRPCRouter({
           provider_id: user_custom_providers.provider_id,
           display_name: user_custom_providers.display_name,
           base_url: user_custom_providers.base_url,
+          provider_api: user_custom_providers.provider_api,
           is_enabled: user_custom_providers.is_enabled,
           models: user_custom_providers.models,
           created_at: user_custom_providers.created_at,

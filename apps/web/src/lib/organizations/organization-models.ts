@@ -8,6 +8,7 @@ import {
   evaluateEffectiveModelAccessPolicy,
 } from '@/lib/organizations/effective-model-access.server';
 import { listAvailableCustomLlms } from '@/lib/ai-gateway/custom-llm/listAvailableCustomLlms';
+import { listAvailableUserCustomProvidersForOrganization } from '@/lib/ai-gateway/user-custom-providers/listAvailableUserCustomProviders';
 import { getDirectByokModelsForOrganization } from '@/lib/ai-gateway/providers/direct-byok';
 import { listAvailableExperimentModels } from '@/lib/ai-gateway/experiments/list-available-experiment-models';
 import { ORG_AUTO_MODEL } from '@/lib/ai-gateway/auto-model';
@@ -59,6 +60,7 @@ export async function getAvailableModelsForOrganization(
 
   availableModels.push(...(await getDirectByokModelsForOrganization(organizationId)));
   availableModels.push(...(await listAvailableCustomLlms(organizationId, context.groupIds)));
+  availableModels.push(...(await listAvailableUserCustomProvidersForOrganization(organizationId)));
 
   // The ChatGPT connection is personal, so it marks models only for the member
   // whose connection applies to this organization.

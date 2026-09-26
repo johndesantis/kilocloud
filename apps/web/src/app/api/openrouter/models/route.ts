@@ -9,6 +9,7 @@ import { getAvailableModelsForOrganization } from '@/lib/organizations/organizat
 import { listAvailableExperimentModels } from '@/lib/ai-gateway/experiments/list-available-experiment-models';
 import { addUserByokAvailability, getUserByokProviderIds } from '@/lib/ai-gateway/byok';
 import { tagOpenAiChatGptByokModels } from '@/lib/ai-gateway/openai-chatgpt/routing';
+import { listAvailableUserCustomProvidersForUser } from '@/lib/ai-gateway/user-custom-providers/listAvailableUserCustomProviders';
 import { readDb } from '@/lib/drizzle';
 import { addAutoRoutingModels } from '@/lib/ai-gateway/auto-routing-models';
 import { appendLocalFakeDeterministicCatalogModels } from '@/lib/ai-gateway/local-fake-llm';
@@ -70,10 +71,11 @@ async function getModels(
       });
     }
 
-    const [byokModels, experimentModels, enabledByokProviderIds] = await Promise.all([
+    const [byokModels, experimentModels, enabledByokProviderIds, userCustomProviders] = await Promise.all([
       getDirectByokModelsForUser(auth.user.id),
       listAvailableExperimentModels(),
       getUserByokProviderIds(readDb, auth.user.id),
+      listAvailableUserCustomProvidersForUser(auth.user.id),
     ]);
     const modelsWithByokAvailability = await tagOpenAiChatGptByokModels(
       { kiloUserId: auth.user.id, organizationId: null },
@@ -81,7 +83,7 @@ async function getModels(
     );
     return await modelResponse({
       data: appendLocalFakeDeterministicCatalogModels(
-        modelsWithByokAvailability.concat(byokModels, experimentModels)
+        modelsWithByokAvailability.concat(byokModels, experimentModels, userCustomProviders)
       ),
     });
   } catch (error) {

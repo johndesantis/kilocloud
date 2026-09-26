@@ -3100,6 +3100,7 @@ export const user_custom_providers = pgTable(
     provider_id: text().notNull(),
     display_name: text().notNull(),
     base_url: text().notNull(),
+    provider_api: text().default('openai-compatible').notNull(),
     api_key_encrypted: jsonb().$type<EncryptedData>().notNull(),
     models: jsonb().$type<readonly string[]>().default([]).notNull(),
     is_enabled: boolean().default(true).notNull(),

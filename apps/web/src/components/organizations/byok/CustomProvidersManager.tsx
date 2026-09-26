@@ -10,6 +10,13 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Trash2, Edit, Plus, Info, Lock } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -49,7 +56,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
   const createMutation = useMutation({
     ...trpc.customProviders.create.mutationOptions({
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: trpc.customProviders.list.queryKey(listInput) });
+        void queryClient.invalidateQueries({ queryKey: trpc.customProviders.list.queryKey(listInput) });
         setDialogState(INITIAL_DIALOG_STATE);
         toast.success('Custom provider added');
       },
@@ -62,7 +69,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
   const updateMutation = useMutation({
     ...trpc.customProviders.update.mutationOptions({
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: trpc.customProviders.list.queryKey(listInput) });
+        void queryClient.invalidateQueries({ queryKey: trpc.customProviders.list.queryKey(listInput) });
         setDialogState(INITIAL_DIALOG_STATE);
         toast.success('Custom provider updated');
       },
@@ -75,7 +82,7 @@ export function CustomProvidersManager({ organizationId }: CustomProvidersManage
   const deleteMutation = useMutation({
     ...trpc.customProviders.delete.mutationOptions({
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: trpc.customProviders.list.queryKey(listInput) });
+        void queryClient.invalidateQueries({ queryKey: trpc.customProviders.list.queryKey(listInput) });
         toast.success('Custom provider deleted');
       },
       onError: err => {
@@ -317,10 +324,16 @@ function CustomProviderForm({
   const [providerId, setProviderId] = useState(initialData?.provider_id ?? '');
   const [displayName, setDisplayName] = useState(initialData?.display_name ?? '');
   const [baseUrl, setBaseUrl] = useState(initialData?.base_url ?? '');
+  const [providerApi, setProviderApi] = useState(initialData?.provider_api ?? 'openai-compatible');
   const [apiKey, setApiKey] = useState('');
   const [models, setModels] = useState(initialData?.models?.join(', ') ?? '');
   const [isEnabled, setIsEnabled] = useState(initialData?.is_enabled ?? true);
   const [errors, setErrors] = useState<Record<string, string>>({});
+
+  const providerApiOptions = [
+    { value: 'openai-compatible', label: 'OpenAI Compatible' },
+    { value: 'anthropic', label: 'Anthropic' },
+  ] as const;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -338,6 +351,7 @@ function CustomProviderForm({
         ? UserCustomProviderUpdateSchema.parse({
             display_name: displayName.trim(),
             base_url: baseUrl.trim(),
+            provider_api: providerApi,
             api_key: apiKey.trim() || undefined,
             models: models
               ? models
@@ -351,6 +365,7 @@ function CustomProviderForm({
             provider_id: providerId.trim(),
             display_name: displayName.trim(),
             base_url: baseUrl.trim(),
+            provider_api: providerApi,
             api_key: apiKey.trim(),
             models: models
               ? models
@@ -407,6 +422,22 @@ function CustomProviderForm({
           className={errors.baseUrl ? 'border-destructive' : ''}
         />
         {errors.baseUrl && <p className="text-xs text-destructive">{errors.baseUrl}</p>}
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="providerApi">Provider API</Label>
+        <Select value={providerApi} onValueChange={setProviderApi}>
+          <SelectTrigger id="providerApi">
+            <SelectValue placeholder="Select provider API" />
+          </SelectTrigger>
+          <SelectContent>
+            {providerApiOptions.map(option => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-xs text-muted-foreground">Default: OpenAI Compatible</p>
       </div>
       <div className="space-y-2">
         <Label htmlFor="apiKey">API Key</Label>

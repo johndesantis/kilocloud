@@ -19,6 +19,7 @@ export type UserCustomProviderResponse = {
   provider_id: string;
   display_name: string;
   base_url: string;
+  provider_api: string;
   is_enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -75,6 +76,7 @@ export const UserCustomProviderCreateSchema = z.object({
   provider_id: z.string().min(1),
   display_name: z.string().trim().min(1),
   base_url: z.string().url(),
+  provider_api: z.string().default('openai-compatible'),
   api_key: z.string().min(1),
   models: z.array(z.string()).default([]),
   is_enabled: z.boolean().default(true),
@@ -83,6 +85,7 @@ export const UserCustomProviderCreateSchema = z.object({
 export const UserCustomProviderUpdateSchema = z.object({
   display_name: z.string().trim().min(1),
   base_url: z.string().url(),
+  provider_api: z.string().default('openai-compatible').optional(),
   api_key: z.string().min(1).optional(),
   models: z.array(z.string()).default([]),
   is_enabled: z.boolean(),
@@ -93,6 +96,7 @@ export const UserCustomProviderListItemSchema = z.object({
   provider_id: z.string(),
   display_name: z.string(),
   base_url: z.string(),
+  provider_api: z.string(),
   is_enabled: z.boolean(),
   models: z.array(z.string()).readonly().default([]),
   created_at: z.string(),
